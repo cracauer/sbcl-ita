@@ -133,6 +133,11 @@ and submit it as a patch."
 
 ;;;; GC hooks
 
+(!defvar *before-gc-hooks* nil
+  "Called before each garbage collection, except for garbage collections
+triggered during thread exits. In a multithreaded environment these hooks may
+run in any thread.")
+
 (!defvar *after-gc-hooks* nil
   #!+sb-doc
   "Called after each garbage collection, except for garbage collections
@@ -229,7 +234,12 @@ statistics are appended to it."
                   ;; awkwardly long piece of code to nest so deeply.
                   (let ((old-usage (dynamic-usage))
                         (new-usage 0)
-                        (start-time (get-internal-run-time)))
+                        (start-time
+                         (dolist (hook *before-gc-hooks* (get-internal-run-time))
+                           (handler-case
+                               (funcall hook)
+                             (error (c)
+                               (warn "Error calling before-GC hook ~S:~% ~A" hook c))))))
                     (collect-garbage gen)
                     (setf *gc-epoch* (cons nil nil))
                     (let ((run-time (- (get-internal-run-time) start-time)))

@@ -651,6 +651,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "GET-TIME-OF-DAY"
 
                ;; People have various good reasons to mess with the GC.
+               "*BEFORE-GC-HOOKS*"
                "*AFTER-GC-HOOKS*"
                "BYTES-CONSED-BETWEEN-GCS"
                "GC" "GET-BYTES-CONSED"
