@@ -868,7 +868,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "SET-SBCL-SOURCE-LOCATION"
                "*DISASSEMBLE-ANNOTATE*"
                "PRINT-SYMBOL-WITH-PREFIX"
-               "*CHARACTER-MACRO-HOOK*"
 
                ;; stepping interface
                "STEP-CONDITION" "STEP-FORM-CONDITION" "STEP-FINISHED-CONDITION"

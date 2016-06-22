@@ -668,50 +668,7 @@ standard Lisp readtable when NIL."
 ;;; as an alist, so maybe we should. -- WHN 19991202
 (defvar *sharp-equal-alist* ())
 
-;;; Read from STREAM given starting CHAR, returning the resulting with object
-;;; and T, unless CHAR is a macro yielding no value, then NIL and NIL,
-;;; for functions that want comments to return so that they can look
-;;; past them. CHAR must not be whitespace.
-
-(declaim (ftype (function (t t) (values t t &optional)) call-character-macro))
-(defun call-character-macro (stream char)
-  ;; new
-  (truly-the
-   (values t t) ; avoid a type-check. M-V-CALL is lame
-   (multiple-value-call
-       (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
-         (declare (ignore junk)) ; is this ANSI-specified?
-         (when (and supplied-p start-pos)
-           (funcall (form-tracking-stream-observer stream)
-                    start-pos
-                    (form-tracking-stream-input-char-pos stream) result))
-         (values result supplied-p))
-     ;; KLUDGE: not capturing anything in the lambda avoids closure consing
-     stream
-     (and (form-tracking-stream-p stream)
-          ;; Subtract 1 because the position points _after_ CHAR.
-          (1- (form-tracking-stream-input-char-pos stream)))
-     (funcall (!cmt-entry-to-function
-               (get-raw-cmt-entry char *readtable*) #'read-token)
-              stream char))))
-
-(declaim (type (function (t t) (values t t &optional)) *character-macro-hook*))
-(defvar *character-macro-hook* #'call-character-macro
-  #!+sb-doc
-  "A hook into the reader mechanism.
-This hook is called each time the reader calls a character macro function.
-It is also called when a character has no macro function and starts a token.
-The hook function has the following signature:
-  (function (stream character) (values t t &optional))
-It returns (values object t) with object read from the STREAM.
-(values nil nil) is returned by default if nothing has been read.")
-
-(declaim (inline read-maybe-nothing))
-(defun read-maybe-nothing (stream char)
-  ;; Calls the CHARACTER-MACRO-HOOK and returns (values 1 obj) if something was read.
-  ;; Returns 0 nil if nothing was read.
-  (multiple-value-bind (result resultp) (funcall *character-macro-hook* stream char)
-    (values (if resultp 1 0) result)))
+(declaim (ftype (sfunction (t t) (values bit t)) read-maybe-nothing))
 
 ;;; Like READ-PRESERVING-WHITESPACE, but doesn't check the read buffer
 ;;; for being set up properly.
@@ -764,6 +721,30 @@ It returns (values object t) with object read from the STREAM.
   (declare (explicit-check))
   (check-for-recursive-read stream recursive-p 'read-preserving-whitespace)
   (%read-preserving-whitespace stream eof-error-p eof-value recursive-p))
+
+;;; Read from STREAM given starting CHAR, returning 1 and the resulting
+;;; object, unless CHAR is a macro yielding no value, then 0 and NIL,
+;;; for functions that want comments to return so that they can look
+;;; past them. CHAR must not be whitespace.
+(defun read-maybe-nothing (stream char)
+  (truly-the
+   (values bit t) ; avoid a type-check. M-V-CALL is lame
+   (multiple-value-call
+       (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
+         (declare (ignore junk)) ; is this ANSI-specified?
+         (when (and supplied-p start-pos)
+           (funcall (form-tracking-stream-observer stream)
+                    start-pos
+                    (form-tracking-stream-input-char-pos stream) result))
+         (values (if supplied-p 1 0) result))
+     ;; KLUDGE: not capturing anything in the lambda avoids closure consing
+     stream
+     (and (form-tracking-stream-p stream)
+          ;; Subtract 1 because the position points _after_ CHAR.
+          (1- (form-tracking-stream-input-char-pos stream)))
+     (funcall (!cmt-entry-to-function
+               (get-raw-cmt-entry char *readtable*) #'read-token)
+              stream char))))
 
 (defun read (&optional (stream *standard-input*)
                        (eof-error-p t)
