@@ -11,7 +11,10 @@
 
 (in-package "SB!IMPL")
 
+(declaim (type list **finalizer-store**))
 (defglobal **finalizer-store** nil)
+(declaim (type hash-table **finalizer-store-ht**))
+(defglobal **finalizer-store-ht** (make-hash-table :test 'eq :weakness :key))
 
 (defglobal **finalizer-store-lock**
   (sb!thread:make-mutex :name "Finalizer store lock."))
@@ -71,27 +74,39 @@ Examples:
   (unless object
     (error "Cannot finalize NIL."))
   (with-finalizer-store-lock
-    (push (list (make-weak-pointer object) function dont-save)
-          **finalizer-store**))
+    (let ((entry (gethash object **finalizer-store-ht**)))
+      (unless entry
+        (setf entry (list (make-weak-pointer object) nil nil)
+              (gethash object **finalizer-store-ht**) entry)
+        (push entry **finalizer-store**))
+      (if dont-save
+          (push function (third entry))
+          (push function (second entry)))))
   object)
 
 (defun deinit-finalizers ()
-  ;; remove :dont-save finalizers
+  ;; remove :dont-save finalizers.
   (with-finalizer-store-lock
-    (setf **finalizer-store** (delete-if #'third **finalizer-store**)))
+    (maphash (lambda (k entry)
+               ;; Check if there are any finalizers that need to be saved.
+               (if (second entry)
+                   ;; In this case only remove the dont-save ones.
+                   (setf (third entry) nil)
+                   (remhash k **finalizer-store-ht**)))
+             **finalizer-store-ht**)
+    (setf **finalizer-store** (delete-if-not #'second **finalizer-store**)))
   nil)
 
 (defun cancel-finalization (object)
   #!+sb-doc
-  "Cancel any finalization for OBJECT."
-  ;; Check for NIL to avoid deleting finalizers that are waiting to be
-  ;; run.
+  "Cancel all finalization for OBJECT."
   (when object
     (with-finalizer-store-lock
-        (setf **finalizer-store**
-              (delete object **finalizer-store**
-                      :key (lambda (list)
-                             (weak-pointer-value (car list))))))
+      (let ((entry (gethash object **finalizer-store-ht**)))
+        (when entry
+          (setf (car entry) nil
+                (cdr entry) nil)
+          (remhash object **finalizer-store-ht**))))
     object))
 
 (defun run-pending-finalizers ()
@@ -101,28 +116,23 @@ Examples:
     ;; And to avoid consing we can reuse the deleted conses from the
     ;; store to build the list of functions.
     (with-finalizer-store-lock
-      (loop with list = **finalizer-store**
-          with previous
-          for finalizer = (car list)
-          do
-          (unless finalizer
-            (if previous
-                (setf (cdr previous) nil)
-                (setf **finalizer-store** nil))
-            (return))
-          unless (weak-pointer-value (car finalizer))
-          do
-          (psetf pending finalizer
-                 (car finalizer) (second finalizer)
-                 (cdr finalizer) pending
-                 (car list) (cadr list)
-                 (cdr list) (cddr list))
-          else
-          do (setf previous list
-                   list (cdr list))))
-    (dolist (fun pending)
-      (handler-case
-          (funcall fun)
-        (error (c)
-          (warn "Error calling finalizer ~S:~%  ~S" fun c)))))
+      ;; Split the **finalizer-store** by the weak-pointer-value.
+      (let ((store (shiftf **finalizer-store** nil)))
+        (loop while store do
+          (cond ((null (caar store))
+                 ;; Skip empty cell.
+                 (shiftf store (cdr store) nil))
+                ((weak-pointer-value (caar store))
+                 ;; Push the cell back onto the **finalizer-store**.
+                 (rotatef store (cdr store) **finalizer-store**))
+                (t
+                 ;; Push the cell onto the pending list.
+                 (rotatef store (cdr store) pending))))))
+    (loop for (ptr funs1 funs2) in pending do
+      (flet ((call (fun)
+               (handler-case (funcall fun)
+                 (error (c)
+                   (warn "Error calling finalizer ~S:~%  ~S" fun c)))))
+        (mapc #'call funs1)
+        (mapc #'call funs2))))
   nil)
