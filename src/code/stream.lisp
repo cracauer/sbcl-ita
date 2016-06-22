@@ -647,7 +647,10 @@
     (if (ansi-stream-p stream)
         (ansi-stream-write-string string stream start end)
         ;; must be Gray streams FUNDAMENTAL-STREAM
-        (stream-write-string stream string start end)))
+        ;; HACK HACK HACK: call stream-write-string with 2 args when possible.
+        (if (and (= start 0) (or (null end) (= end (length string))))
+            (stream-write-string stream string)
+            (stream-write-string stream string start end))))
   string)
 
 (defun write-string (string &optional (stream *standard-output*)
