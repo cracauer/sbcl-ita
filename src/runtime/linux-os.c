@@ -370,12 +370,36 @@ os_vm_address_t
 os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 {
     os_vm_address_t actual;
+    off_t tmp;
 
-    actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
-                  fd, (off_t) offset);
-    if (actual == MAP_FAILED || (addr && (addr != actual))) {
-        perror("mmap");
-        lose("unexpected mmap(..) failure\n");
+    /* HUGE KLUDGE: if we want the core to have anonymous mappings, we first
+     * mmap the region we asked for, then read(2) from the FD there. Urk. */
+    if (anon_core) {
+        actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                      -1, 0);
+        if (actual == MAP_FAILED || (addr && (addr != actual))) {
+            perror("mmap");
+            lose("unexpected mmap(..) failure\n");
+        }
+        if (0 != offset) {
+            if ((tmp = lseek(fd, 0, SEEK_CUR))<0)
+                lose("unexptected lseek() failure");
+            if (lseek(fd, offset, SEEK_SET)<0)
+                lose("really unexpected lseek() failure");
+        }
+        if (len != read(fd, actual, len))
+            lose("unexpected short read()");
+        if (lseek(fd, tmp, SEEK_SET)<0)
+            lose("definitely unexpected lseek() failure");
+    }
+    /* The normal, sane, case. */
+    else {
+        actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
+                      fd, (off_t) offset);
+        if (actual == MAP_FAILED || (addr && (addr != actual))) {
+            perror("mmap");
+            lose("unexpected mmap(..) failure\n");
+        }
     }
 
     return actual;

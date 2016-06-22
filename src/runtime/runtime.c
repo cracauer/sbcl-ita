@@ -359,6 +359,7 @@ parse_size_arg(char *arg, char *arg_name)
 
 char **posix_argv;
 char *core_string;
+boolean anon_core = 0;
 
 struct runtime_options *runtime_options;
 
@@ -520,6 +521,9 @@ main(int argc, char *argv[], char *envp[])
                     core = copied_string(argv[argi]);
                     ++argi;
                 }
+            } else if (0 == strcmp(arg, "--anon-core")) {
+                anon_core = 1;
+                ++argi;
             } else if (0 == strcmp(arg, "--help")) {
                 /* I think this is the (or a) usual convention: upon
                  * seeing "--help" we immediately print our help

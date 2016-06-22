@@ -396,6 +396,7 @@ other_immediate_lowtag_p(lispobj header)
 extern void *successful_malloc (size_t size);
 extern char *copied_string (char *string);
 
+extern boolean anon_core;
 #if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_SAFEPOINT)
 # define THREADS_USING_GCSIGNAL 1
 #endif
