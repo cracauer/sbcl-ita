@@ -31,7 +31,8 @@
                 `(+ dynamic-space-start
                     (ecase n-word-bits
                       (32 (expt 2 29))
-                      (64 (expt 2 30))))))))))
+                      ;; ITA: use 8GB default.
+                      (64 (* 8 (expt 2 30)))))))))))
 
 #!+gencgc
 ;; Define START/END constants for GENCGC spaces.
