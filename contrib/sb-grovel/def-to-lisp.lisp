@@ -229,10 +229,7 @@ code:
                          (sb-int:style-warn
                           "CC environment variable not set, SB-GROVEL falling back to \"cc\"."))
                      "cc"))
-             (code (sb-ext:process-exit-code
-                    (sb-ext:run-program
-                     cc
-                     (append
+             (args (append
                       (split-cflags (sb-ext:posix-getenv "EXTRA_CFLAGS"))
                       #+(and linux largefile)
                       '("-D_LARGEFILE_SOURCE"
@@ -256,11 +253,17 @@ code:
                       #+(and x86-64 sunos) '("-m64")
                       (list "-o"
                             (namestring tmp-a-dot-out)
-                            (namestring tmp-c-source)))
+                            (namestring tmp-c-source))))
+             (code (sb-ext:process-exit-code
+                    (sb-ext:run-program
+                     cc
+                     args
                      :search t
                      :input nil
                      :output *trace-output*))))
         (unless (= code 0)
+          (format *error-output* "Failed C compilation: ~a~%~a~%" cc args)
+          (finish-output *error-output*)
           (apply 'error 'c-compile-failed condition-arguments)))
       (let ((code (sb-ext:process-exit-code
                    (sb-ext:run-program (namestring tmp-a-dot-out)
