@@ -12,7 +12,6 @@
 output
 obj
 local-target-features.lisp-expr
-customize-target-features.*
 customize-backend-subfeatures.*
 whitespace-stamp
 src/assembly/target
