@@ -1,0 +1,49 @@
+This is a public tree of the SBCL Common Lisp compiler with ITA
+patches as used at this time.
+
+This has not been polished.  Patches are for various reasons including
+building in blaze/bazel, disapprements about upstream changes, reasons
+long forgotten, shutting up some warnings, local hacks and patches
+that went size zero long ago without anybody noticing.  Not all people
+inside ITA like all these patches.
+
+For comments on what a specific patch is for follow the commit
+messages in branch "ita".  I will amend messages as I clarify things.
+
+Branched off f9db2f115794114bffd46b5415865f48cccc73a8.  Personally I
+(cracauer) use newer SBCLs for QPX.  In newer SBCLs:
+
+- sbcl-final-hashtable.patch doesn't work, and something about the
+  quilt patch is messed up (I committed to the ita branch corrected).
+
+- call-character-macro.patch seems to not work, although it applies
+  cleanly.  Maybe it's just the test that's broken.
+
+- there is an issue with bivalent-string-stream.  It fails a test for
+  us.  Doug suspects that b6975e22454da9b444dda20bc7ea6bddf3779b52
+  caused the problem.  I ran with
+  890140aaa5d44a4e0962ccb7f708026662bcb8ca in and out but it fails in
+  both.  I seem to have a similar but not identical problem to the one
+  described in that commit message.
+
+  Still runs QPX fine, it is only an automated test that fails.  It
+  isn't clear whether the specific way in which the tests makes the
+  stream is resonsible for this.
+
+  This test uses a good chunk of our Lisp libraries that we should
+  probably open source anyway.  Maybe I can properly report the bug
+  and add our test to SBCL's later.
+
+
+I did not add my branch of current SBCL to this as it would be
+confusing.  I don't use patches that QPX doesn't need to run queries.
+The only new thing that is new is changing the base address of the
+dynamic heap which I will commit upstream anyway (need more platforms
+for testing).  The patches here mostly apply cleanly.  I will push a
+devhead version of my tree to spare people the merges.  But it won't
+have new per-patch messages (and some patches removed).
+
+More notes:
+- ITA should but does not run SBCL's own tests in our final image
+- SBCL is awesome
+
