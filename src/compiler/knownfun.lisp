@@ -71,18 +71,17 @@
                                 (:optimizer (or function null))
                                 (:destroyed-constant-args (or function null))
                                 (:result-arg (or index null))
-                                (:overwrite-fndb-silently boolean))
+                                (:overwrite-fndb-silently boolean)
+                                (:foldable-call-check (or function null))
+                                (:callable-check (or function null)))
                           *)
                 %defknown))
 (defun %defknown (names type attributes location
                   &key derive-type optimizer destroyed-constant-args result-arg
-                       overwrite-fndb-silently)
-  (let ((ctype (specifier-type type))
-        (info (make-fun-info :attributes attributes
-                             :derive-type derive-type
-                             :optimizer optimizer
-                             :destroyed-constant-args destroyed-constant-args
-                             :result-arg result-arg)))
+                       overwrite-fndb-silently
+                       foldable-call-check
+                       callable-check)
+  (let ((ctype (specifier-type type)))
     (dolist (name names)
       (unless overwrite-fndb-silently
         (let ((old-fun-info (info :function :info name)))
@@ -102,36 +101,24 @@
       (setf (info :function :type name) ctype)
       (setf (info :function :where-from name) :declared)
       (setf (info :function :kind name) :function)
-      (setf (info :function :info name) info)
+      (setf (info :function :info name)
+            (make-fun-info :attributes attributes
+                           :derive-type derive-type
+                           :optimizer optimizer
+                           :destroyed-constant-args destroyed-constant-args
+                           :result-arg result-arg
+                           :foldable-call-check foldable-call-check
+                           :callable-check callable-check))
       (if location
           (setf (getf (info :source-location :declaration name) 'defknown)
                 location)
           (remf (info :source-location :declaration name) 'defknown))))
   names)
 
-;;; Return the FUN-INFO for NAME or die trying. Since this is
-;;; used by callers who want to modify the info, and the info may be
-;;; shared, we copy it. We don't have to copy the lists, since each
-;;; function that has generators or transforms has already been
-;;; through here.
-;;;
-;;; Note that this operation is somewhat garbage-producing in the current
-;;; globaldb implementation.  Setting a piece of INFO for a name makes
-;;; a shallow copy of the name's info-vector. FUN-INFO-OR-LOSE sounds
-;;; like a data reader, and you might be disinclined to think that it
-;;; copies at all, but:
-;;;   (TIME (LOOP REPEAT 1000 COUNT (FUN-INFO-OR-LOSE '*)))
-;;;   294,160 bytes consed
-;;; whereas just copying the info per se is not half as bad:
-;;;   (LET ((X (INFO :FUNCTION :INFO '*)))
-;;;     (TIME (LOOP REPEAT 1000 COUNT (COPY-FUN-INFO X))))
-;;;   130,992 bytes consed
-;;;
+;;; Return the FUN-INFO for NAME or die trying.
 (declaim (ftype (sfunction (t) fun-info) fun-info-or-lose))
 (defun fun-info-or-lose (name)
-    (let ((old (info :function :info name)))
-      (unless old (error "~S is not a known function." name))
-      (setf (info :function :info name) (copy-fun-info old))))
+  (or (info :function :info name) (error "~S is not a known function." name)))
 
 ;;;; generic type inference methods
 
@@ -212,14 +199,21 @@
                 `(simple-array character ,@(if size (list size) '((*)))))))
             (t
              (let ((ctype (careful-specifier-type specifier)))
-               (if (and (array-type-p ctype)
-                        (eq (array-type-specialized-element-type ctype)
-                            *wild-type*))
-                   (make-array-type (array-type-dimensions ctype)
-                    :complexp (array-type-complexp ctype)
-                    :element-type *universal-type*
-                    :specialized-element-type *universal-type*)
-                   ctype)))))))))
+               (cond ((not (array-type-p ctype))
+                      ctype)
+                     ((unknown-type-p (array-type-element-type ctype))
+                      (make-array-type (array-type-dimensions ctype)
+                                       :complexp (array-type-complexp ctype)
+                                       :element-type *wild-type*
+                                       :specialized-element-type *wild-type*))
+                     ((eq (array-type-specialized-element-type ctype)
+                          *wild-type*)
+                      (make-array-type (array-type-dimensions ctype)
+                                       :complexp (array-type-complexp ctype)
+                                       :element-type *universal-type*
+                                       :specialized-element-type *universal-type*))
+                     (t
+                      ctype))))))))))
 
 (defun remove-non-constants-and-nils (fun)
   (lambda (list)

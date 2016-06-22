@@ -113,9 +113,10 @@
            (type fixnum item)
            (optimize speed))
   (labels ((recurse (start end)
-             (declare (type index start end))
+             (declare (type index start end)
+                      (optimize (safety 0)))
              (when (< start end)
-               (let* ((i (+ start (truncate (- end start) 2)))
+               (let* ((i (+ start (truncate (the index (- end start)) 2)))
                       (index (* 2 i))
                       (elt1 (svref vector index))
                       (elt2 (svref vector (1+ index))))
@@ -991,7 +992,7 @@ be longer than the input.
 (defun casefold (string)
   #!+sb-doc
   "Returns the full casefolding of STRING according to the Unicode standard.
-Casefolding remove case information in a way that allaws the results to be used
+Casefolding removes case information in a way that allows the results to be used
 for case-insensitive comparisons.
 The result is not guaranteed to have the same length as the input."
   (string-somethingcase #'char-foldcase string (constantly nil)))
@@ -1038,31 +1039,53 @@ The result is not guaranteed to have the same length as the input."
             (not (binary-search cp not-spacing-mark))) :spacing-mark)
       (t (hangul-syllable-type char)))))
 
+(macrolet ((def (name extendedp)
+             `(defun ,name (function string)
+                (do ((length (length string))
+                     (start 0)
+                     (end 1 (1+ end))
+                     (c1 nil)
+                     (c2 (and (> (length string) 0) (grapheme-break-class (char string 0)))))
+                    ((>= end length)
+                     (if (= end length) (progn (funcall function string start end) nil)))
+                  (flet ((brk () (funcall function string start end) (setf start end)))
+                    (declare (truly-dynamic-extent #'brk))
+                    (shiftf c1 c2 (grapheme-break-class (char string end)))
+                    (cond
+                      ((and (eql c1 :cr) (eql c2 :lf)))
+                      ((or (member c1 '(:control :cr :lf))
+                           (member c2 '(:control :cr :lf)))
+                       (brk))
+                      ((or (and (eql c1 :l) (member c2 '(:l :v :lv :lvt)))
+                           (and (or (eql c1 :v) (eql c1 :lv))
+                                (or (eql c2 :v) (eql c2 :t)))
+                           (and (eql c2 :t) (or (eql c1 :lvt) (eql c1 :t)))))
+                      ((and (eql c1 :regional-indicator) (eql c2 :regional-indicator)))
+                      ((eql c2 :extend))
+                      ,@(when extendedp
+                              `(((or (eql c2 :spacing-mark) (eql c1 :prepend)))))
+                      (t (brk))))))))
+  (def map-legacy-grapheme-boundaries nil)
+  (def map-grapheme-boundaries t))
+
+(macrolet ((def (name mapper)
+             `(defun ,name (function string)
+                (let ((array (make-array 0 :element-type (array-element-type string) :adjustable t :displaced-to string)))
+                  (flet ((fun (string start end)
+                           (declare (type string string))
+                           (funcall function (adjust-array array (- end start) :displaced-to string :displaced-index-offset start))))
+                    (declare (truly-dynamic-extent #'fun))
+                    (,mapper #'fun string))))))
+  (def map-legacy-graphemes map-legacy-grapheme-boundaries)
+  (def map-graphemes map-grapheme-boundaries))
+
 (defun graphemes (string)
   #!+sb-doc
   "Breaks STRING into graphemes acording to the default
 grapheme breaking rules specified in UAX #29, returning a list of strings."
-  (let* ((chars (coerce string 'list)) clusters (cluster (list (car chars))))
-    (do ((first (car chars) second)
-         (tail (cdr chars) (when tail (cdr tail)))
-         (second (cadr chars) (when tail (cadr tail))))
-        ((not first) (nreverse (mapcar #'(lambda (l) (coerce l 'string)) clusters)))
-      (flet ((brk () (push (nreverse cluster) clusters) (setf cluster (list second)))
-             (nobrk () (push second cluster)))
-        (let ((c1 (grapheme-break-class first))
-              (c2 (grapheme-break-class second)))
-          (cond
-            ((and (eql c1 :cr) (eql c2 :lf)) (nobrk))
-            ((or (member c1 '(:control :cr :lf))
-                 (member c2 '(:control :cr :lf))) (brk))
-             ((or (and (eql c1 :l) (member c2 '(:l :v :lv :lvt)))
-                  (and (or (eql c1 :v) (eql c1 :lv))
-                       (or (eql c2 :v) (eql c2 :t)))
-                  (and (eql c2 :t) (or (eql c1 :lvt) (eql c1 :t))))
-              (nobrk))
-             ((and (eql c1 :regional-indicator) (eql c2 :regional-indicator)) (nobrk))
-             ((or (eql c2 :extend) (eql c2 :spacing-mark) (eql c1 :prepend)) (nobrk))
-             (t (brk))))))))
+  (let (result)
+    (map-graphemes (lambda (a) (push (subseq a 0) result)) string)
+    (nreverse result)))
 
 (defun word-break-class (char)
   #!+sb-doc
@@ -1461,7 +1484,7 @@ sentence breaking rules specified in UAX #29"
 (defun lines (string &key (margin *print-right-margin*))
   #!+sb-doc
   "Breaks STRING into lines that are no wider than :MARGIN according to the
-line breaking rules outlined in UAX #14. Combining marks will awsays be kept
+line breaking rules outlined in UAX #14. Combining marks will always be kept
 together with their base characters, and spaces (but not other types of
 whitespace) will be removed from the end of lines. If :MARGIN is unspecified,
 it defaults to 80 characters"

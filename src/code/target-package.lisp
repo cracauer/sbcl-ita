@@ -68,7 +68,7 @@
 
 ;;;; PACKAGE-HASHTABLE stuff
 
-(def!method print-object ((table package-hashtable) stream)
+(defmethod print-object ((table package-hashtable) stream)
   (declare (type stream stream))
   (print-unreadable-object (table stream :type t :identity t)
     (let* ((n-live (%package-hashtable-symbol-count table))
@@ -256,12 +256,20 @@ error if any of PACKAGES is not a valid package designator."
        (or (eq :invalid *ignored-package-locks*)
            (not (member package *ignored-package-locks*)))
        ;; declarations for symbols
-       (not (and symbolp (member symbol (disabled-package-locks))))))
+       (not (and symbolp (lexically-unlocked-symbol-p symbol)))))
 
-(defun disabled-package-locks ()
-  (if (boundp 'sb!c::*lexenv*)
-      (sb!c::lexenv-disabled-package-locks sb!c::*lexenv*)
-      sb!c::*disabled-package-locks*))
+(defun lexically-unlocked-symbol-p (symbol)
+  (member symbol
+          (if (boundp 'sb!c::*lexenv*)
+              (let ((list (sb!c::lexenv-disabled-package-locks sb!c::*lexenv*)))
+                ;; The so-called LIST might be an interpreter env.
+                #!+sb-fasteval
+                (unless (listp list)
+                  (return-from lexically-unlocked-symbol-p
+                    (sb!interpreter::lexically-unlocked-symbol-p
+                     symbol list)))
+                list)
+              sb!c::*disabled-package-locks*)))
 
 ) ; progn
 
@@ -297,6 +305,11 @@ error if any of PACKAGES is not a valid package designator."
   #!+sb-package-locks
   (let* ((symbol (etypecase name
                    (symbol name)
+                   ;; Istm that the right way to declare that you want to allow
+                   ;; overriding the lock on (SETF X) is to list (SETF X) in
+                   ;; the declaration, not expect that X means itself and SETF.
+                   ;; Worse still, the syntax ({ENABLE|DISABLE}-..-locks (SETF X))
+                   ;; is broken, and yet we make no indication of it.
                    ((cons (eql setf) cons) (second name))
                    ;; Skip lists of length 1, single conses and
                    ;; (class-predicate foo), etc.  FIXME: MOP and
@@ -316,7 +329,7 @@ error if any of PACKAGES is not a valid package designator."
 
 ;;;; miscellaneous PACKAGE operations
 
-(def!method print-object ((package package) stream)
+(defmethod print-object ((package package) stream)
   (let ((name (package-%name package)))
     (print-unreadable-object (package stream :type t :identity (not name))
       (if name (prin1 name stream) (write-string "(deleted)" stream)))))
@@ -580,7 +593,9 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
 ;;; Return a list of packages given a package designator or list of
 ;;; package designators, or die trying.
 (defun package-listify (thing)
-  (mapcar #'find-undeleted-package-or-lose (ensure-list thing)))
+  (if (listp thing)
+      (mapcar #'find-undeleted-package-or-lose thing)
+      (list (find-undeleted-package-or-lose thing))))
 
 ;;; ANSI specifies (in the definition of DELETE-PACKAGE) that PACKAGE-NAME
 ;;; returns NIL (not an error) for a deleted package, so this is a special
@@ -832,9 +847,9 @@ implementation it is ~S." *default-package-use-list*)
          (unless (and (string= name (package-name package))
                       (null (set-difference nicks (package-nicknames package)
                                             :test #'string=)))
-           (assert-package-unlocked package "rename as ~A~@[ with nickname~P ~
-                                             ~{~A~^, ~}~]"
-                                    name (length nicks) nicks))
+           (assert-package-unlocked
+            package "renaming as ~A~@[ with nickname~*~P ~1@*~{~A~^, ~}~]"
+            name nicks (length nicks)))
          (with-package-names (names)
            ;; Check for race conditions now that we have the lock.
            (unless (eq package (find-package package-designator))
@@ -1603,8 +1618,7 @@ PACKAGE."
                      (add-symbol table symbol)))))
           (setf (package-external-symbols pkg) (!make-table (car symbols))
                 (package-internal-symbols pkg) (!make-table (cdr symbols))))
-        (setf (package-%shadowing-symbols pkg) nil
-              (package-%local-nicknames pkg) nil
+        (setf (package-%local-nicknames pkg) nil
               (package-%locally-nicknamed-by pkg) nil
               (package-source-location pkg) nil
               (gethash (package-%name pkg) names) pkg)
@@ -1723,6 +1737,9 @@ PACKAGE."
                   (lambda (condition)
                     (ecase context
                       (:compile
+                       ;; FIXME: Code containing a lexically impermissible
+                       ;; violation causes both a warning AND an error.
+                       ;; The warning is enough. It's ugly that both happen.
                        (warn "Compile-time package lock violation:~%  ~A"
                              condition)
                        (sb!c:compiler-error condition))

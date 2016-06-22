@@ -34,12 +34,7 @@
              (or (and (>= (length name) 1) (char= (char name 0) #\!))
                  (and (>= (length name) 2) (string= name "*!" :end1 2))
                  (memq symbol
-                       ;; DEF!METHOD need no longer be accessible,
-                       ;; but *DELAYED-DEF!METHOD-ARGS* remains,
-                       ;; due to a reference from pcl/methods.lisp.
-                       ;; It would be nice to fix that.
-                       '(def!method
-                         sb!c::sb!pcl sb!c::sb!impl sb!c::sb!kernel
+                       '(sb!c::sb!pcl sb!c::sb!impl sb!c::sb!kernel
                          sb!c::sb!c sb!c::sb!int))))))
     ;; A structure constructor name, in particular !MAKE-SAETP,
     ;; can't be uninterned if referenced by a defstruct-description.
@@ -66,8 +61,7 @@
                 ;; can't disappear from the image, but we don't need to preserve
                 ;; their functions, so FMAKUNBOUND them. This doesn't have
                 ;; the intended effect if the function shares a code-component
-                ;; with non-cold-init lambdas, such as in !CONSTANTP-COLD-INIT
-                ;; and !GLOBALDB-COLD-INIT. Though the cold-init function is
+                ;; with non-cold-init lambdas. Though the cold-init function is
                 ;; never called post-build, it is not discarded. Also, I suspect
                 ;; that the following loop should print nothing, but it does:
 #|
@@ -104,9 +98,10 @@
 ;;;; !COLD-INIT
 
 ;;; a list of toplevel things set by GENESIS
-(defvar *!reversed-cold-toplevels*)
-(!defvar *!reversed-cold-setf-macros* nil) ; just SETF macros
-(!defvar *!reversed-cold-defuns* nil)      ; just DEFUNs
+(defvar *!cold-toplevels*)                 ; except for DEFUNs and SETF macros
+(defvar *!cold-setf-macros*)               ; just SETF macros
+(defvar *!cold-defconstants*)              ; just DEFCONSTANT-EQXs
+(defvar *!cold-defuns*)                    ; just DEFUNs
 
 ;;; a SIMPLE-VECTOR set by GENESIS
 (defvar *!load-time-values*)
@@ -119,6 +114,50 @@
     `(progn
        (/primitive-print ,(symbol-name name))
        (,name))))
+
+(defun !encapsulate-stuff-for-cold-init (&aux names)
+  (flet ((encapsulate-1 (name handler)
+           (encapsulate name '!cold-init handler)
+           (push name names)))
+    (encapsulate-1 '%failed-aver
+                   (lambda (f expr)
+                     ;; output the message before signaling error,
+                     ;; as it may be this is too early in the cold init.
+                     (fresh-line)
+                     (write-line "failed AVER:")
+                     (write expr)
+                     (terpri)
+                     (funcall f expr)))
+
+    (encapsulate-1
+     'find-package
+     (lambda (f designator)
+       (cond ((packagep designator) designator)
+             (t (funcall f (let ((s (string designator)))
+                             (if (eql (mismatch s "SB!") 3)
+                                 (concatenate 'string "SB-" (subseq s 3))
+                                 s)))))))
+
+    ;; Wrap thing-defining-functions that style-warn sufficiently early
+    ;; that HANDLER-BIND can't be used to suppress the warning
+    ;; (since condition classoids don't exist yet).
+    (flet ((warning-suppressor (signaler)
+             (lambda (f &rest args)
+               (encapsulate signaler '!cold-init (constantly nil))
+               (apply f args)
+               (unencapsulate signaler '!cold-init)))) ; Restore it.
+      ;; %DEFUN complains about everything being redefined
+      (encapsulate-1 '%defun (warning-suppressor 'warn))
+      ;; %DEFCONSTANT complains about all named types because of earmuffs.
+      (encapsulate-1 'sb!c::%defconstant (warning-suppressor 'style-warn))
+      ;; %DEFSETF ',FN warns when #'(SETF fn) also has a function binding.
+      (encapsulate-1 '%defsetf (warning-suppressor 'style-warn))))
+  names)
+
+(defmacro !with-init-wrappers (&rest forms)
+  `(let ((wrapped-functions (!encapsulate-stuff-for-cold-init)))
+     ,@forms
+     (dolist (f wrapped-functions) (unencapsulate f '!cold-init))))
 
 ;;; called when a cold system starts up
 (defun !cold-init ()
@@ -156,7 +195,7 @@
   (progn (prin1 `(package = ,(package-name *package*)))
          (terpri))
 
-  ;; *RAW-SLOT-DATA-LIST* is essentially a compile-time constant
+  ;; *RAW-SLOT-DATA* is essentially a compile-time constant
   ;; but isn't dumpable as such because it has functions in it.
   (show-and-call sb!kernel::!raw-slot-data-init)
 
@@ -180,12 +219,11 @@
   ;; the basic type machinery needs to be initialized before toplevel
   ;; forms run.
   (show-and-call !type-class-cold-init)
+  (!with-init-wrappers (show-and-call sb!kernel::!primordial-type-cold-init))
   (show-and-call !world-lock-cold-init)
   (show-and-call !classes-cold-init)
   (show-and-call !early-type-cold-init)
   (show-and-call !late-type-cold-init)
-  ;; See comment at the DEFUN explaining why there are 2 of them.
-  (show-and-call sb!kernel::!late-type-cold-init2)
   (show-and-call !alien-type-cold-init)
   (show-and-call !target-type-cold-init)
   ;; FIXME: It would be tidy to make sure that that these cold init
@@ -195,91 +233,56 @@
   (show-and-call !policy-cold-init-or-resanify)
   (/show0 "back from !POLICY-COLD-INIT-OR-RESANIFY")
 
-  (show-and-call !constantp-cold-init)
-  (show-and-call !constantp2-cold-init)
   ;; Must be done before toplevel forms are invoked
   ;; because a toplevel defstruct will need to add itself
   ;; to the subclasses of STRUCTURE-OBJECT.
   (show-and-call sb!kernel::!set-up-structure-object-class)
 
-  (dolist (x (nreverse *!reversed-cold-setf-macros*))
-    (apply #'!quietly-defsetf x))
-  (dolist (x (nreverse *!reversed-cold-defuns*))
-    (destructuring-bind (name . inline-expansion) x
-      (!%quietly-defun name inline-expansion)))
+  (dolist (x *!cold-defconstants*)
+    (destructuring-bind (name source-loc &optional docstring) x
+      (setf (info :variable :kind name) :constant)
+      (when source-loc (setf (info :source-location :constant name) source-loc))
+      (when docstring (setf (fdocumentation name 'variable) docstring))))
+  (!with-init-wrappers
+   (dolist (x *!cold-defuns*)
+     (destructuring-bind (name . inline-expansion) x
+       (%defun name (fdefinition name) nil inline-expansion))))
 
   ;; KLUDGE: Why are fixups mixed up with toplevel forms? Couldn't
   ;; fixups be done separately? Wouldn't that be clearer and better?
   ;; -- WHN 19991204
   (/show0 "doing cold toplevel forms and fixups")
-  (/show0 "(LISTP *!REVERSED-COLD-TOPLEVELS*)=..")
-  (/hexstr (if (listp *!reversed-cold-toplevels*) "true" "NIL"))
   #!-win32
-  (progn (write `("Length(TLFs)= " ,(length *!reversed-cold-toplevels*)))
+  (progn (write `("Length(TLFs)= " ,(length *!cold-toplevels*)))
          (terpri))
-  #!+win32
-  (progn (/show0 "about to calculate (LENGTH *!REVERSED-COLD-TOPLEVELS*)")
-         (/show0 "(LENGTH *!REVERSED-COLD-TOPLEVELS*)=..")
-         #!+sb-show (let ((r-c-tl-length (length *!reversed-cold-toplevels*)))
-                      (/show0 "(length calculated..)")
-                      (let ((hexstr (hexstr r-c-tl-length)))
-                        (/show0 "(hexstr calculated..)")
-                        (/primitive-print hexstr))))
-  (let (#!+sb-show (index-in-cold-toplevels 0))
-    #!+sb-show (declare (type fixnum index-in-cold-toplevels))
 
-    (encapsulate
-     'find-package '!bootstrap
-     (lambda (f designator)
-       (cond ((packagep designator) designator)
-             (t (funcall f (let ((s (string designator)))
-                             (if (eql (mismatch s "SB!") 3)
-                                 (concatenate 'string "SB-" (subseq s 3))
-                                 s)))))))
-    (encapsulate '%failed-aver '!bootstrap
-                 (lambda (f expr)
-                   ;; output the message before signaling error,
-                   ;; as it may be this is too early in the cold init.
-                   (fresh-line)
-                   (write-line "failed AVER:")
-                   (write expr)
-                   (terpri)
-                   (funcall f expr)))
-
-    (dolist (toplevel-thing (prog1
-                                (nreverse *!reversed-cold-toplevels*)
-                              ;; (Now that we've NREVERSEd it, it's
-                              ;; somewhat scrambled, so keep anyone
-                              ;; else from trying to get at it.)
-                              (makunbound '*!reversed-cold-toplevels*)))
+  (!with-init-wrappers
+    (loop for index-in-cold-toplevels from 0
+          for toplevel-thing in (prog1 *!cold-toplevels*
+                                 (makunbound '*!cold-toplevels*))
+        do
       #!+sb-show
       (when (zerop (mod index-in-cold-toplevels 1024))
         (/show0 "INDEX-IN-COLD-TOPLEVELS=..")
         (/hexstr index-in-cold-toplevels))
-      #!+sb-show
-      (setf index-in-cold-toplevels
-            (the fixnum (1+ index-in-cold-toplevels)))
       (typecase toplevel-thing
         (function
          (funcall toplevel-thing))
-        (cons
-         (case (first toplevel-thing)
-           (:load-time-value
+        ((cons (eql :load-time-value))
             (setf (svref *!load-time-values* (third toplevel-thing))
                   (funcall (second toplevel-thing))))
-           (:load-time-value-fixup
+        ((cons (eql :load-time-value-fixup))
             (setf (sap-ref-word (int-sap (get-lisp-obj-address (second toplevel-thing)))
                                 (third toplevel-thing))
                   (get-lisp-obj-address
                    (svref *!load-time-values* (fourth toplevel-thing)))))
-           (defstruct
-            (apply 'sb!kernel::%defstruct (cdr toplevel-thing)))
-           (t
-            (!cold-lose "bogus fixup code in *!REVERSED-COLD-TOPLEVELS*"))))
-        (t (!cold-lose "bogus operation in *!REVERSED-COLD-TOPLEVELS*")))))
+        ((cons (eql defstruct))
+         (apply 'sb!kernel::%defstruct (cdr toplevel-thing)))
+        (t
+         (!cold-lose "bogus operation in *!COLD-TOPLEVELS*")))))
   (/show0 "done with loop over cold toplevel forms and fixups")
-  (unencapsulate '%failed-aver '!bootstrap)
-  (unencapsulate 'find-package '!bootstrap)
+
+  (show-and-call time-reinit)
 
   ;; Set sane values again, so that the user sees sane values instead
   ;; of whatever is left over from the last DECLAIM/PROCLAIM.
@@ -304,8 +307,6 @@
   (show-and-call !foreign-cold-init)
   #!-(and win32 (not sb-thread))
   (show-and-call signal-cold-init-or-reinit)
-  (/show0 "enabling internal errors")
-  (setf (extern-alien "internal_errors_enabled" int) 1)
 
   (show-and-call float-cold-init-or-reinit)
 
@@ -332,6 +333,9 @@
 
   ;; Enable normal (post-cold-init) behavior of INFINITE-ERROR-PROTECT.
   (setf sb!kernel::*maximum-error-depth* 10)
+  (/show0 "enabling internal errors")
+  (setf (extern-alien "internal_errors_enabled" int) 1)
+
 
   ; hppa heap is segmented, lisp and c uses a stub to call eachother
   #!+hpux (%primitive sb!vm::setup-return-from-lisp-stub)
@@ -490,11 +494,10 @@ process to continue normally."
 (defun unintern-init-only-stuff ()
   (let ((this-package (find-package "SB-INT")))
     ;; For some reason uninterning these:
-    ;;    DEF!TYPE DEF!CONSTANT DEF!MACRO DEF!STRUCT
+    ;;    DEF!TYPE DEF!CONSTANT DEF!STRUCT
     ;; does not work, they stick around as uninterned symbols.
     ;; Some other macros must expand into them. Ugh.
-    (dolist (s '(defenum defmacro-mundanely defun-cached
-                 with-globaldb-name
+    (dolist (s '(defenum defun-cached with-globaldb-name
                  .
                  #!+sb-show ()
                  #!-sb-show (/hexstr /nohexstr /noshow /noshow0 /noxhow

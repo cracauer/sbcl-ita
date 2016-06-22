@@ -84,6 +84,14 @@
 
 (declaim (ftype (sfunction (t) (unsigned-byte #.sb!vm:n-positive-fixnum-bits))
                 globaldb-sxhashoid))
+
+;;; In the host, we use the host's sxhash, but ensure that the result
+;;; is a target fixnum. The definition for the target occurs later, as it
+;;; relies on MIX, which is inlined.
+#+sb-xc-host
+(defun globaldb-sxhashoid (name)
+  (logand (sxhash name) sb!xc:most-positive-fixnum))
+
 (defstruct (info-hashtable (:conc-name info-env-))
   (storage (make-info-storage 30) :type simple-vector)
   (comparator #'equal :type function)
@@ -93,7 +101,7 @@
   ;; If no insertions are in progress, it is exactly right.
   (count 0 :type word))
 
-(def!method print-object ((self info-hashtable) stream)
+(defmethod print-object ((self info-hashtable) stream)
   (declare (stream stream))
   (print-unreadable-object (self stream :type t :identity t)
     (format stream "~D/~D entr~:@P" (info-env-count self)
@@ -515,7 +523,7 @@
 
 ;; Compute the number of elements needed to hold unpacked VECTOR after packing.
 ;; This is not "compute-packed-info-size" since that could be misconstrued
-;; and wanting the vector to be already packed.
+;; as expecting the vector to be already packed.
 ;;
 (defun compute-packified-info-size (vector &optional (end (length vector)))
   (declare (simple-vector vector)) ; unpacked format
@@ -1043,7 +1051,7 @@ This is interpreted as
 ;; The info for a symbol's fdefn must precede other info-numbers.
 ;; and SETF must be the first aux key if other aux keys are present.
 ;; The test function does not enforce these invariants.
-;; N.B. As this function starts with "!", is is omitted from the target image.
+#+nil ; for debugging only
 (defun !test-packify-infos (&rest lists)
   (flet ((check (plist)
            (and (evenp (length plist))
@@ -1125,21 +1133,6 @@ This is interpreted as
     (when newval
       (setf (symbol-info-vector symbol) newval))
     (values)))
-
-;; Return the globaldb info for SYMBOL. With respect to the state diagram
-;; presented at the definition of SYMBOL-PLIST, if the object in SYMBOL's
-;; info slot is LISTP, it is in state 1 or 3. Either way, take the CDR.
-;; Otherwise, it is in state 2 so return the value as-is.
-;; In terms of this function being named "-vector", implying always a vector,
-;; it is understood that NIL is a proxy for +NIL-PACKED-INFOS+, a vector.
-;;
-#-sb-xc-host
-(progn
- #!-symbol-info-vops (declaim (inline symbol-info-vector))
- (defun symbol-info-vector (symbol)
-  (let ((info-holder (symbol-info symbol)))
-    (truly-the (or null simple-vector)
-               (if (listp info-holder) (cdr info-holder) info-holder)))))
 
 ;;; The current *INFO-ENVIRONMENT*, a structure of type INFO-HASHTABLE.
 ;;; Cheat by setting to nil before the type is proclaimed

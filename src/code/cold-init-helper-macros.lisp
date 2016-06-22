@@ -37,10 +37,8 @@
             (setf *!cold-init-forms*
                   (nconc *!cold-init-forms* (copy-list forms)))
             nil)
-  ;; In the cross-compilation host Lisp, cold load might not be a
-  ;; meaningful concept and in any case would have happened long ago,
-  ;; so just execute the forms at load time (i.e. basically as soon as
-  ;; possible).
+  ;; In the cross-compilation host Lisp, cold load is not a
+  ;; meaningful concept. Just execute the forms at load time.
   #-sb-xc `(progn ,@forms))
 
 (defmacro !defun-from-collected-cold-init-forms (name)
@@ -78,6 +76,39 @@
     (set list (acons symbol
                      (cons value-form (package-name *package*))
                      (delete symbol (symbol-value list) :key #'car)))))
+
+(defmacro !set-load-form-method (class-name usable-by &optional method)
+  ;; If USABLE-BY is:
+  ;;  :host   - the host compiler can execute this M-L-F method
+  ;;  :xc     - the cross-compiler can execute this M-L-F method
+  ;;  :target - the target compiler can execute this M-L-F method
+  (assert (and usable-by
+               (every (lambda (x) (member x '(:host :xc :target)))
+                      usable-by)))
+  (multiple-value-bind (host-expr target-expr)
+      (case method
+        ((nil) ; default
+         (values '(cl:make-load-form-saving-slots obj :environment env)
+                 '(sb!xc:make-load-form-saving-slots obj :environment env)))
+        (:ignore-it
+         (values '(bug "Can't :ignore-it for host") :ignore-it))
+        (t
+         (assert (not (member :host usable-by)))
+         (values nil `(funcall ,method obj env))))
+    `(progn
+       ,@(when (or #+sb-xc-host (member :host usable-by))
+           `((defmethod make-load-form ((obj ,class-name) &optional env)
+               ,host-expr)))
+       ,@(when (or #+sb-xc-host (member :xc usable-by))
+           ;; Use the host's CLOS implementation to select the target's method.
+           `((defmethod sb!xc:make-load-form ((obj ,class-name) &optional env)
+               (declare (ignorable obj env))
+               ,target-expr)))
+       ,@(when (or #-sb-xc-host (member :target usable-by))
+           ;; Use the target's CLOS implementation
+           `((defmethod make-load-form ((obj ,class-name) &optional env)
+               (declare (ignorable obj env))
+               ,target-expr))))))
 
 ;;; FIXME: Consider renaming this file asap.lisp,
 ;;; and the renaming the various things

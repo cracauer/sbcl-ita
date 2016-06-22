@@ -172,7 +172,8 @@
 ;;; This macro should only be used inside a pseudo-atomic section,
 ;;; which should also cover subsequent initialization of the
 ;;; object.
-(defun allocation-tramp (alloc-tn size lowtag)
+(defun allocation-tramp (alloc-tn size lowtag
+                         &optional (result-tn alloc-tn))
   (cond ((typep size '(and integer (not (signed-byte 32))))
          ;; MOV accepts large immediate operands, PUSH does not
          (inst mov alloc-tn size)
@@ -181,9 +182,9 @@
          (inst push size)))
   (inst mov alloc-tn (make-fixup "alloc_tramp" :foreign))
   (inst call alloc-tn)
-  (inst pop alloc-tn)
+  (inst pop result-tn)
   (when lowtag
-    (inst or (reg-in-size alloc-tn :byte) lowtag))
+    (inst or (reg-in-size result-tn :byte) lowtag))
   (values))
 
 (defun allocation (alloc-tn size &optional ignored dynamic-extent lowtag)
@@ -219,11 +220,7 @@
                #!+gencgc
                ;; large objects will never be made in a per-thread region
                (and (integerp size)
-                    ;; Kludge: this is supposed to be
-                    ;;  (>= size (extern-alien "large_object_size" long))
-                    ;; but that won't cross-compile. So, a little OAOOM...
-                    (>= size (* 4 (max *backend-page-bytes* gencgc-card-bytes
-                                       gencgc-alloc-granularity)))))
+                    (>= size large-object-size)))
            (allocation-tramp alloc-tn size lowtag))
           (t
            (inst mov temp-reg-tn free-pointer)
@@ -241,17 +238,17 @@
            (inst cmp alloc-tn end-addr)
            (inst jmp :a NOT-INLINE)
            (inst mov free-pointer alloc-tn)
+           (emit-label DONE)
            (if lowtag
                (inst lea alloc-tn (make-ea :byte :base temp-reg-tn :disp lowtag))
                (inst mov alloc-tn temp-reg-tn))
-           (emit-label DONE)
            (assemble (*elsewhere*)
              (emit-label NOT-INLINE)
              (cond ((numberp size)
-                    (allocation-tramp alloc-tn size lowtag))
+                    (allocation-tramp alloc-tn size nil temp-reg-tn))
                    (t
                     (inst sub alloc-tn free-pointer)
-                    (allocation-tramp alloc-tn alloc-tn lowtag)))
+                    (allocation-tramp alloc-tn alloc-tn nil temp-reg-tn)))
              (inst jmp DONE))))
     (values)))
 
@@ -583,7 +580,7 @@
 
 ;;; helper for alien stuff.
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   #!+sb-doc
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
@@ -614,3 +611,28 @@ collection."
                            `(touch-object ,pin))
                          pins)))))
       `(progn ,@body)))
+
+;;; Emit the most compact form of the test immediate instruction,
+;;; using an 8 bit test when the immediate is only 8 bits and the
+;;; value is one of the four low registers (rax, rbx, rcx, rdx) or the
+;;; control stack.
+(defun emit-optimized-test-inst (x y)
+  (typecase y
+    ((unsigned-byte 7)
+     ;; If we knew that the sign bit would not be tested, this could
+     ;; handle (unsigned-byte 8) constants. But since we don't know,
+     ;; we assume that it's not ok to change the test such that the S flag
+     ;; comes out possibly differently.
+     (let ((offset (tn-offset x)))
+       (cond ((and (sc-is x any-reg descriptor-reg signed-reg unsigned-reg)
+                   (or (= offset rax-offset) (= offset rbx-offset)
+                       (= offset rcx-offset) (= offset rdx-offset)))
+              (inst test (reg-in-size x :byte) y))
+             ((sc-is x control-stack)
+              (inst test (make-ea :byte :base rbp-tn
+                                  :disp (frame-byte-offset offset))
+                    y))
+             (t
+              (inst test x y)))))
+    (t
+     (inst test x y))))

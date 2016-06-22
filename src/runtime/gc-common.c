@@ -55,6 +55,13 @@
 os_vm_size_t dynamic_space_size = DEFAULT_DYNAMIC_SPACE_SIZE;
 os_vm_size_t thread_control_stack_size = DEFAULT_CONTROL_STACK_SIZE;
 
+#ifndef LISP_FEATURE_GENCGC
+inline static boolean
+in_gc_p(void) {
+    return current_dynamic_space == from_space;
+}
+#endif
+
 inline static boolean
 forwarding_pointer_p(lispobj *pointer) {
     lispobj first_word=*pointer;
@@ -62,6 +69,7 @@ forwarding_pointer_p(lispobj *pointer) {
     return (first_word == 0x01);
 #else
     return (is_lisp_pointer(first_word)
+            && in_gc_p() /* cheneygc new_space_p() is broken when not in gc */
             && new_space_p(first_word));
 #endif
 }
@@ -149,31 +157,6 @@ scavenge(lispobj *start, sword_t n_words)
                 object_ptr++;
             }
         }
-#if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64)
-        /* This workaround is probably not needed for those ports
-           which don't have a partitioned register set (and therefore
-           scan the stack conservatively for roots). */
-        else if (n_words == 1) {
-            /* there are some situations where an other-immediate may
-               end up in a descriptor register.  I'm not sure whether
-               this is supposed to happen, but if it does then we
-               don't want to (a) barf or (b) scavenge over the
-               data-block, because there isn't one.  So, if we're
-               checking a single word and it's anything other than a
-               pointer, just hush it up */
-            int widetag = widetag_of(object);
-
-            if ((scavtab[widetag] == scav_lose) ||
-                (((sizetab[widetag])(object_ptr)) > 1)) {
-                fprintf(stderr,"warning: \
-attempted to scavenge non-descriptor value %x at %p.\n\n\
-If you can reproduce this warning, please send a bug report\n\
-(see manual page for details).\n",
-                        object, object_ptr);
-            }
-            object_ptr++;
-        }
-#endif
         else if (fixnump(object)) {
             /* It's a fixnum: really easy.. */
             object_ptr++;
@@ -675,7 +658,6 @@ scav_boxed(lispobj *where, lispobj object)
     return 1;
 }
 
-#ifdef LISP_FEATURE_INTERLEAVED_RAW_SLOTS
 boolean positive_bignum_logbitp(int index, struct bignum* bignum)
 {
   /* If the bignum in the layout has another pointer to it (besides the layout)
@@ -709,13 +691,13 @@ boolean positive_bignum_logbitp(int index, struct bignum* bignum)
 // Helper function for stepping through the tagged slots of an instance in
 // scav_instance and verify_space (which, as it happens, is not useful).
 void
-instance_scan_interleaved(void (*proc)(),
+instance_scan_interleaved(void (*proc)(lispobj*, sword_t),
                           lispobj *instance_ptr,
                           sword_t n_words,
                           lispobj *layout_obj)
 {
   struct layout *layout = (struct layout*)layout_obj;
-  lispobj untagged_metadata = layout->untagged_bitmap;
+  lispobj layout_bitmap = layout->bitmap;
   sword_t index;
 
   /* This code would be more efficient if the Lisp stored an additional format
@@ -726,27 +708,29 @@ instance_scan_interleaved(void (*proc)(),
      On the other hand, this may not be a bottleneck as-is */
 
   ++instance_ptr; // was supplied as the address of the header word
-  if (untagged_metadata == 0) {
+  if (layout_bitmap == 0) {
       proc(instance_ptr, n_words);
-  } else if (fixnump(untagged_metadata)) {
-      unsigned long bitmap = fixnum_value(untagged_metadata);
+  } else if (fixnump(layout_bitmap)) {
+      unsigned long bitmap = fixnum_value(layout_bitmap);
       for (index = 0; index < n_words ; index++, bitmap >>= 1)
           if (!(bitmap & 1))
               proc(instance_ptr + index, 1);
   } else { /* huge bitmap */
       struct bignum * bitmap;
-      bitmap = (struct bignum*)native_pointer(untagged_metadata);
+      bitmap = (struct bignum*)native_pointer(layout_bitmap);
       for (index = 0; index < n_words ; index++)
           if (!positive_bignum_logbitp(index, bitmap))
               proc(instance_ptr + index, 1);
   }
 }
-#endif
 
 static sword_t
 scav_instance(lispobj *where, lispobj header)
 {
-    sword_t ntotal = instance_length(header);
+    // instance_length() is the number of words following the header including
+    // the layout. If this is an even number, it should be made odd so that
+    // scav_instance() always consumes an even number of words in total.
+    sword_t ntotal = instance_length(header) | 1;
     lispobj* layout = (lispobj*)instance_layout(where);
 
     if (!layout)
@@ -755,12 +739,7 @@ scav_instance(lispobj *where, lispobj header)
     if (forwarding_pointer_p(layout))
         layout = native_pointer((lispobj)forwarding_pointer_value(layout));
 
-#ifdef LISP_FEATURE_INTERLEAVED_RAW_SLOTS
     instance_scan_interleaved(scavenge, where, ntotal, layout);
-#else
-    lispobj nuntagged = ((struct layout*)layout)->n_untagged_slots;
-    scavenge(where + 1, ntotal - fixnum_value(nuntagged));
-#endif
 
     return ntotal + 1;
 }
@@ -2497,13 +2476,19 @@ gc_search_space(lispobj *start, size_t words, lispobj *pointer)
 {
     while (words > 0) {
         size_t count = 1;
-        lispobj thing = *start;
+        lispobj *forwarded_start;
 
+        if (forwarding_pointer_p(start))
+            forwarded_start =
+                native_pointer((lispobj)forwarding_pointer_value(start));
+        else
+            forwarded_start = start;
+        lispobj thing = *forwarded_start;
         /* If thing is an immediate then this is a cons. */
         if (is_lisp_pointer(thing) || is_lisp_immediate(thing))
             count = 2;
         else
-            count = (sizetab[widetag_of(thing)])(start);
+            count = (sizetab[widetag_of(thing)])(forwarded_start);
 
         /* Check whether the pointer is within this object. */
         if ((pointer >= start) && (pointer < (start+count))) {
@@ -2851,7 +2836,7 @@ maybe_gc(os_context_t *context)
         /* Otherwise done by undo_fake_foreign_function_call. And
          something later wants them to be blocked. What a nice
          interface.*/
-        block_blockable_signals(0, 0);
+        block_blockable_signals(0);
     }
 
     FSHOW((stderr, "/maybe_gc: returning\n"));

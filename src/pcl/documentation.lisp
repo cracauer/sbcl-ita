@@ -15,13 +15,9 @@
     (variable
      (typecase x
        (symbol (values (info :variable :documentation x)))))
-    ;; FUNCTION is not used at the momemnt, just here for symmetry.
     (function
-     (cond ((functionp x)
-            (%fun-doc x))
-           ((and (legal-fun-name-p x) (fboundp x))
-            (%fun-doc (or (and (symbolp x) (macro-function x))
-                          (fdefinition x))))))
+     ;; Unused
+     (error "FUNCTION doc-type is not supported."))
     (structure
      (typecase x
        (symbol (cond
@@ -57,42 +53,11 @@
       (setf (slot-value x '%documentation) new-value)
       (setf (%fun-doc x) new-value)))
 
-;;; FIXME: There's already fun-name in code/describe.lisp, but it's
-;;; loaded after PCL, so it cannot be used, because we set
-;;; some documentation at the end of this file.
-(defun fun-name (x)
-  (if (typep x 'generic-function)
-      (sb-pcl:generic-function-name x)
-      (%fun-name x)))
-
-(defun real-function-name (name)
-  ;; Resolve the actual name of the function named by NAME
-  ;; e.g. (setf (name-function 'x) #'car)
-  ;; (real-function-name 'x) => CAR
-  (cond ((not (fboundp name))
-         nil)
-        ((and (symbolp name)
-              (special-operator-p name))
-         (%fun-name (fdefinition name)))
-        ((and (symbolp name)
-              (macro-function name))
-         (let ((name (%fun-name (macro-function name))))
-           (and (consp name)
-                (eq (car name) 'macro-function)
-                (cadr name))))
-        (t
-         (fun-name (fdefinition name)))))
-
-(defun ignore-nil-doc (type)
-  (style-warn "Ignoring doc-type ~a for ~a."
-              type nil))
-
 (defun set-function-name-documentation (name documentation)
-  (cond ((not name)
-         (ignore-nil-doc 'function))
-        ((not (legal-fun-name-p name))
+  (aver name)
+  (cond ((not (legal-fun-name-p name))
          nil)
-        ((not (equal (real-function-name name) name))
+        ((not (equal (sb-c::real-function-name name) name))
          (setf (random-documentation name 'function) documentation))
         (t
          (setf (fun-doc (or (and (symbolp name)
@@ -100,6 +65,27 @@
                             (fdefinition name)))
                documentation)))
   documentation)
+
+;;; Generic behavior
+
+(defmethod (setf documentation) :around (new-value (x (eql nil)) doc-type)
+  (style-warn "Ignoring doc-type ~a for ~a." doc-type nil)
+  new-value)
+
+;;; default if DOC-TYPE doesn't match one of the specified types
+(defmethod documentation (object doc-type)
+  (warn "unsupported DOCUMENTATION: doc-type ~S for object of type ~S"
+        doc-type (type-of object))
+  nil)
+
+;;; default if DOC-TYPE doesn't match one of the specified types
+(defmethod (setf documentation) (new-value object doc-type)
+  ;; CMU CL made this an error, but since ANSI says that even for supported
+  ;; doc types an implementation is permitted to discard docs at any time
+  ;; for any reason, this feels to me more like a warning. -- WHN 19991214
+  (warn "discarding unsupported DOCUMENTATION: doc-type ~S for object of type ~S"
+        doc-type (type-of object))
+  new-value)
 
 ;;; Deprecation note
 
@@ -134,7 +120,7 @@
                       doc-type)))
         (name (cond
                 ((typep x 'function)
-                 (fun-name x))
+                 (%fun-name x))
                 ((typep x 'class)
                  (class-name x))
                 (t
@@ -199,19 +185,11 @@
   (set-function-name-documentation x new-value))
 
 (defmethod (setf documentation) (new-value (x symbol) (doc-type (eql 'compiler-macro)))
-  (cond (x
-         (awhen (compiler-macro-function x)
-           (setf (documentation it t) new-value)))
-        (t
-         (ignore-nil-doc 'compiler-macro)
-         new-value)))
+  (awhen (compiler-macro-function x)
+    (setf (documentation it t) new-value)))
 
 (defmethod (setf documentation) (new-value (x symbol) (doc-type (eql 'setf)))
-  (cond (x
-         (setf (fdocumentation x 'setf) new-value))
-        (t
-         (ignore-nil-doc 'setf)
-         new-value)))
+  (setf (fdocumentation x 'setf) new-value))
 
 ;;; method combinations
 (defmethod documentation ((x method-combination) (doc-type (eql 't)))
@@ -234,11 +212,7 @@
 
 (defmethod (setf documentation)
     (new-value (x symbol) (doc-type (eql 'method-combination)))
-  (cond (x
-         (setf (random-documentation x 'method-combination) new-value))
-        (t
-         (ignore-nil-doc 'method-combination)
-         new-value)))
+  (setf (random-documentation x 'method-combination) new-value))
 
 ;;; methods
 (defmethod documentation ((x standard-method) (doc-type (eql 't)))
@@ -265,82 +239,62 @@
   (setf (package-doc-string x) new-value))
 
 ;;; types, classes, and structure names
-(defmethod documentation ((x structure-class) (doc-type (eql 't)))
-  (fdocumentation (class-name x) 'type))
 
-(defmethod documentation ((x structure-class) (doc-type (eql 'type)))
-  (fdocumentation (class-name x) 'type))
+(macrolet
+    ((define-type-documentation-methods (specializer get-form set-form)
+       `(progn
+          (defmethod documentation ((x ,specializer) (doc-type (eql 't)))
+            ,get-form)
 
-(defmethod documentation ((x class) (doc-type (eql 't)))
-  (slot-value x '%documentation))
+          (defmethod documentation ((x ,specializer) (doc-type (eql 'type)))
+            (documentation x t))
 
-(defmethod documentation ((x class) (doc-type (eql 'type))) ; TODO setf
-  (slot-value x '%documentation))
+          (defmethod (setf documentation) (new-value
+                                           (x ,specializer)
+                                           (doc-type (eql 't)))
+            ,set-form)
 
-(defmethod (setf documentation) (new-value
-                                 (x class)
-                                 (doc-type (eql 't)))
-  (setf (slot-value x '%documentation) new-value))
+          (defmethod (setf documentation) (new-value
+                                           (x ,specializer)
+                                           (doc-type (eql 'type)))
+            (setf (documentation x 't) new-value))))
+     (define-type-documentation-lookup-methods (doc-type)
+       `(progn
+          (defmethod documentation ((x symbol) (doc-type (eql ',doc-type)))
+            (acond
+             ((find-class x nil)
+              (documentation it t))
+             (t
+              (fdocumentation x ',doc-type))))
 
-(defmethod (setf documentation) (new-value
-                                 (x class)
-                                 (doc-type (eql 'type)))
-  (setf (slot-value x '%documentation) new-value))
+          (defmethod (setf documentation) (new-value
+                                           (x symbol)
+                                           (doc-type (eql ',doc-type)))
+            (acond
+             ((find-class x nil)
+              (setf (documentation it t) new-value))
+             (t
+              (setf (fdocumentation x ',doc-type) new-value)))))))
 
-;;; although the CLHS doesn't mention this, it is reasonable to assume
-;;; that parallel treatment of condition-class was intended (if
-;;; condition-class is in fact not implemented as a standard-class or
-;;; structure-class).
-(defmethod documentation ((x condition-class) (doc-type (eql 't)))
-  (fdocumentation (class-name x) 'type))
+  (define-type-documentation-methods structure-class
+      (fdocumentation (class-name x) 'type)
+      (setf (fdocumentation (class-name x) 'type) new-value))
 
-(defmethod documentation ((x condition-class) (doc-type (eql 'type)))
-  (fdocumentation (class-name x) 'type))
+  (define-type-documentation-methods class
+      (slot-value x '%documentation)
+      (setf (slot-value x '%documentation) new-value))
 
-(defmethod documentation ((x symbol) (doc-type (eql 'type)))
-  (or (fdocumentation x 'type)
-      (awhen (find-class x nil)
-        (slot-value it '%documentation))))
+  ;; although the CLHS doesn't mention this, it is reasonable to
+  ;; assume that parallel treatment of condition-class was intended
+  ;; (if condition-class is in fact not implemented as a
+  ;; standard-class or structure-class).
+  (define-type-documentation-methods condition-class
+      (fdocumentation (class-name x) 'type)
+      (setf (fdocumentation (class-name x) 'type) new-value))
 
-(defmethod documentation ((x symbol) (doc-type (eql 'structure)))
-  (fdocumentation x 'structure))
+  (define-type-documentation-lookup-methods type)
+  (define-type-documentation-lookup-methods structure))
 
-(defmethod (setf documentation) (new-value
-                                 (x structure-class)
-                                 (doc-type (eql 't)))
-  (setf (fdocumentation (class-name x) 'type) new-value))
-
-(defmethod (setf documentation) (new-value
-                                 (x structure-class)
-                                 (doc-type (eql 'type)))
-  (setf (fdocumentation (class-name x) 'type) new-value))
-
-(defmethod (setf documentation) (new-value
-                                 (x condition-class)
-                                 (doc-type (eql 't)))
-  (setf (fdocumentation (class-name x) 'type) new-value))
-
-(defmethod (setf documentation) (new-value
-                                 (x condition-class)
-                                 (doc-type (eql 'type)))
-  (setf (fdocumentation (class-name x) 'type) new-value))
-
-(defmethod (setf documentation) (new-value (x symbol) (doc-type (eql 'type)))
-  (if (or (structure-type-p x) (condition-type-p x))
-      (setf (fdocumentation x 'type) new-value)
-      (let ((class (find-class x nil)))
-        (if class
-            (setf (slot-value class '%documentation) new-value)
-            (setf (fdocumentation x 'type) new-value)))))
-
-(defmethod (setf documentation) (new-value
-                                 (x symbol)
-                                 (doc-type (eql 'structure)))
-  (cond (x
-         (setf (fdocumentation x 'structure) new-value))
-        (t
-         (ignore-nil-doc 'structure)
-         new-value)))
 
 ;;; variables
 (defmethod documentation ((x symbol) (doc-type (eql 'variable)))
@@ -349,28 +303,7 @@
 (defmethod (setf documentation) (new-value
                                  (x symbol)
                                  (doc-type (eql 'variable)))
-  (cond (x
-         (setf (fdocumentation x 'variable) new-value))
-        (t
-         (ignore-nil-doc 'variable)
-         new-value)))
-
-;;; default if DOC-TYPE doesn't match one of the specified types
-(defmethod documentation (object doc-type)
-  (warn "unsupported DOCUMENTATION: doc-type ~S for object of type ~S"
-        doc-type
-        (type-of object))
-  nil)
-
-;;; default if DOC-TYPE doesn't match one of the specified types
-(defmethod (setf documentation) (new-value object doc-type)
-  ;; CMU CL made this an error, but since ANSI says that even for supported
-  ;; doc types an implementation is permitted to discard docs at any time
-  ;; for any reason, this feels to me more like a warning. -- WHN 19991214
-  (warn "discarding unsupported DOCUMENTATION: doc-type ~S for object of type ~S"
-        doc-type
-        (type-of object))
-  new-value)
+  (setf (fdocumentation x 'variable) new-value))
 
 ;;; extra-standard methods, for getting at slot documentation
 (defmethod documentation ((slotd standard-slot-definition) (doc-type (eql 't)))

@@ -26,9 +26,21 @@
            expansion))
      `(type-expander ,name))))
 
-(defvar !*xc-processed-deftypes* nil)
-(def!macro sb!xc:deftype (&whole form name lambda-list &body body
-                          &environment env)
+;; Can't have a function called SIMPLE-TYPE-ERROR or TYPE-ERROR...
+;; FUNCTION returning NIL is as good as SFUNCTION returning NIL,
+;; so we don't care that this can't use (FTYPE (SFUNCTION ...)).
+;; But do we really need this? It's not highly useful.
+(declaim (ftype (function (t t t &rest t) #+(and sb-xc-host ccl) *
+                                          #-(and sb-xc-host ccl) nil) bad-type))
+(defun bad-type (datum type control &rest arguments)
+  (error 'simple-type-error
+         :datum datum
+         :expected-type type
+         :format-control control
+         :format-arguments arguments))
+
+(defmacro sb!xc:deftype (&whole form name lambda-list &body body
+                         &environment env)
   #!+sb-doc
   "Define a new type, with syntax like DEFMACRO."
   (declare (ignore env))
@@ -37,8 +49,6 @@
               form))
   (multiple-value-bind (expander-form doc source-location-form)
       (multiple-value-bind (forms decls doc) (parse-body body t)
-        ;; FIXME: CONSTANTP would need to understand backquote a little better
-        ;; to be of any help in expressions such as `(integer 1 ,max-foo).
         (acond ((and (not lambda-list) (not decls)
                     (let ((expr `(progn ,@forms)))
                       ;; While CONSTANTP works early, %MACROEXPAND does not,
@@ -58,11 +68,6 @@
                                    :doc-string-allowed :external
                                    :environment :ignore))))
     `(progn
-       #+sb-xc-host
-       (eval-when (:compile-toplevel)
-         ;; This needs to be in the macroexpansion when building the xc,
-         ;; but not when running the xc. But it's harmless in the latter.
-         (pushnew ',name !*xc-processed-deftypes*))
        (eval-when (:compile-toplevel :load-toplevel :execute)
          (%compiler-deftype ',name ,expander-form ,source-location-form
                             ,@(when doc `(,doc)))))))

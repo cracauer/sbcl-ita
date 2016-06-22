@@ -169,7 +169,6 @@
 ;;; Try it with and without tail call elimination, since they can have
 ;;; different effects.  (Specifically, if undefined_tramp is incorrect
 ;;; a stunted stack can result from the tail call variant.)
-
 (flet ((optimized ()
          (declare (optimize (speed 2) (debug 1))) ; tail call elimination
          (#:undefined-function 42))
@@ -182,11 +181,11 @@
 
   (with-test (:name (:backtrace :undefined-function :bug-346)
                     :skipped-on :interpreter
-                    ;; Failures on ALPHA, SPARC, and probably HPPA are
-                    ;; due to not having a full and valid stack frame
-                    ;; for the undefined function frame.  See PPC
+                    ;; Failures on SPARC, and probably HPPA are due to
+                    ;; not having a full and valid stack frame for the
+                    ;; undefined function frame.  See PPC
                     ;; undefined_tramp for details.
-                    :fails-on '(or :alpha :sparc))
+                    :fails-on '(or :sparc))
     (assert-backtrace
      (lambda () (test #'optimized))
      (list *undefined-function-frame*
@@ -239,15 +238,13 @@
          (funcall fun)))
 
   (with-test (:name (:backtrace :divide-by-zero :bug-346)
-                    :skipped-on :interpreter
-                    :fails-on :alpha)  ; bug 346
+                    :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'optimized))
                       `((/ 42 &rest)
                         ((flet test :in ,*p*) ,#'optimized))))
 
   (with-test (:name (:backtrace :divide-by-zero :bug-356)
-                    :skipped-on :interpreter
-                    :fails-on :alpha)  ; bug 356
+                    :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'not-optimized))
                       `((/ 42 &rest)
                         ((flet not-optimized :in ,*p*))
@@ -256,16 +253,19 @@
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on '(or (and :sparc :linux) :alpha))
+                  :fails-on '(and :sparc :linux))
   (assert-backtrace #'throw-test '((throw-test))))
 
-(defun bug-308926 (x)
-  (let ((v "foo"))
-    (flet ((bar (z)
-             (oops v z)
-             (oops z v)))
-      (bar x)
-      (bar v))))
+(funcall (checked-compile
+          '(lambda ()
+            (defun bug-308926 (x)
+              (let ((v "foo"))
+                (flet ((bar (z)
+                         (oops v z)
+                         (oops z v)))
+                  (bar x)
+                  (bar v)))))
+          :allow-style-warnings t))
 (with-test (:name (:backtrace :bug-308926) :skipped-on :interpreter)
   (assert-backtrace (lambda () (bug-308926 13))
                     '(((flet bar :in bug-308926) 13)
@@ -310,7 +310,9 @@
 
 (with-test (:name (:backtrace :xep-too-many-arguments)
             :skipped-on :interpreter)
-  (assert-backtrace (lambda () (oops 1 2 3 4 5 6))
+  ;; CHECKED-COMPILE avoids STYLE-WARNING noise.
+  (assert-backtrace (checked-compile '(lambda () (oops 1 2 3 4 5 6))
+                                     :allow-style-warnings t)
                     '((oops ? ? ? ? ? ?))))
 
 (defmacro defbt (n ll &body body)
@@ -319,20 +321,21 @@
   ;; slightly smarter, which meant that things which used to have xeps
   ;; suddently had tl-xeps, etc. This takes care of that.
   `(funcall
-    (compile nil
-             '(lambda ()
-               (progn
-                 ;; normal debug info
-                 (defun ,(intern (format nil "BT.~A.1" n)) ,ll
-                   ,@body)
-                 ;; no arguments saved
-                 (defun ,(intern (format nil "BT.~A.2" n)) ,ll
-                   (declare (optimize (debug 1) (speed 3)))
-                   ,@body)
-                 ;; no lambda-list saved
-                 (defun ,(intern (format nil "BT.~A.3" n)) ,ll
-                   (declare (optimize (debug 0)))
-                   ,@body))))))
+    (checked-compile
+     '(lambda ()
+        (progn
+          ;; normal debug info
+          (defun ,(intern (format nil "BT.~A.1" n)) ,ll
+            ,@body)
+          ;; no arguments saved
+          (defun ,(intern (format nil "BT.~A.2" n)) ,ll
+            (declare (optimize (debug 1) (speed 3)))
+            ,@body)
+          ;; no lambda-list saved
+          (defun ,(intern (format nil "BT.~A.3" n)) ,ll
+            (declare (optimize (debug 0)))
+            ,@body)))
+     :allow-style-warnings t)))
 
 (defbt 1 (&key key)
   (list key))
@@ -373,18 +376,26 @@
   (assert-backtrace #'namestring '((namestring))))
 
 (with-test (:name (:backtrace :more-processor))
-  (assert-backtrace (lambda () (bt.1.1 :key))
+  ;; CHECKED-COMPILE avoids STYLE-WARNING noise.
+  (assert-backtrace (checked-compile '(lambda () (bt.1.1 :key))
+                                     :allow-style-warnings t)
                     '(((bt.1.1 :key) (:more :optional)))
                     :details t)
-  (assert-backtrace (lambda () (bt.1.2 :key))
+  (assert-backtrace (checked-compile '(lambda () (bt.1.2 :key))
+                                     :allow-style-warnings t)
                     '(((bt.1.2 ?) (:more :optional)))
                     :details t)
   (assert-backtrace (lambda () (bt.1.3 :key))
                     `(((bt.1.3 . ,*unavailable-lambda-list*) (:more :optional)))
                     :details t)
-  (assert-backtrace (lambda () (bt.1.1 :key)) '((bt.1.1 :key)))
-  (assert-backtrace (lambda () (bt.1.2 :key)) '((bt.1.2 &rest)))
-  (assert-backtrace (lambda () (bt.1.3 :key)) '((bt.1.3 &rest))))
+  (assert-backtrace (checked-compile '(lambda () (bt.1.1 :key))
+                                     :allow-style-warnings t)
+                    '((bt.1.1 :key)))
+  (assert-backtrace (checked-compile '(lambda () (bt.1.2 :key))
+                                     :allow-style-warnings t)
+                    '((bt.1.2 &rest)))
+  (assert-backtrace (lambda () (bt.1.3 :key))
+                    '((bt.1.3 &rest))))
 
 (with-test (:name (:backtrace :xep))
   (assert-backtrace #'bt.2.1 '(((bt.2.1) (:external))) :details t)
@@ -460,11 +471,11 @@
                     `((bt.7.3 . ,*unavailable-lambda-list*))))
 
 (defvar *compile-nil-error*
-  (compile nil '(lambda (x)
-                 (cons (when x (error "oops")) nil))))
+  (checked-compile '(lambda (x)
+                      (cons (when x (error "oops")) nil))))
 (defvar *compile-nil-non-tc*
-  (compile nil '(lambda (y)
-                 (cons (funcall *compile-nil-error* y) nil))))
+  (checked-compile '(lambda (y)
+                      (cons (funcall *compile-nil-error* y) nil))))
 (with-test (:name (:backtrace compile nil))
   (assert-backtrace (lambda () (funcall *compile-nil-non-tc* 13))
                     `(((lambda (x) :in ,*p*) 13)
@@ -472,31 +483,34 @@
 
 (with-test (:name (:backtrace :clos-slot-typecheckfun-named))
   (assert-backtrace
-   (lambda ()
-     (eval `(locally (declare (optimize safety))
-              (defclass clos-typecheck-test ()
-                ((slot :type fixnum)))
-              (setf (slot-value (make-instance 'clos-typecheck-test) 'slot) t))))
+   (checked-compile
+    `(lambda ()
+       (locally (declare (optimize safety))
+         (defclass clos-typecheck-test ()
+           ((slot :type fixnum)))
+         (setf (slot-value (make-instance 'clos-typecheck-test) 'slot) t))))
    '(((sb-pcl::slot-typecheck fixnum) t))))
 
 (with-test (:name (:backtrace :clos-emf-named))
   (assert-backtrace
-   (lambda ()
-     (eval `(progn
-              (defgeneric clos-emf-named-test (x)
-                (:method ((x symbol)) x)
-                (:method :before (x) (assert x)))
-              (clos-emf-named-test nil))))
+   (checked-compile
+    `(lambda ()
+       (progn
+         (defgeneric clos-emf-named-test (x)
+           (:method ((x symbol)) x)
+           (:method :before (x) (assert x)))
+         (clos-emf-named-test nil)))
+    :allow-style-warnings t)
    '(((sb-pcl::emf clos-emf-named-test) ? ? nil))))
 
 (with-test (:name (:backtrace :bug-310173))
   (flet ((make-fun (n)
            (let* ((names '(a b))
                   (req (loop repeat n collect (pop names))))
-             (compile nil
-                      `(lambda (,@req &rest rest)
-                         (let ((* *)) ; no tail-call
-                           (apply '/ ,@req rest)))))))
+             (checked-compile
+              `(lambda (,@req &rest rest)
+                 (let ((* *)) ; no tail-call
+                   (apply '/ ,@req rest)))))))
     (assert-backtrace (lambda ()
                         (funcall (make-fun 0) 10 11 0))
                       `((sb-kernel:two-arg-/ 10/11 0)
@@ -536,6 +550,7 @@
 
 (defun fact (n) (if (zerop n) (error "nope") (* n (fact (1- n)))))
 
+#+sb-fasteval
 (with-test (:name (:backtrace :interpreted-factorial)
             :skipped-on '(not :interpreter))
   (assert-backtrace

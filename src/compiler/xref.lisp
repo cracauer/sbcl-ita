@@ -11,7 +11,7 @@
 
 (in-package "SB!C")
 
-(defvar *xref-kinds* '(:binds :calls :sets :references :macroexpands))
+(defglobal *xref-kinds* '(:binds :calls :sets :references :macroexpands))
 
 (defun record-component-xrefs (component)
   (declare (type component component))
@@ -94,7 +94,7 @@
           (let* ((name (leaf-debug-name leaf)))
             (case (global-var-kind leaf)
               ;; Reading a special
-              (:special
+              ((:special :global)
                (record-xref :references name context node nil))
               ;; Calling a function
               (:global-function
@@ -110,9 +110,9 @@
           (record-xref :references (ref-%source-name node) context node nil)))))
     ;; Setting a special variable
     (cset
-     (let* ((var (set-var node)))
+     (let ((var (set-var node)))
        (when (and (global-var-p var)
-                  (eq :special (global-var-kind var)))
+                  (memq (global-var-kind var) '(:special :global)))
          (record-xref :sets
                       (leaf-debug-name var)
                       context
@@ -148,10 +148,10 @@
                          #+sb-xc-host (find-package "SB-XC")
                          (remove-if-not
                           (lambda (package)
-                            (= (mismatch "SB!"
+                            (= (mismatch #+sb-xc "SB-" #-sb-xc "SB!"
                                          (package-name package))
                                3))
-                          (list-all-packages)))))
+                          (list-all-packages))) t))
          #+sb-xc-host   ; again, special case like in genesis and dump
          (multiple-value-bind (cl-symbol cl-status)
              (find-symbol (symbol-name what) sb!int:*cl-package*)
@@ -160,12 +160,10 @@
 
 (defun record-xref (kind what context node path)
   (unless (internal-name-p what)
-    (let ((path (reverse
-                 (source-path-original-source
-                  (or path
-                      (node-source-path node))))))
-      (push (list what path)
-            (getf (functional-xref context) kind)))))
+    (push (cons what
+                (source-path-form-number (or path
+                                             (node-source-path node))))
+          (getf (functional-xref context) kind))))
 
 (defun record-macroexpansion (what block path)
   (unless (internal-name-p what)
@@ -184,9 +182,14 @@
             for i from 0
             for values = (remove-duplicates (getf xref-data key)
                                             :test #'equal)
-            for flattened = (reduce #'append values :from-end t)
-            collect (setf (aref array i)
-                          (when flattened
-                            (make-array (length flattened)
-                                        :initial-contents flattened))))
+            do
+            (setf (aref array i)
+                  (when values
+                    (let* ((length (* (length values) 2))
+                           (data (make-array length)))
+                      (loop for i below length by 2
+                            for (name . number) in values
+                            do (setf (aref data i) name
+                                     (aref data (1+ i)) number))
+                      data))))
       array)))

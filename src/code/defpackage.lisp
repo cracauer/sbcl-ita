@@ -27,9 +27,10 @@
     ;; is free to :USE (PACKAGE-USE-LIST :CL-USER) anyway.:-|
     nil))
 
-;; "mundanely" because this macro can't work (never has, never will)
-;; until the target system is fully operational.
-(defmacro-mundanely defpackage (package &rest options)
+;; this macro can't work (never has, never will) until the target system
+;; is fully operational, so push it down to non-toplevel.
+(let ()
+(defmacro defpackage (package &rest options)
   #!+sb-doc
   #.(format nil
   "Defines a new package called PACKAGE. Each of OPTIONS should be one of the
@@ -72,7 +73,10 @@
                :format-arguments (list option)))
       (case (car option)
         (:nicknames
-         (setf nicknames (stringify-package-designators (cdr option))))
+         (setf nicknames
+               (append
+                nicknames
+                (stringify-package-designators (cdr option)))))
         (:local-nicknames
          (setf local-nicknames
                (append local-nicknames
@@ -158,6 +162,7 @@
                     ',lock (sb!c:source-location)
                     ,@(and doc
                            `(,doc))))))
+)
 
 (defun check-disjoint (&rest args)
   ;; An arg is (:key . set)
@@ -249,7 +254,7 @@
                   exports)
           package)
   ;; Everything was created: update metadata
-  (sb!c:with-source-location (source-location)
+  (when source-location
     (setf (package-source-location package) source-location))
   (setf (package-doc-string package) doc-string)
   #!+sb-package-locks

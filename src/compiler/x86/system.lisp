@@ -60,17 +60,27 @@
 
     DONE
     (inst movzx result al-tn)))
+
+(define-vop (%other-pointer-widetag)
+  (:translate %other-pointer-widetag)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (inst movzx result (make-ea :byte :base object
+                                      :disp (- other-pointer-lowtag)))))
+
 
 (define-vop (fun-subtype)
   (:translate fun-subtype)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
-  (:temporary (:sc byte-reg :from (:eval 0) :to (:eval 1)) temp)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (load-type temp function (- fun-pointer-lowtag))
-    (inst movzx result temp)))
+    (inst movzx result (make-ea :byte :base function
+                                      :disp (- fun-pointer-lowtag)))))
 
 (define-vop (set-fun-subtype)
   (:translate (setf fun-subtype))
@@ -120,7 +130,7 @@
   (:generator 6
     (move eax data)
     (inst shl eax (- n-widetag-bits 2))
-    (inst mov al-tn (make-ea :byte :base x :disp (- other-pointer-lowtag)))
+    (load-type al-tn x (- other-pointer-lowtag))
     (storew eax x 0 other-pointer-lowtag)
     (move res x)))
 
@@ -436,11 +446,11 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;;
 
-(defknown %cons-cas-pair (cons t t t t) (values t t &optional))
+(defknown %cons-cas-pair (cons t t t t) (values t t))
 ;; These unsafely permits cmpxchg on any kind of vector, boxed or unboxed
 ;; and the same goes for instances.
-(defknown %vector-cas-pair (simple-array index t t t t) (values t t &optional))
-(defknown %instance-cas-pair (instance index t t t t) (values t t &optional))
+(defknown %vector-cas-pair (simple-array index t t t t) (values t t))
+(defknown %instance-cas-pair (instance index t t t t) (values t t))
 
 (macrolet
     ((define-cmpxchg-vop (name memory-operand more-stuff &optional index-arg)

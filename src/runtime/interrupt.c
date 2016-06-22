@@ -68,6 +68,28 @@
 #include "genesis/simple-fun.h"
 #include "genesis/cons.h"
 
+/*
+ * This is a workaround for some slightly silly Linux/GNU Libc
+ * behaviour: glibc defines sigset_t to support 1024 signals, which is
+ * more than the kernel.  This is usually not a problem, but becomes
+ * one when we want to save a signal mask from a ucontext, and restore
+ * it later into another ucontext: the ucontext is allocated on the
+ * stack by the kernel, so copying a libc-sized sigset_t into it will
+ * overflow and cause other data on the stack to be corrupted */
+/* FIXME: do not rely on NSIG being a multiple of 8 */
+
+#ifdef LISP_FEATURE_WIN32
+# define REAL_SIGSET_SIZE_BYTES (4)
+#else
+# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+#endif
+
+static inline void
+sigcopyset(sigset_t *new, sigset_t *old)
+{
+    memcpy(new, old, REAL_SIGSET_SIZE_BYTES);
+}
+
 /* When we catch an internal error, should we pass it back to Lisp to
  * be handled in a high-level way? (Early in cold init, the answer is
  * 'no', because Lisp is still too brain-dead to handle anything.
@@ -413,30 +435,20 @@ check_gc_signals_blocked_or_lose(sigset_t *sigset)
 #endif
 
 void
-block_deferrable_signals(sigset_t *where, sigset_t *old)
+block_deferrable_signals(sigset_t *old)
 {
 #if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
-    block_signals(&deferrable_sigset, where, old);
+    block_signals(&deferrable_sigset, 0, old);
 #endif
 }
 
 void
-block_blockable_signals(sigset_t *where, sigset_t *old)
+block_blockable_signals(sigset_t *old)
 {
 #if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
-    block_signals(&blockable_sigset, where, old);
+    block_signals(&blockable_sigset, 0, old);
 #endif
 }
-
-#ifndef LISP_FEATURE_SB_SAFEPOINT
-void
-block_gc_signals(sigset_t *where, sigset_t *old)
-{
-#if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
-    block_signals(&gc_sigset, where, old);
-#endif
-}
-#endif
 
 void
 unblock_deferrable_signals(sigset_t *where, sigset_t *old)
@@ -448,14 +460,6 @@ unblock_deferrable_signals(sigset_t *where, sigset_t *old)
     check_gc_signals_unblocked_or_lose(where);
 #endif
     unblock_signals(&deferrable_sigset, where, old);
-#endif
-}
-
-void
-unblock_blockable_signals(sigset_t *where, sigset_t *old)
-{
-#if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
-    unblock_signals(&blockable_sigset, where, old);
 #endif
 }
 
@@ -515,7 +519,7 @@ maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset)
     sigset_t oldset;
     /* Obviously, this function is called when signals may not be
      * blocked. Let's make sure we are not interrupted. */
-    block_blockable_signals(0, &oldset);
+    block_blockable_signals(&oldset);
 #ifndef LISP_FEATURE_SB_THREAD
     /* With threads a SIG_STOP_FOR_GC and a normal GC may also want to
      * block. */
@@ -774,7 +778,7 @@ undo_fake_foreign_function_call(os_context_t *context)
 {
     struct thread *thread=arch_os_get_current_thread();
     /* Block all blockable signals. */
-    block_blockable_signals(0, 0);
+    block_blockable_signals(0);
 
     foreign_function_call_active_p(thread) = 0;
 
@@ -1460,7 +1464,9 @@ arrange_return_to_c_function(os_context_t *context,
      * must obviously exist in reality.  That would be post_signal_tramp
      */
 
+#ifndef LISP_FEATURE_DARWIN
     u32 *sp=(u32 *)*os_context_register_addr(context,reg_ESP);
+#endif
 
 #if defined(LISP_FEATURE_DARWIN)
     u32 *register_save_area = (u32 *)os_validate(0, 0x40);
@@ -1597,7 +1603,9 @@ void
 arrange_return_to_lisp_function(os_context_t *context, lispobj function)
 {
 #if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_X86)
-    arrange_return_to_c_function(context, call_into_lisp_tramp, function);
+    arrange_return_to_c_function(context,
+                                 (call_into_lisp_lookalike)call_into_lisp_tramp,
+                                 function);
 #else
     arrange_return_to_c_function(context, call_into_lisp, function);
 #endif
@@ -1819,7 +1827,7 @@ see_if_sigaction_nodefer_works(void)
 static void *
 signal_thread_trampoline(void *pthread_arg)
 {
-    int signo = (int) pthread_arg;
+    intptr_t signo = (intptr_t) pthread_arg;
     os_context_t fake_context;
     siginfo_t fake_info;
 #ifdef LISP_FEATURE_PPC
@@ -1833,9 +1841,9 @@ signal_thread_trampoline(void *pthread_arg)
     fake_context.uc_mcontext.uc_regs = &uc_regs;
 #endif
 
-    *os_context_pc_addr(&fake_context) = &signal_thread_trampoline;
+    *os_context_pc_addr(&fake_context) = (intptr_t) &signal_thread_trampoline;
 #ifdef ARCH_HAS_STACK_POINTER /* aka x86(-64) */
-    *os_context_sp_addr(&fake_context) = __builtin_frame_address(0);
+    *os_context_sp_addr(&fake_context) = (intptr_t) __builtin_frame_address(0);
 #endif
 
     signal_handler_callback(interrupt_handlers[signo].lisp,
@@ -1884,7 +1892,7 @@ spawn_signal_thread_handler(int signal, siginfo_t *info, void *void_context)
         goto lost;
     if (pthread_attr_setstacksize(&attr, thread_control_stack_size))
         goto lost;
-    if (pthread_create(&th, &attr, &signal_thread_trampoline, (void*) signal))
+    if (pthread_create(&th, &attr, &signal_thread_trampoline, (void*)(intptr_t) signal))
         goto lost;
     if (pthread_attr_destroy(&attr))
         goto lost;
@@ -1991,7 +1999,7 @@ install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
 
     FSHOW((stderr, "/entering POSIX install_handler(%d, ..)\n", signal));
 
-    block_blockable_signals(0, &old);
+    block_blockable_signals(&old);
 
     FSHOW((stderr, "/interrupt_low_level_handlers[signal]=%p\n",
            interrupt_low_level_handlers[signal]));
@@ -2038,6 +2046,9 @@ install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
 void
 sigabrt_handler(int signal, siginfo_t *info, os_context_t *context)
 {
+    /* Save the interrupt context. No need to undo it, since lose()
+     * shouldn't return. */
+    fake_foreign_function_call(context);
     lose("SIGABRT received.\n");
 }
 
@@ -2091,6 +2102,10 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
     * now -- some address is better then no address in this case.
     */
     current_memory_fault_address = addr;
+
+    /* If we lose on corruption, provide LDB with debugging information. */
+    fake_foreign_function_call(context);
+
     /* To allow debugging memory faults in signal handlers and such. */
     corruption_warning_and_maybe_lose("Memory fault at %p (pc=%p, sp=%p)",
                                       addr,
@@ -2101,12 +2116,15 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
                                       0
 #endif
                                       );
-    unblock_signals_in_context_and_maybe_warn(context);
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+    undo_fake_foreign_function_call(context);
+    unblock_signals_in_context_and_maybe_warn(context);
     arrange_return_to_lisp_function(context,
                                     StaticSymbolFunction(MEMORY_FAULT_ERROR));
 #else
+    unblock_gc_signals(0, 0);
     funcall0(StaticSymbolFunction(MEMORY_FAULT_ERROR));
+    undo_fake_foreign_function_call(context);
 #endif
 }
 #endif

@@ -208,19 +208,13 @@ This is SETFable."
 
 ;;;; runtime C values that don't correspond directly to Lisp types
 
-;;; Note: The DEFSTRUCT for ALIEN-VALUE lives in a separate file
-;;; 'cause it has to be real early in the cold-load order.
-#!-sb-fluid (declaim (freeze-type alien-value))
-(def!method print-object ((value alien-value) stream)
+(defmethod print-object ((value alien-value) stream)
+  ;; Don't use ":TYPE T" here - TYPE-OF isn't what we want.
   (print-unreadable-object (value stream)
-    ;; See identical kludge in host-alieneval.
-    (let ((sb!pretty:*pprint-quote-with-syntactic-sugar* nil))
-      (declare (special sb!pretty:*pprint-quote-with-syntactic-sugar*))
-      (format stream
-            "~S ~S #X~8,'0X ~S ~S"
+    (format stream "~S ~S #X~8,'0X ~S ~/sb!impl:print-type-specifier/"
             'alien-value
             :sap (sap-int (alien-value-sap value))
-            :type (unparse-alien-type (alien-value-type value))))))
+            :type (unparse-alien-type (alien-value-type value)))))
 
 #!-sb-fluid (declaim (inline null-alien))
 (defun null-alien (x)
@@ -236,11 +230,6 @@ This is SETFable."
     (if (eq (compute-alien-rep-type alien-type) 'system-area-pointer)
         `(%sap-alien ,sap ',alien-type)
         (error "cannot make an alien of type ~S out of a SAP" type))))
-
-(defun %sap-alien (sap type)
-  (declare (type system-area-pointer sap)
-           (type alien-type type))
-  (make-alien-value :sap sap :type type))
 
 (defun alien-sap (alien)
   #!+sb-doc
@@ -339,6 +328,28 @@ Examples:
     (if (and (not (eql 0 bytes)) (eql 0 (sap-int sap)))
         (malloc-error bytes (get-errno))
         sap)))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *saved-fp-and-pcs* nil)
+  ;; Can't use DECLAIM since always-bound is a non-standard declaration
+  (sb!xc:proclaim '(sb!ext:always-bound *saved-fp-and-pcs*)))
+
+#!+c-stack-is-control-stack
+(declaim (inline invoke-with-saved-fp-and-pc))
+;;; On :c-stack-is-control-stack platforms, this DEFUN must appear prior to the
+;;; first cross-compile-time use of ALIEN-FUNCALL, the transform of which is
+;;; an invocation of INVOKE-WITH-SAVED-FP-AND-PC, which should be inlined.
+;;; Makes no sense when compiling for the host.
+#!+(and c-stack-is-control-stack (host-feature sb-xc))
+(defun invoke-with-saved-fp-and-pc (fn)
+  (declare #-sb-xc-host (muffle-conditions compiler-note)
+           (optimize (speed 3)))
+  (dx-let ((fp-and-pc (make-array 2 :element-type 'word)))
+    (setf (aref fp-and-pc 0) (sb!kernel:get-lisp-obj-address
+                              (sb!kernel:%caller-frame))
+          (aref fp-and-pc 1) (sap-int (sb!kernel:%caller-pc)))
+    (dx-let ((*saved-fp-and-pcs* (cons fp-and-pc *saved-fp-and-pcs*)))
+      (funcall fn))))
 
 #!-sb-fluid (declaim (inline free-alien))
 (defun free-alien (alien)
@@ -1031,6 +1042,7 @@ ENTER-ALIEN-CALLBACK pulls the corresponding trampoline out and calls it.")
 
 ;;;; interface (not public, yet) for alien callbacks
 
+(let ()
 (defmacro alien-callback (specifier function &environment env)
   #!+sb-doc
   "Returns an alien-value with of alien ftype SPECIFIER, that can be passed to
@@ -1050,7 +1062,7 @@ one."
                                               ',(alien-callback-lisp-wrapper-lambda
                                                  specifier result-type argument-types env))))
                            ,call-type)
-      ',(parse-alien-type specifier env))))
+      ',(parse-alien-type specifier env)))))
 
 (defun alien-callback-p (alien)
   #!+sb-doc
@@ -1107,6 +1119,7 @@ callback signal an error."
 ;;;
 ;;; For lambdas that result in simple-funs we get the callback from
 ;;; the cache on subsequent calls.
+(let ()
 (defmacro alien-lambda (result-type typed-lambda-list &body forms)
   (multiple-value-bind (specifier lambda-list)
       (parse-callback-specification result-type typed-lambda-list)
@@ -1126,3 +1139,4 @@ the alien callback for that function with the given alien type."
     `(progn
        (defun ,name ,lambda-list ,@forms)
        (defparameter ,name (alien-callback ,specifier #',name)))))
+)

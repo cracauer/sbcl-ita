@@ -34,7 +34,6 @@
 
 (def!struct (prim-object-slot
              (:constructor make-slot (name docs rest-p offset special options))
-             (:make-load-form-fun just-dump-it-normally)
              (:conc-name slot-))
   (name nil :type symbol :read-only t)
   (docs nil :type (or null simple-string) :read-only t)
@@ -45,7 +44,7 @@
   ;; referenced as special variables, this slot holds the name of that variable.
   (special nil :type symbol :read-only t))
 
-(def!struct (primitive-object (:make-load-form-fun just-dump-it-normally))
+(def!struct (primitive-object)
   (name nil :type symbol :read-only t)
   (widetag nil :type symbol :read-only t)
   (lowtag nil :type symbol :read-only t)
@@ -53,6 +52,10 @@
   (slots nil :type list :read-only t)
   (size 0 :type fixnum :read-only t)
   (variable-length-p nil :type (member t nil) :read-only t))
+
+(declaim (freeze-type prim-object-slot primitive-object))
+(!set-load-form-method prim-object-slot (:host :xc))
+(!set-load-form-method primitive-object (:host :xc))
 
 (defvar *primitive-objects* nil)
 
@@ -83,8 +86,23 @@
                        (set-known nil set-known-p) set-trans
                        cas-trans
                        special
+                       pointer
                        &allow-other-keys)
             (if (atom spec) (list spec) spec)
+          #!-alpha
+          (declare (ignorable pointer))
+          #!+alpha
+          (when pointer
+            ;; Pointer values on ALPHA are 64 bits wide, and
+            ;; double-word aligned.  We may also wish to have such a
+            ;; mode for other 64-bit hardware outside of any defined
+            ;; 32-on-64 ABI (which would presumably have 32-bit
+            ;; pointers in the first place, obviating the alignment
+            ;; and size requirements).
+            (unless rest-p
+              (setf length 2))
+            (when (oddp offset)
+              (incf offset)))
           (slots (make-slot slot-name docs rest-p offset special
                             (remove-keywords options
                                              '(:docs :rest-p :length))))

@@ -349,9 +349,16 @@
 (assert (not (type= (specifier-type '(function (t) (values &optional)))
                     (specifier-type '(function (t) (values))))))
 
-;; Why this assertion? Because INDEX type is defined in 'early-extensions'
-;; which is far removed from the logic to return *INDEX-TYPE* which is
-;; hardwired into the kernel. We had best ensure that it remains correct.
-(assert (type= (specifier-type 'index) *index-type*))
+;; Assert that these types are interned by parsing each twice,
+;; dropping the specifier-type cache in between.
+(dolist (spec '(index cons null boolean character base-char extended-char))
+  (let ((a (specifier-type spec)))
+    (drop-all-hash-caches)
+    (let ((b (specifier-type spec)))
+      (assert (eq a b)))))
+(drop-all-hash-caches)
+;; BOOLEAN's deftype lists the members as (T NIL),
+;; but it should also be EQ to (MEMBER NIL T)
+(assert (eq (specifier-type '(member nil t)) (specifier-type 'boolean)))
 
 (/show "done with tests/type.before-xc.lisp")

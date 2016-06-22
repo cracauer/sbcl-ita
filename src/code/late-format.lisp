@@ -11,7 +11,17 @@
 
 ;;;; TOKENIZE-CONTROL-STRING
 
-(defun tokenize-control-string (string)
+;;; The case for caching is to speed up out-of-line calls that use a fixed
+;;; control string in a loop, not to avoid re-tokenizing all strings that
+;;; happen to be STRING= to that string.
+(defun-cached (tokenize-control-string
+               :hash-bits 7
+               :hash-function #+sb-xc-host
+                              (lambda (x) (declare (ignore x)) 1)
+                              #-sb-xc-host #'pointer-hash)
+    ;; Due to string mutability, the comparator is STRING=
+    ;; even though the hash is address-based.
+    ((string string=))
   (declare (simple-string string))
   (let ((index 0)
         (end (length string))
@@ -267,7 +277,7 @@
      (values `(write-string ,directive stream)
              more-directives))))
 
-(defmacro-mundanely expander-next-arg (string offset)
+(sb!xc:defmacro expander-next-arg (string offset)
   `(if args
        (pop args)
        (error 'format-error
@@ -1472,3 +1482,41 @@
 
   (sb!c:define-source-transform write-to-string (object &rest keys)
     (expand 'write-to-string object keys)))
+
+;;; A long as we're processing ERROR strings to remove "SB!" packages,
+;;; we might as well squash out tilde-newline-whitespace too.
+;;; This might even be robust enough to keep in the target image,
+;;; but, FIXME: this punts on ~newline with {~@,~:,~@:} modifiers
+#+sb-xc-host
+(defun sb!impl::!xc-preprocess-format-control (string)
+  (let (pieces ltrim)
+    ;; Tokenizing is the correct way to deal with "~~/foo/"
+    ;; without mistaking it for an occurrence of the "~/" directive.
+    (dolist (piece (tokenize-control-string string)
+                   (let ((new (apply 'concatenate 'string (nreverse pieces))))
+                     (if (string/= new string) new string)))
+      (etypecase piece
+        (string
+         (if ltrim
+             (let ((p (position-if
+                       (lambda (x) (and (not (eql x #\Space)) (graphic-char-p x)))
+                       piece)))
+               (when p
+                 (push (subseq piece p) pieces)))
+             (push piece pieces))
+         (setq ltrim nil))
+        (format-directive
+         (setq ltrim nil)
+         (let ((text (subseq string
+                             (format-directive-start piece)
+                             (format-directive-end piece)))
+               (processed nil))
+           (cond ((and (eql (format-directive-character piece) #\Newline)
+                       (not (format-directive-colonp piece))
+                       (not (format-directive-atsignp piece)))
+                  (setq ltrim t processed t))
+                 ((eql (format-directive-character piece) #\/)
+                  (when (string-equal text "~/sb!" :end1 5)
+                    (setq text (concatenate 'string "~/sb-" (subseq text 5))))))
+           (unless processed
+             (push text pieces))))))))

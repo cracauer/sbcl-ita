@@ -19,7 +19,7 @@
                                        :key #'car :from-end t))))
                `(progn
                   (declaim ((simple-vector ,n) **internal-error-handlers**))
-                  (defglobal **internal-error-handlers**
+                  (!defglobal **internal-error-handlers**
                     (make-array ,n :initial-element 0))))))
   (def-it))
 
@@ -84,6 +84,8 @@
     (when (listp tag)
       (multiple-value-bind (name frame)
           (sb!debug::find-interrupted-name-and-frame)
+        ;; KLUDGE: can't inline due to build ordering problem.
+        (declare (notinline sb!di:frame-debug-fun))
         (let ((down (and (eq name 'sb!c::unwind) ; is this tautological ?
                          (sb!di:frame-down frame))))
           (when frame
@@ -159,62 +161,6 @@
   ;; recursive error.
   (%primitive print "Thread local storage exhausted.")
   (sb!impl::%halt))
-
-
-;;;; fetching errorful function name
-
-;;; This flag is used to prevent infinite recursive lossage when
-;;; we can't find the caller for some reason.
-(defvar *finding-frame* nil)
-
-(defun find-caller-frame ()
-  (unless *finding-frame*
-    (handler-case
-        (let* ((*finding-frame* t)
-               (frame (sb!di:frame-down (sb!di:frame-down (sb!di:top-frame)))))
-          (sb!di:flush-frames-above frame)
-          frame)
-      ((or error sb!di:debug-condition) ()))))
-
-(defun find-interrupted-frame ()
-  (/show0 "entering FIND-INTERRUPTED-FRAME")
-  (unless *finding-frame*
-    (handler-case
-        (let ((*finding-frame* t))
-          (/show0 "in ordinary case")
-          (do ((frame (sb!di:top-frame) (sb!di:frame-down frame)))
-              ((null frame)
-               (/show0 "null frame")
-               nil)
-            (/noshow0 "at head of DO loop")
-            (when (and (sb!di::compiled-frame-p frame)
-                       (sb!di::compiled-frame-escaped frame))
-              (sb!di:flush-frames-above frame)
-              (/show0 "returning from within DO loop")
-              (return frame))))
-      (error ()
-        (/show0 "trapped ERROR")
-        nil)
-      (sb!di:debug-condition ()
-        (/show0 "trapped DEBUG-CONDITION")
-        nil))))
-
-(defun find-caller-of-named-frame (name)
-  (unless *finding-frame*
-    (handler-case
-        (let ((*finding-frame* t))
-          (do ((frame (sb!di:top-frame) (sb!di:frame-down frame)))
-              ((null frame))
-            (when (and (sb!di::compiled-frame-p frame)
-                       (eq name (sb!di:debug-fun-name
-                                 (sb!di:frame-debug-fun frame))))
-              (let ((caller (sb!di:frame-down frame)))
-                (sb!di:flush-frames-above caller)
-                (return caller)))))
-      ((or error sb!di:debug-condition) ()
-        nil)
-      (sb!di:debug-condition ()
-        nil))))
 
 
 ;;; Returns true if number of arguments matches required/optional
@@ -359,6 +305,7 @@
      (error *heap-exhausted-error-condition*))))
 
 (defun undefined-alien-variable-error ()
+  (declare (optimize allow-non-returning-tail-call))
   (error 'undefined-alien-variable-error))
 
 #!-win32
@@ -366,8 +313,9 @@
 
 #!-win32
 (defun memory-fault-error ()
-  (error 'memory-fault-error
-         :address current-memory-fault-address))
+  (let ((sb!debug:*stack-top-hint* (find-interrupted-frame)))
+    (error 'memory-fault-error
+           :address current-memory-fault-address)))
 
 ;;; This is SIGTRAP / EXCEPTION_BREAKPOINT that runtime could not deal
 ;;; with. Prior to Windows we just had a Lisp side handler for

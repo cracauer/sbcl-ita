@@ -254,7 +254,7 @@
   (fun (missing-arg) :type function)
   (before-address nil :type (member t nil)))
 
-(def!method print-object ((seg segment) stream)
+(defmethod print-object ((seg segment) stream)
   (print-unreadable-object (seg stream :type t)
     (let ((addr (sb!sys:sap-int (funcall (seg-sap-maker seg)))))
       (format stream "#X~X..~X[~W]~:[ (#X~X)~;~*~]~@[ in ~S~]"
@@ -300,11 +300,6 @@
 (defun code-inst-area-length (code-component)
   (declare (type sb!kernel:code-component code-component))
   (sb!kernel:%code-code-size code-component))
-
-;;; Return the address of the instruction area in CODE-COMPONENT.
-(defun code-inst-area-address (code-component)
-  (declare (type sb!kernel:code-component code-component))
-  (sb!sys:sap-int (sb!kernel:code-instructions code-component)))
 
 (defun segment-offs-to-code-offs (offset segment)
   (sb!sys:without-gcing
@@ -512,8 +507,7 @@
     (rewind-current-segment dstate segment)
 
     (loop
-      (when (>= (dstate-cur-offs dstate)
-                (seg-opcodes-length (dstate-segment dstate)))
+      (when (>= (dstate-cur-offs dstate) (seg-length (dstate-segment dstate)))
         ;; done!
         (when (and stream (> prefix-len 0))
           (pad-inst-column stream prefix-len)
@@ -560,12 +554,31 @@
                               (+ (dstate-cur-offs dstate)
                                  (inst-length inst)))
                         (let ((orig-next (dstate-next-offs dstate))
-                              (prefilter (inst-prefilter inst))
                               (control (inst-control inst)))
                           (print-inst (inst-length inst) stream dstate
                                       :trailing-space nil)
-                          (when prefilter
-                            (funcall prefilter chunk dstate))
+
+                          (dolist (item (inst-prefilters inst))
+                            (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                            ;; item = #(INDEX FUNCTION SIGN-EXTEND-P BYTE-SPEC ...).
+                            (flet ((extract-byte (spec-index)
+                                     (let* ((byte-spec (svref item spec-index))
+                                            (integer (dchunk-extract chunk byte-spec)))
+                                       (if (svref item 2) ; SIGN-EXTEND-P
+                                           (sign-extend integer (byte-size byte-spec))
+                                           integer))))
+                              (let ((item-length (length item))
+                                    (fun (svref item 1)))
+                                (setf (svref (dstate-filtered-values dstate) (svref item 0))
+                                      (case item-length
+                                        (2 (funcall fun dstate)) ; no subfields
+                                        (3 (bug "Bogus prefilter"))
+                                        (4 (funcall fun dstate (extract-byte 3))) ; one subfield
+                                        (5 (funcall fun dstate ; two subfields
+                                                    (extract-byte 3) (extract-byte 4)))
+                                        (t (apply fun dstate ; > 2 subfields
+                                                  (loop for i from 3 below item-length
+                                                        collect (extract-byte i)))))))))
 
                           (setf prefix-p (null (inst-printer inst)))
 
@@ -612,6 +625,30 @@
         (setf (dstate-inst-properties dstate) nil)))))
 
 
+(defun collect-labelish-operands (args cache)
+  (awhen (remove-if-not #'arg-use-label args)
+    (let* ((list (mapcar (lambda (arg &aux (fun (arg-use-label arg))
+                                           (prefilter (arg-prefilter arg))
+                                           (bytes (arg-fields arg)))
+                           ;; Require byte specs or a prefilter (or both).
+                           ;; Prefilter alone is ok - it can use READ-SUFFIX.
+                           ;; Additionally, you can't have :use-label T
+                           ;; if multiple fields exist with no prefilter.
+                           (aver (or prefilter
+                                     (if (eq fun t) (singleton-p bytes) bytes)))
+                           ;; If arg has a prefilter, just compute its index,
+                           ;; otherwise keep the byte specs for extraction.
+                           (coerce (cons (if (eq fun t) #'identity fun)
+                                         (if prefilter
+                                             (list (posq arg args))
+                                             (cons (arg-sign-extend-p arg) bytes)))
+                                   'vector))
+                         it))
+           (repr (if (cdr list) list (car list))) ; usually just 1 item
+           (table (assq :labeller cache)))
+      (or (find repr (cdr table) :test 'equalp)
+          (car (push repr (cdr table)))))))
+
 ;;; Make an initial non-printing disassembly pass through DSTATE,
 ;;; noting any addresses that are referenced by instructions in this
 ;;; segment.
@@ -623,9 +660,39 @@
     (map-segment-instructions
      (lambda (chunk inst)
        (declare (type dchunk chunk) (type instruction inst))
-       (let ((labeller (inst-labeller inst)))
-         (when labeller
-           (setf labels (funcall labeller chunk labels dstate)))))
+       (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+       (loop with list = (inst-labeller inst)
+             while list
+             ;; item = #(FUNCTION PREFILTERED-VALUE-INDEX)
+             ;;      | #(FUNCTION SIGN-EXTEND-P BYTE-SPEC ...)
+             for item = (if (listp list) (pop list) (prog1 list (setq list nil)))
+             then (pop list)
+          do (let* ((item-length (length item))
+                    (index/signedp (svref item 1))
+                    (adjusted-value
+                     (funcall
+                      (svref item 0)
+                      (flet ((extract-byte (spec-index)
+                               (let* ((byte-spec (svref item spec-index))
+                                      (integer (dchunk-extract chunk byte-spec)))
+                                 (if index/signedp
+                                     (sign-extend integer (byte-size byte-spec))
+                                     integer))))
+                        (case item-length
+                          (2 (svref (dstate-filtered-values dstate) index/signedp))
+                          (3 (extract-byte 2)) ; extract exactly one byte
+                          (t ; extract >1 byte.
+                           ;; FIXME: this is strictly redundant.
+                           ;; You should combine fields in the prefilter
+                           ;; so that the labeller receives a single byte.
+                           ;; AARCH64 and HPPA make use of this though.
+                           (loop for i from 2 below item-length
+                                 collect (extract-byte i)))))
+                      dstate)))
+               ;; If non-integer, the value is not a label.
+               (when (and (integerp adjusted-value)
+                          (not (assoc adjusted-value labels)))
+                 (push (cons adjusted-value nil) labels)))))
      segment
      dstate)
     (setf (dstate-labels dstate) labels)
@@ -653,16 +720,63 @@
                   (format nil "L~W" max)))))
       (setf (dstate-labels dstate) labels))))
 
+(defun collect-inst-variants (base-name package variants cache)
+  (loop for printer in variants
+        for index from 1
+        collect
+     (destructuring-bind (format-name
+                          (&rest arg-constraints)
+                          &optional (printer :default)
+                          &key (print-name
+                                (without-package-locks (intern base-name package)))
+                               control)
+         printer
+       (declare (type (or symbol string) print-name))
+       (let* ((format (format-or-lose format-name))
+              (args (copy-list (format-args format)))
+              (format-length (bytes-to-bits (format-length format))))
+         (dolist (constraint arg-constraints)
+           (destructuring-bind (name . props) constraint
+             (let ((cell (member name args :key #'arg-name))
+                   (arg))
+               (if cell
+                   (setf (car cell) (setf arg (copy-structure (car cell))))
+                   (setf args (nconc args (list (setf arg (%make-arg name))))))
+               (apply #'modify-arg
+                      arg format-length (and props (cons :value props))))))
+         (multiple-value-bind (mask id) (compute-mask-id args)
+           (make-instruction
+                   base-name format-name print-name
+                   (format-length format) mask id
+                   (awhen (if (eq printer :default)
+                              (format-default-printer format)
+                              printer)
+                     (find-printer-fun it args cache (list base-name index)))
+                   (collect-labelish-operands args cache)
+                   (collect-prefiltering-args args cache)
+                   control))))))
+
+(defun !compile-inst-printers ()
+  (let ((package sb!assem::*backend-instruction-set-package*)
+        (cache (list (list :printer) (list :prefilter) (list :labeller))))
+    (do-symbols (symbol package)
+      (awhen (get symbol 'instruction-flavors)
+        (setf (get symbol 'instruction-flavors)
+              (collect-inst-variants
+               (string-upcase symbol) package it cache))))
+    (apply 'format t
+           "~&Disassembler: ~D printers, ~D prefilters, ~D labelers~%"
+           (mapcar (lambda (x) (length (cdr x))) cache))))
+
 ;;; Get the instruction-space, creating it if necessary.
-(defun get-inst-space (&key force)
+(defun get-inst-space (&key (package sb!assem::*backend-instruction-set-package*)
+                            force)
   (let ((ispace *disassem-inst-space*))
     (when (or force (null ispace))
       (let ((insts nil))
-        (maphash (lambda (name inst-flavs)
-                   (declare (ignore name))
-                   (dolist (flav inst-flavs)
-                     (push flav insts)))
-                 *disassem-insts*)
+        (do-symbols (symbol package)
+          (setq insts (nconc (copy-list (get symbol 'instruction-flavors))
+                             insts)))
         (setf ispace (build-inst-space insts)))
       (setf *disassem-inst-space* ispace))
     ispace))
@@ -964,7 +1078,6 @@
           (%make-segment
            :sap-maker sap-maker
            :length length
-           :opcodes-length length
            :virtual-location (or virtual-location
                                  (sb!sys:sap-int (funcall sap-maker)))
            :hooks hooks
@@ -1433,9 +1546,8 @@
     (map-segment-instructions
      (lambda (chunk inst)
        (declare (type dchunk chunk) (type instruction inst))
-       (let ((printer (inst-printer inst)))
-         (when printer
-           (funcall printer chunk inst stream dstate))))
+       (awhen (inst-printer inst)
+         (funcall it chunk inst stream dstate)))
      segment
      dstate
      stream)))
@@ -1996,3 +2108,89 @@
               (emit-note (get-sc-name sc-offs))))))
     (incf (dstate-next-offs dstate)
           adjust)))
+
+;;; arm64 stores an error-number in the instruction bytes,
+;;; so can't easily share this code.
+;;; But probably we should just add the conditionalization in here.
+#!-arm64
+(defun snarf-error-junk (sap offset &optional length-only)
+  (let ((length (sb!sys:sap-ref-8 sap offset)))
+    (declare (type sb!sys:system-area-pointer sap)
+             (type (unsigned-byte 8) length))
+    (if length-only
+        (values 0 (1+ length) nil nil)
+        (let ((vector
+               (truly-the (simple-array (unsigned-byte 8) (*))
+                          (sb!sys:sap-ref-octets sap (1+ offset) length))))
+           (collect ((sc-offsets)
+                     (lengths))
+             (lengths 1)                ; the length byte
+             (let* ((index 0)
+                    (error-number (sb!c:read-var-integer vector index)))
+               (lengths index)
+               (loop
+                 (when (>= index length)
+                   (return))
+                 (let ((old-index index))
+                   (sc-offsets (sb!c:read-var-integer vector index))
+                   (lengths (- index old-index))))
+               (values error-number
+                       (1+ length)
+                       (sc-offsets)
+                       (lengths))))))))
+
+;; A prefilter set is a list of vectors specifying bytes to extract
+;; and a function to call on the extracted value(s).
+;; EQUALP lists of vectors can be coalesced, since they're immutable.
+(defun collect-prefiltering-args (args cache)
+  (awhen (remove-if-not #'arg-prefilter args)
+    (let ((repr
+           (mapcar (lambda (arg &aux (bytes (arg-fields arg)))
+                     (coerce (list* (posq arg args)
+                                    (arg-prefilter arg)
+                                    (and bytes (cons (arg-sign-extend-p arg) bytes)))
+                             'vector))
+                   it))
+          (table (assq :prefilter cache)))
+      (or (find repr (cdr table) :test 'equalp)
+          (car (push repr (cdr table)))))))
+
+(defun unintern-init-only-stuff ()
+  ;; Remove compile-time-only metadata. This preserves compatibility with the
+  ;; older disassembler macros which wrapped GEN-ARG-TYPE-DEF-FORM and such
+  ;; in (EVAL-WHEN (:COMPILE-TOPLEVEL :EXECUTE)), which in turn required that
+  ;; all prefilters, labellers, and printers be defined at cross-compile-time.
+  ;; A consequence of :LOAD-TOPLEVEL not being there was that was not possible
+  ;; to add instruction definitions to an image without also recompiling
+  ;; the backend's "insts" file. It also was not possible to incrementally
+  ;; recompile and/or use slam.sh because of a bunch of mostly harmless bugs
+  ;; in the function cache (a/k/a identical-code-folding) logic that was only
+  ;; guaranteed to do the right thing from a clean compile. Additionally,
+  ;; you had to use (GET-INST-SPACE :FORCE T) to pick up new definitions.
+  ;; Given those considerations which made extending a running disassembler
+  ;; nontrivial, the code-generating code is not so useful after the
+  ;; initial instruction space is built, so it can all be removed.
+  ;; But if you need all these macros to exist for some reason,
+  ;; then define one of the two following features to keep them:
+  #!+(or sb-fluid sb-retain-assembler-macros)
+  (return-from unintern-init-only-stuff)
+
+  (do-symbols (symbol sb!assem::*backend-instruction-set-package*)
+    (remf (symbol-plist symbol) 'arg-type)
+    (remf (symbol-plist symbol) 'inst-format))
+
+  ;; Get rid of functions that only make sense with metadata available.
+  (dolist (s '(%def-arg-type %def-inst-format %gen-arg-forms
+               all-arg-refs-relevant-p arg-or-lose arg-position arg-value-form
+               collect-labelish-operands collect-prefiltering-args
+               compare-fields-form compile-inst-printer compile-print
+               compile-printer-body compile-printer-list compile-test
+               correct-dchunk-bytespec-for-endianness
+               define-arg-type define-instruction-format
+               find-first-field-name find-printer-fun format-or-lose
+               gen-arg-forms make-arg-temp-bindings make-funstate massage-arg
+               maybe-listify modify-arg pd-error pick-printer-choice
+               preprocess-chooses preprocess-conditionals preprocess-printer
+               preprocess-test sharing-cons sharing-mapcar))
+    (fmakunbound s)
+    (unintern s 'sb-disassem)))

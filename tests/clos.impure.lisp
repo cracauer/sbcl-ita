@@ -579,7 +579,7 @@
 ;;; DOCUMENTATION's argument-precedence-order wasn't being faithfully
 ;;; preserved through the bootstrap process until sbcl-0.7.8.39.
 ;;; (thanks to Gerd Moellmann)
-(with-test (:name :documentation-argument-precedence-order)
+(with-test (:name (documentation :argument-precedence-order))
   (defun foo022 ()
     "Documentation"
     t)
@@ -2484,4 +2484,18 @@
    (defclass class-with-eventual-self-as-metaclass () ()
      (:metaclass class-with-eventual-self-as-metaclass))))
 
-;;;; success
+(with-test (:name :function-keywords)
+  (defgeneric function-keywords-test (&key))
+  (assert (equal (function-keywords
+                  (defmethod function-keywords-test (&key a b)
+                    (declare (ignore a b))))
+                 '(:a :b))))
+
+(with-test (:name :superclass-finalization)
+  (let* ((class1 (gensym "CLASS1-"))
+         (class2 (gensym "CLASS2-")))
+    (eval `(defclass ,class1 () ()))
+    (eval `(defclass ,class2 (,class1) ()))
+    (let ((instance (make-instance class2)))
+      (sb-mop:finalize-inheritance (find-class class1))
+      (assert (not (sb-kernel:layout-invalid (sb-kernel:layout-of instance)))))))

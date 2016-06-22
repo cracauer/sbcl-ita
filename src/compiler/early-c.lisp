@@ -190,11 +190,12 @@ the stack without triggering overflow protection.")
   ;; We do this BOUNDP check because this function can be called when
   ;; not in a compilation unit (as when loading top level forms).
   (when (boundp '*undefined-warnings*)
-    (setq *undefined-warnings*
-          (delete-if (lambda (x)
-                       (and (equal (undefined-warning-name x) name)
-                            (eq (undefined-warning-kind x) kind)))
-                     *undefined-warnings*)))
+    (let ((name (uncross name)))
+      (setq *undefined-warnings*
+            (delete-if (lambda (x)
+                         (and (equal (undefined-warning-name x) name)
+                              (eq (undefined-warning-kind x) kind)))
+                       *undefined-warnings*))))
   (values))
 
 ;;; to be called when a variable is lexically bound
@@ -220,8 +221,7 @@ the stack without triggering overflow protection.")
                 :format-arguments (list symbol)))
   (values))
 
-(def!struct (debug-name-marker (:make-load-form-fun dump-debug-name-marker)
-                               (:print-function print-debug-name-marker)))
+(def!struct (debug-name-marker (:print-function print-debug-name-marker)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -229,20 +229,19 @@ the stack without triggering overflow protection.")
 (defvar *debug-name-sharp*)
 (defvar *debug-name-ellipsis*)
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun dump-debug-name-marker (marker &optional env)
-    (declare (ignore env))
-    (cond ((eq marker *debug-name-sharp*)
-           `(if (boundp '*debug-name-sharp*)
-                *debug-name-sharp*
-                (make-debug-name-marker)))
-          ((eq marker *debug-name-ellipsis*)
-           `(if (boundp '*debug-name-ellipsis*)
-                *debug-name-ellipsis*
-                (make-debug-name-marker)))
-          (t
-           (warn "Dumping unknown debug-name marker.")
-           '(make-debug-name-marker)))))
+(defmethod make-load-form ((marker debug-name-marker) &optional env)
+  (declare (ignore env))
+  (cond ((eq marker *debug-name-sharp*)
+         `(if (boundp '*debug-name-sharp*)
+              *debug-name-sharp*
+              (make-debug-name-marker)))
+        ((eq marker *debug-name-ellipsis*)
+         `(if (boundp '*debug-name-ellipsis*)
+              *debug-name-ellipsis*
+              (make-debug-name-marker)))
+        (t
+         (warn "Dumping unknown debug-name marker.")
+         '(make-debug-name-marker))))
 
 (defun print-debug-name-marker (marker stream level)
   (declare (ignore level))
@@ -289,3 +288,19 @@ the stack without triggering overflow protection.")
           (bug "~S is a legal function name, and cannot be used as a ~
                 debug name." name))
         name))))
+
+;;; Set this to NIL to inhibit assembly-level optimization. (For
+;;; compiler debugging, rather than policy control.)
+(defvar *assembly-optimize* t)
+
+(in-package "SB!ALIEN")
+
+;;; Information describing a heap-allocated alien.
+(def!struct (heap-alien-info)
+  ;; The type of this alien.
+  (type (missing-arg) :type alien-type)
+  ;; Its name.
+  (alien-name (missing-arg) :type simple-string)
+  ;; Data or code?
+  (datap (missing-arg) :type boolean))
+(!set-load-form-method heap-alien-info (:xc :target))

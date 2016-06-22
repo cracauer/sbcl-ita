@@ -175,10 +175,10 @@
   (declare (ignore start count))
 
   (load-symbol-value cur-uwp *current-unwind-protect-block*)
-  (let ((error (generate-error-code nil invalid-unwind-error)))
+  (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst beq block error))
 
-  (loadw target-uwp block unwind-block-current-uwp-slot)
+  (loadw target-uwp block unwind-block-uwp-slot)
   (inst cmpeq cur-uwp target-uwp temp1)
   (inst beq temp1 do-uwp)
 
@@ -186,15 +186,15 @@
 
   do-exit
 
-  (loadw cfp-tn cur-uwp unwind-block-current-cont-slot)
-  (loadw code-tn cur-uwp unwind-block-current-code-slot)
+  (loadw cfp-tn cur-uwp unwind-block-cfp-slot)
+  (loadw code-tn cur-uwp unwind-block-code-slot)
   (progn
     (loadw lra cur-uwp unwind-block-entry-pc-slot)
     (lisp-return lra lip :frob-code nil))
 
   do-uwp
 
-  (loadw next-uwp cur-uwp unwind-block-current-uwp-slot)
+  (loadw next-uwp cur-uwp unwind-block-uwp-slot)
   (store-symbol-value next-uwp *current-unwind-protect-block*)
   (inst br zero-tn do-exit))
 
@@ -213,7 +213,7 @@
 
   loop
 
-  (let ((error (generate-error-code nil unseen-throw-tag-error target)))
+  (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
     (inst beq catch error))
 
   (loadw tag catch catch-block-tag-slot)

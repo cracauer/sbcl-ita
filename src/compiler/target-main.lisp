@@ -57,9 +57,6 @@
                   (*code-coverage-records* nil)
                   (*code-coverage-blocks* nil)
                   (*current-path* nil)
-                  (*last-source-context* nil)
-                  (*last-original-source* nil)
-                  (*last-source-form* nil)
                   (*last-format-string* nil)
                   (*last-format-args* nil)
                   (*last-message-count* 0)
@@ -201,7 +198,7 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
 
 ;; For macros this seems fair enough, but for inline functions it could
 ;; be considered undesirable on the grounds that enabling/disabling inlining
-;; should not change visible behavior. Other then working harder to figure
+;; should not change visible behavior. Other than working harder to figure
 ;; out where we are in inlined code (which may not even be feasible),
 ;; a viable remedy is that all inlineable functions should have their stored
 ;; representation not contain any macros, i.e. macros could be pre-expanded,
@@ -211,6 +208,7 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
 ;; times as there are calls to the function - not very defensible
 ;; as a design choice, but just an accident of the particular implementation.
 ;;
+(let ()
 (defmacro compile-file-position (&whole this-form)
   #!+sb-doc
   "Return character position of this macro invocation or NIL if unavailable."
@@ -224,6 +222,7 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
   #!+sb-doc
   "Return line# and column# of this macro invocation as multiple values."
   (compute-compile-file-position this-form t))
+)
 
 (defun compute-compile-file-position (this-form as-line/col-p)
   (let (file-info stream charpos)

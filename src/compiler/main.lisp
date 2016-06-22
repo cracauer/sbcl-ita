@@ -23,9 +23,7 @@
                   *compiler-warning-count* *compiler-style-warning-count*
                   *compiler-note-count*
                   *compiler-error-bailout*
-                  #!+sb-show *compiler-trace-output*
-                  *last-source-context* *last-original-source*
-                  *last-source-form* *last-format-string* *last-format-args*
+                  *last-format-string* *last-format-args*
                   *last-message-count* *last-error-context*
                   *lexenv* *fun-names-in-this-file*
                   *allow-instrumenting*))
@@ -357,38 +355,44 @@ Examples:
       (terpri *error-output*)
       (force-output *error-output*))))
 
+;; Bidrectional map between IR1/IR2/assembler abstractions
+;; and a corresponding small integer identifier. One direction could be done
+;; by adding the integer ID as an object slot, but we want both directions.
+(defstruct (compiler-ir-obj-map (:conc-name objmap-)
+                                (:constructor make-compiler-ir-obj-map ())
+                                (:copier nil)
+                                (:predicate nil))
+  (obj-to-id   (make-hash-table :test 'eq) :read-only t)
+  (id-to-cont  (make-array 10) :type simple-vector) ; number -> CTRAN or LVAR
+  (id-to-tn    (make-array 10) :type simple-vector) ; number -> TN
+  (id-to-label (make-array 10) :type simple-vector) ; number -> LABEL
+  (cont-num    0 :type fixnum)
+  (tn-id       0 :type fixnum)
+  (label-id    0 :type fixnum))
+
+(declaim (type compiler-ir-obj-map *compiler-ir-obj-map*))
+(defvar *compiler-ir-obj-map*)
+
 ;;; Evaluate BODY, then return (VALUES BODY-VALUE WARNINGS-P
 ;;; FAILURE-P), where BODY-VALUE is the first value of the body, and
 ;;; WARNINGS-P and FAILURE-P are as in CL:COMPILE or CL:COMPILE-FILE.
-;;; This also wraps up WITH-IR1-NAMESPACE functionality.
 (defmacro with-compilation-values (&body body)
-  ;; These bindings could just as well be in WITH-IR1-NAMESPACE, but
-  ;; since they're primarily debugging tools, it's nicer to have
+  ;; This binding could just as well be in WITH-IR1-NAMESPACE, but
+  ;; since it's primarily a debugging tool, it's nicer to have
   ;; a wider unique scope by ID.
-  `(let ((*continuation-number* 0)
-         (*continuation-numbers* (make-hash-table :test 'eq))
-         (*number-continuations* (make-hash-table :test 'eql))
-         (*tn-id* 0)
-         (*tn-ids* (make-hash-table :test 'eq))
-         (*id-tns* (make-hash-table :test 'eql))
-         (*label-id* 0)
-         (*label-ids* (make-hash-table :test 'eq))
-         (*id-labels* (make-hash-table :test 'eql)))
-       (unwind-protect
-            (let ((*warnings-p* nil)
-                  (*failure-p* nil))
-              (handler-bind ((compiler-error #'compiler-error-handler)
-                             (style-warning #'compiler-style-warning-handler)
-                             (warning #'compiler-warning-handler))
-                  (values (progn ,@body)
-                       *warnings-p*
-                       *failure-p*)))
-         (clrhash *tn-ids*)
-         (clrhash *id-tns*)
-         (clrhash *continuation-numbers*)
-         (clrhash *number-continuations*)
-         (clrhash *label-ids*)
-         (clrhash *id-labels*))))
+  `(let ((*compiler-ir-obj-map* (make-compiler-ir-obj-map)))
+     (unwind-protect
+         (let ((*warnings-p* nil)
+               (*failure-p* nil))
+           (handler-bind ((compiler-error #'compiler-error-handler)
+                          (style-warning #'compiler-style-warning-handler)
+                          (warning #'compiler-warning-handler))
+             (values (progn ,@body) *warnings-p* *failure-p*)))
+       (let ((map *compiler-ir-obj-map*))
+         (clrhash (objmap-obj-to-id map))
+         (fill (objmap-id-to-cont map) nil)
+         (fill (objmap-id-to-tn map) nil)
+         (fill (objmap-id-to-label map) nil)))))
 
 ;;; THING is a kind of thing about which we'd like to issue a warning,
 ;;; but showing at most one warning for a given set of <THING,FMT,ARGS>.
@@ -628,11 +632,13 @@ necessary, since type inference may take arbitrarily long to converge.")
             (maybe-mumble "check-pack ")
             (check-pack-consistency component))
 
+          (optimize-constant-loads component)
           (when *compiler-trace-output*
             (describe-component component *compiler-trace-output*)
             (describe-ir2-component component *compiler-trace-output*))
 
           (maybe-mumble "code ")
+
           (multiple-value-bind (code-length fixup-notes)
               (generate-code component)
 
@@ -651,6 +657,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                                     code-length
                                     fixup-notes
                                     *compile-object*))
+              #-sb-xc-host ; no compiling to core
               (core-object
                (maybe-mumble "core")
                (make-core-component component
@@ -940,8 +947,7 @@ necessary, since type inference may take arbitrarily long to converge.")
       (funcall function form
                :current-index
                (let* ((forms (file-info-forms file-info))
-                      (current-idx (+ (fill-pointer forms)
-                                      (file-info-source-root file-info))))
+                      (current-idx (fill-pointer forms)))
                  (vector-push-extend form forms)
                  (vector-push-extend pos (file-info-positions file-info))
                  current-idx))
@@ -981,8 +987,7 @@ necessary, since type inference may take arbitrarily long to converge.")
            (form
             `(write-string
               ,(format nil "Completed TLFs: ~A~%" (file-info-name file-info))))
-           (index
-            (+ (fill-pointer forms) (file-info-source-root file-info))))
+           (index (fill-pointer forms)))
       (with-source-paths
         (find-source-paths form index)
         (process-toplevel-form
@@ -1004,6 +1009,9 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; *TOPLEVEL-LAMBDAS* instead.
 (defun convert-and-maybe-compile (form path &optional (expand t))
   (declare (list path))
+  #+sb-xc-host
+  (when sb-cold::*compile-for-effect-only*
+    (return-from convert-and-maybe-compile))
   (let ((*top-level-form-noted* (note-top-level-form form t)))
     ;; Don't bother to compile simple objects that just sit there.
     (when (and form (or (symbolp form) (consp form)))
@@ -1468,51 +1476,35 @@ necessary, since type inference may take arbitrarily long to converge.")
 
 ;;; Return T if we are currently producing a fasl file and hence
 ;;; constants need to be dumped carefully.
+(declaim (inline producing-fasl-file))
 (defun producing-fasl-file ()
   (fasl-output-p *compile-object*))
 
-;;; Compile FORM and arrange for it to be called at load-time. Return
-;;; the dumper handle and our best guess at the type of the object.
-;;; It would be nice if L-T-V forms were generally eligible
-;;; for fopcompilation, as it could eliminate special cases below.
-(defun compile-load-time-value (form)
-  (let ((ctype
-         (cond
-          ;; Ideally any ltv would test FOPCOMPILABLE-P on its form,
-          ;; but be that as it may, this case is picked off because of
-          ;; its importance during cross-compilation to ensure that
-          ;; compiled lambdas don't cause a chicken-and-egg problem.
-          ((typep form '(cons (eql find-package) (cons string null)))
-           (specifier-type 'package))
-          #+sb-xc-host
-          ((typep form '(cons (eql find-classoid-cell)
-                              (cons (cons (eql quote)))))
-           (aver (eq (getf (cddr form) :create) t))
-           (specifier-type 'sb!kernel::classoid-cell))
-          ;; Special case for the cross-compiler, necessary for at least
-          ;; SETUP-PRINTER-STATE, but also anything that would be dumped
-          ;; using FOP-KNOWN-FUN in the target compiler, to avoid going
-          ;; through an fdefn.
-          ;; I'm pretty sure that as of change 00298ec6, it works to
-          ;; compile #'F before the defun would have been seen by Genesis.
-          #+sb-xc-host
-          ((typep form '(cons (eql function) (cons symbol null)))
-           (specifier-type 'function)))))
-    (when ctype
-      (fopcompile form nil t)
-      (return-from compile-load-time-value
-        (values (sb!fasl::dump-pop *compile-object*) ctype))))
-  (let ((lambda (compile-load-time-stuff form t)))
-    (values
-     (fasl-dump-load-time-value-lambda lambda *compile-object*)
-     (let ((type (leaf-type lambda)))
-       (if (fun-type-p type)
-           (single-value-type (fun-type-returns type))
-           *wild-type*)))))
-
 ;;; Compile the FORMS and arrange for them to be called (for effect,
 ;;; not value) at load time.
-(defun compile-make-load-form-init-forms (forms)
+(defun compile-make-load-form-init-forms (forms fasl)
+  ;; If FORMS has exactly one PROGN containing a call of SB-PCL::SET-SLOTS,
+  ;; then fopcompile it, otherwise use the main compiler.
+  (when (singleton-p forms)
+    (let ((call (car forms)))
+      (when (typep call '(cons (eql sb!pcl::set-slots) (cons instance)))
+        (pop call)
+        (let ((instance (pop call))
+              (slot-names (pop call))
+              (value-forms call)
+              (values))
+          (when (and (every #'symbolp slot-names)
+                     (every #'sb!xc:constantp value-forms))
+            (dolist (x value-forms)
+              (let ((val (constant-form-value x)))
+                ;; invoke recursive MAKE-LOAD-FORM stuff as necessary
+                (find-constant val)
+                (push val values)))
+            (mapc (lambda (x) (dump-object x fasl)) (nreverse values))
+            (dump-object (cons (length slot-names) slot-names) fasl)
+            (dump-object instance fasl)
+            (dump-fop 'sb!fasl::fop-set-slot-values fasl)
+            (return-from compile-make-load-form-init-forms))))))
   (let ((lambda (compile-load-time-stuff `(progn ,@forms) nil)))
     (fasl-dump-toplevel-lambda-call lambda *compile-object*)))
 
@@ -1705,9 +1697,6 @@ necessary, since type inference may take arbitrarily long to converge.")
            (declare (ignore error))
            (return-from sub-compile-file (values t t t))))
         (*current-path* nil)
-        (*last-source-context* nil)
-        (*last-original-source* nil)
-        (*last-source-form* nil)
         (*last-format-string* nil)
         (*last-format-args* nil)
         (*last-message-count* 0)
@@ -1781,7 +1770,10 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defun print-compile-start-note (source-info)
   (declare (type source-info source-info))
   (let ((file-info (source-info-file-info source-info)))
-    (compiler-mumble #+sb-xc-host "~&; cross-compiling file ~S (written ~A):~%"
+    (compiler-mumble #+sb-xc-host "~&; ~A file ~S (written ~A):~%"
+                     #+sb-xc-host (if sb-cold::*compile-for-effect-only*
+                                      "preloading"
+                                      "cross-compiling")
                      #-sb-xc-host "~&; compiling file ~S (written ~A):~%"
                      (namestring (file-info-name file-info))
                      (sb!int:format-universal-time nil
@@ -2011,10 +2003,9 @@ SPEED and COMPILATION-SPEED optimization values, and the
 ;;; circular object.
 ;;;
 ;;; If the constant doesn't show up in *CONSTANTS-BEING-CREATED*, then
-;;; we have to create it. We call MAKE-LOAD-FORM and check to see
-;;; whether the creation form is the magic value
-;;; :SB-JUST-DUMP-IT-NORMALLY. If it is, then we don't do anything. The
-;;; dumper will eventually get its hands on the object and use the
+;;; we have to create it. We call %MAKE-LOAD-FORM and check
+;;; if the result is 'FOP-STRUCT, and if so we don't do anything.
+;;; The dumper will eventually get its hands on the object and use the
 ;;; normal structure dumping noise on it.
 ;;;
 ;;; Otherwise, we bind *CONSTANTS-BEING-CREATED* and
@@ -2031,40 +2022,25 @@ SPEED and COMPILATION-SPEED optimization values, and the
 (defvar *constants-being-created* nil)
 (defvar *constants-created-since-last-init* nil)
 ;;; FIXME: Shouldn't these^ variables be unbound outside LET forms?
-(defun emit-make-load-form (constant &optional (name nil namep))
-  (aver (fasl-output-p *compile-object*))
-  (unless (or (fasl-constant-already-dumped-p constant *compile-object*)
-              ;; KLUDGE: This special hack is because I was too lazy
-              ;; to rework DEF!STRUCT so that the MAKE-LOAD-FORM
-              ;; function of LAYOUT returns nontrivial forms when
-              ;; building the cross-compiler but :IGNORE-IT when
-              ;; cross-compiling or running under the target Lisp. --
-              ;; WHN 19990914
-              #+sb-xc-host (typep constant 'layout))
+(defun emit-make-load-form (constant &optional (name nil namep)
+                                     &aux (fasl *compile-object*))
+  (aver (fasl-output-p fasl))
+  (unless (fasl-constant-already-dumped-p constant fasl)
     (let ((circular-ref (assoc constant *constants-being-created* :test #'eq)))
       (when circular-ref
         (when (find constant *constants-created-since-last-init* :test #'eq)
           (throw constant t))
         (throw 'pending-init circular-ref)))
-    (multiple-value-bind (creation-form init-form)
-        (if namep
-            ;; If the constant is a reference to a named constant, we can
-            ;; just use SYMBOL-VALUE during LOAD.
-            (values `(symbol-value ',name) nil)
-            (handler-case
-                (sb!xc:make-load-form constant (make-null-lexenv))
-              (error (condition)
-                (compiler-error condition))))
-      #-sb-xc-host
-      (when (and (not namep)
-                 (listp creation-form) ; skip if already a magic keyword
-                 (typep constant 'structure-object)
-                 (sb!kernel::canonical-slot-saving-forms-p
-                  constant creation-form init-form))
-        (setq creation-form :sb-just-dump-it-normally))
+    ;; If this is a global constant reference, we can call SYMBOL-GLOBAL-VALUE
+    ;; during LOAD as a fasl op, and not compile a lambda.
+    (when namep
+      (fopcompile `(symbol-global-value ',name) nil t nil)
+      (fasl-note-handle-for-constant constant (sb!fasl::dump-pop fasl) fasl)
+      (return-from emit-make-load-form nil))
+    (multiple-value-bind (creation-form init-form) (%make-load-form constant)
       (case creation-form
-        (:sb-just-dump-it-normally
-         (fasl-validate-structure constant *compile-object*)
+        (sb!fasl::fop-struct
+         (fasl-validate-structure constant fasl)
          t)
         (:ignore-it
          nil)
@@ -2081,9 +2057,17 @@ SPEED and COMPILATION-SPEED optimization values, and the
                  (catch constant
                    (fasl-note-handle-for-constant
                     constant
-                    (or (fopcompile-allocate-instance creation-form)
-                        (compile-load-time-value creation-form))
-                    *compile-object*)
+                    (cond ((typep creation-form
+                                  '(cons (eql sb!kernel::new-instance)
+                                         (cons symbol null)))
+                           (dump-object (cadr creation-form) fasl)
+                           (dump-fop 'sb!fasl::fop-allocate-instance fasl)
+                           (let ((index (sb!fasl::fasl-output-table-free fasl)))
+                             (setf (sb!fasl::fasl-output-table-free fasl) (1+ index))
+                             index))
+                          (t
+                           (compile-load-time-value creation-form)))
+                    fasl)
                    nil)
                (compiler-error "circular references in creation form for ~S"
                                constant)))
@@ -2091,11 +2075,9 @@ SPEED and COMPILATION-SPEED optimization values, and the
              (let* ((*constants-created-since-last-init* nil)
                     (circular-ref
                      (catch 'pending-init
-                       (loop for (name form) on (cdr info) by #'cddr
-                         collect name into names
+                       (loop for (nil form) on (cdr info) by #'cddr
                          collect form into forms
-                         finally (or (fopcompile-constant-init-forms forms)
-                                     (compile-make-load-form-init-forms forms)))
+                         finally (compile-make-load-form-init-forms forms fasl))
                        nil)))
                (when circular-ref
                  (setf (cdr circular-ref)

@@ -24,7 +24,7 @@
 
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg)))
+         (value :scs (descriptor-reg any-reg null)))
   (:info name offset lowtag)
   (:ignore name)
   (:results)
@@ -286,7 +286,7 @@
 ;;; symbol.
 #!+sb-thread
 (progn
-  (define-vop (bind)
+  (define-vop (dynbind)
     (:args (value :scs (any-reg descriptor-reg) :to :save)
            (symbol :scs (descriptor-reg)))
     (:temporary (:sc descriptor-reg) value-temp)
@@ -302,7 +302,7 @@
       (inst add bsp bsp (* binding-size n-word-bytes))
       (store-binding-stack-pointer bsp)
       (inst cbnz (32-bit-reg tls-index) TLS-INDEX-VALID)
-      (inst mov alloc-tls-symbol symbol)
+      (move alloc-tls-symbol symbol)
       (load-inline-constant value-temp '(:fixup alloc-tls-index :assembly-routine) lip)
       (inst blr value-temp)
       TLS-INDEX-VALID
@@ -360,7 +360,7 @@
     (store-binding-stack-pointer bsp)))
 #!-sb-thread
 (progn
-  (define-vop (bind)
+  (define-vop (dynbind)
     (:args (val :scs (any-reg descriptor-reg))
            (symbol :scs (descriptor-reg)))
     (:temporary (:scs (descriptor-reg)) value-temp)
@@ -459,17 +459,22 @@
 
 (macrolet
     ((define-raw-slot-vops (name value-primtype value-sc
-                                 &key (width 1) (move-macro 'move))
+                            &optional (move-macro 'move))
        (labels ((emit-generator (instruction move-result)
-                  `((loadw offset object 0 instance-pointer-lowtag)
-                    (inst lsr offset offset n-widetag-bits)
-                    (inst lsl offset offset word-shift)
-                    (inst sub offset offset (lsl index (- word-shift n-fixnum-tag-bits)))
-                    (inst sub offset offset (+ (* (- ,width
-                                                     instance-slots-offset)
-                                                  n-word-bytes)
-                                               instance-pointer-lowtag))
-                    (inst ,instruction value (@ object offset))
+                  `((sc-case index
+                      (immediate
+                       (inst ,instruction value
+                             (@ object
+                                (load-store-offset (- (* (+ instance-slots-offset
+                                                            (tn-value index))
+                                                         n-word-bytes)
+                                                      instance-pointer-lowtag)))))
+                      (t
+                       (inst lsl offset index (- word-shift n-fixnum-tag-bits))
+                       (inst add offset offset (- (* instance-slots-offset
+                                                     n-word-bytes)
+                                                  instance-pointer-lowtag))
+                       (inst ,instruction value (@ object offset))))
                     ,@(when move-result
                         `((,move-macro result value))))))
          (let ((ref-vop (symbolicate "RAW-INSTANCE-REF/" name))
@@ -479,7 +484,7 @@
                 (:translate ,(symbolicate "%" ref-vop))
                 (:policy :fast-safe)
                 (:args (object :scs (descriptor-reg))
-                       (index :scs (any-reg)))
+                       (index :scs (any-reg immediate)))
                 (:arg-types * positive-fixnum)
                 (:results (value :scs (,value-sc)))
                 (:result-types ,value-primtype)
@@ -489,7 +494,7 @@
                 (:translate ,(symbolicate "%" set-vop))
                 (:policy :fast-safe)
                 (:args (object :scs (descriptor-reg))
-                       (index :scs (any-reg))
+                       (index :scs (any-reg immediate))
                        (value :scs (,value-sc) :target result))
                 (:arg-types * positive-fixnum ,value-primtype)
                 (:results (result :scs (,value-sc)))
@@ -498,13 +503,13 @@
                 (:generator 5 ,@(emit-generator 'str t))))))))
   (define-raw-slot-vops word unsigned-num unsigned-reg)
   (define-raw-slot-vops single single-float single-reg
-     :move-macro move-float)
+    move-float)
   (define-raw-slot-vops double double-float double-reg
-     :move-macro move-float)
+    move-float)
   (define-raw-slot-vops complex-single complex-single-float complex-single-reg
-    :move-macro move-float)
+    move-float)
   (define-raw-slot-vops complex-double complex-double-float complex-double-reg
-    :width 2 :move-macro move-complex-double))
+    move-complex-double))
 
 (define-vop (raw-instance-atomic-incf/word)
   (:translate %raw-instance-atomic-incf/word)
@@ -513,19 +518,15 @@
          (index :scs (any-reg))
          (diff :scs (unsigned-reg)))
   (:arg-types * positive-fixnum unsigned-num)
-  (:temporary (:sc unsigned-reg) offset)
   (:temporary (:sc non-descriptor-reg) sum)
   (:temporary (:sc interior-reg) lip)
   (:results (result :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
   (:generator 4
-    (loadw offset object 0 instance-pointer-lowtag)
-    (inst lsr offset offset n-widetag-bits)
-    (inst lsl offset offset word-shift)
-    (inst sub offset offset (lsl index (- word-shift n-fixnum-tag-bits)))
-    (inst sub offset offset (+ (* (1- instance-slots-offset) n-word-bytes)
-                               instance-pointer-lowtag))
-    (inst add lip object offset)
+    (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
+    (inst add lip lip (- (* instance-slots-offset
+                            n-word-bytes)
+                         instance-pointer-lowtag))
 
     (inst dsb)
     LOOP

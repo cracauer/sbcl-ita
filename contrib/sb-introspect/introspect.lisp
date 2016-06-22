@@ -78,23 +78,32 @@ include the pathname of the file and the position of the definition."
   "Debug function represent static compile-time information about a function."
   'sb-c::compiled-debug-fun)
 
-(declaim (ftype (function (function) debug-info) function-debug-info))
+(declaim (ftype (sb-int:sfunction (function) debug-info) function-debug-info))
 (defun function-debug-info (function)
   (let* ((function-object (sb-kernel::%fun-fun function))
          (function-header (sb-kernel:fun-code-header function-object)))
     (sb-kernel:%code-debug-info function-header)))
 
-(declaim (ftype (function (function) debug-source) function-debug-source))
+(declaim (ftype (sb-int:sfunction (function) debug-source) function-debug-source))
 (defun function-debug-source (function)
   (debug-info-source (function-debug-info function)))
 
-(declaim (ftype (function (debug-info) debug-source) debug-info-source))
+(declaim (ftype (sb-int:sfunction (debug-info) debug-source) debug-info-source))
 (defun debug-info-source (debug-info)
   (sb-c::debug-info-source debug-info))
 
-(declaim (ftype (function (debug-info) debug-function) debug-info-debug-function))
-(defun debug-info-debug-function (debug-info)
-  (elt (sb-c::compiled-debug-info-fun-map debug-info) 0))
+(declaim (ftype (sb-int:sfunction (t debug-info) debug-function) debug-info-debug-function))
+(defun debug-info-debug-function (function debug-info)
+  (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
+        (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
+    (or
+     (find-if
+      (lambda (x)
+        (and
+         (sb-c::compiled-debug-fun-p x)
+         (eq (sb-c::compiled-debug-fun-name x) name)))
+      map)
+     (elt map 0))))
 
 (defun valid-function-name-p (name)
   "True if NAME denotes a valid function name, ie. one that can be passed to
@@ -298,8 +307,7 @@ If an unsupported TYPE is requested, the function will return NIL.
         (when (and (consp name)
                    (eq (car name) 'setf))
           (setf name (cadr name)))
-        (let ((expander (or (sb-int:info :setf :inverse name)
-                            (sb-int:info :setf :expander name))))
+        (let ((expander (sb-int:info :setf :expander name)))
           (when expander
             (find-definition-source
              (cond ((symbolp expander) (symbol-function expander))
@@ -464,7 +472,7 @@ If an unsupported TYPE is requested, the function will return NIL.
 (defun find-function-definition-source (function)
   (let* ((debug-info (function-debug-info function))
          (debug-source (debug-info-source debug-info))
-         (debug-fun (debug-info-debug-function debug-info))
+         (debug-fun (debug-info-debug-function function debug-info))
          (tlf (if debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
     (make-definition-source
      :pathname
@@ -503,6 +511,7 @@ If an unsupported TYPE is requested, the function will return NIL.
 Works for special-operators, macros, simple functions, interpreted functions,
 and generic functions. Signals an error if FUNCTION is not a valid extended
 function designator."
+  ;; FIXME: sink this logic into SB-KERNEL:%FUN-LAMBDA-LIST and just call that?
   (cond ((and (symbolp function) (special-operator-p function))
          (function-lambda-list (sb-int:info :function :ir1-convert function)))
         ((valid-function-name-p function)
@@ -634,28 +643,45 @@ value."
 
 (defun collect-xref (kind-index wanted-name)
   (let ((ret nil))
-    (call-with-each-global-functoid
-     (lambda (info-name value)
-          ;; Get a simple-fun for the definition, and an xref array
-          ;; from the table if available.
-          (let* ((simple-fun (get-simple-fun value))
-                 (xrefs (when simple-fun
-                          (sb-kernel:%simple-fun-xrefs simple-fun)))
-                 (array (when xrefs
-                          (aref xrefs kind-index))))
-            ;; Loop through the name/path xref entries in the table
-            (loop for i from 0 below (length array) by 2
-                  for xref-name = (aref array i)
-                  for xref-path = (aref array (1+ i))
-                  do (when (equal xref-name wanted-name)
-                       (let ((source-location
-                              (find-function-definition-source simple-fun)))
-                         ;; Use the more accurate source path from
-                         ;; the xref entry.
-                         (setf (definition-source-form-path source-location)
-                               xref-path)
-                         (push (cons info-name source-location)
-                               ret)))))))
+    (flet ((process (info-name value)
+             ;; Get a simple-fun for the definition, and an xref array
+             ;; from the table if available.
+             (let* ((simple-fun (get-simple-fun value))
+                    (xrefs (when simple-fun
+                             (sb-kernel:%simple-fun-xrefs simple-fun)))
+                    (array (when xrefs
+                             (aref xrefs kind-index))))
+               ;; Loop through the name/path xref entries in the table
+               (loop for i from 0 below (length array) by 2
+                     for xref-name = (aref array i)
+                     for xref-form-number = (aref array (+ i 1))
+                     do (when (equal xref-name wanted-name)
+                          (let ((source-location
+                                  (find-function-definition-source simple-fun)))
+                            ;; Use the more accurate source path from
+                            ;; the xref entry.
+                            (setf (definition-source-form-number source-location)
+                                  xref-form-number)
+                            (push (cons info-name source-location)
+                                  ret)))))))
+      (call-with-each-global-functoid
+       (lambda (info-name value)
+         ;; Functions with EQL specializers no longer get a fdefinition,
+         ;; process all the methods from a generic function
+         (cond ((and (sb-kernel:fdefn-p value)
+                     (typep (sb-kernel:fdefn-fun value) 'generic-function))
+                (loop for method in (sb-mop:generic-function-methods (sb-kernel:fdefn-fun value))
+                      for fun = (sb-pcl::safe-method-fast-function method)
+                      when fun
+                      do
+                      (process (sb-kernel:%fun-name fun) fun)))
+               ;; Methods are alredy processed above
+               ((and (sb-kernel:fdefn-p value)
+                     (consp (sb-kernel:fdefn-name value))
+                     (member (car (sb-kernel:fdefn-name value))
+                             '(sb-pcl::slow-method sb-pcl::fast-method))))
+               (t
+                (process info-name value))))))
     ret))
 
 (defun who-calls (function-name)

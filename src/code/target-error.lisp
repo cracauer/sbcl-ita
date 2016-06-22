@@ -52,7 +52,7 @@
 ;;; on account of the fact that an initializer was supplied at all.
 (defparameter *restart-clusters* '())
 
-(def!method print-object ((restart restart) stream)
+(defmethod print-object ((restart restart) stream)
   (if *print-escape*
       (print-unreadable-object (restart stream :type t :identity t)
         (prin1 (restart-name restart) stream))
@@ -156,6 +156,7 @@ with that condition (or with no condition) will be returned."
 ;;; helper for the various functions which are ANSI-spec'ed to do
 ;;; something with a restart or signal CONTROL-ERROR if there is none
 (defun find-restart-or-control-error (identifier &optional condition (call-test-p t))
+  (declare (optimize allow-non-returning-tail-call))
   (or (%find-restart identifier condition call-test-p)
       (error 'simple-control-error
              :format-control "No restart ~S is active~@[ for ~S~]."
@@ -260,13 +261,20 @@ with that condition (or with no condition) will be returned."
         :interactive read-evaluated-form
         value))))
 
-(defun case-failure (name value keys)
+(defun etypecase-failure (value keys)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'case-failure
-         :name name
+         :name 'etypecase
          :datum value
-         :expected-type (if (eq name 'ecase)
-                            `(member ,@keys)
-                            `(or ,@keys))
+         :expected-type `(or ,@keys)
+         :possibilities keys))
+
+(defun ecase-failure (value keys)
+  (declare (optimize allow-non-returning-tail-call))
+  (error 'case-failure
+         :name 'ecase
+         :datum value
+         :expected-type `(member ,@keys)
          :possibilities keys))
 
 (defun case-body-error (name keyform keyform-value expected-type keys)

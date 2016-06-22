@@ -407,14 +407,13 @@ has written, having proved that it is unreachable."))
    (lambda (condition stream)
      ;; Grammar note - starting a sentence with a numeral is wrong.
      (format stream
-             (!uncross-format-control
               "~@<~@(~D~) call~:P to ~
                ~/sb!impl:print-symbol-with-prefix/ ~
                ~2:*~[~;was~:;were~] compiled before a compiler-macro ~
                was defined for it. A declaration of NOTINLINE at the ~
                call site~:P will eliminate this warning, as will ~
                defining the compiler-macro before its first potential ~
-               use.~@:>")
+               use.~@:>"
              (compiler-macro-application-missed-warning-count condition)
              (compiler-macro-application-missed-warning-function condition)))))
 
@@ -544,16 +543,13 @@ has written, having proved that it is unreachable."))
 ;;; WITH-COMPILATION-UNIT, which can potentially be invoked outside
 ;;; the compiler, hence the BOUNDP check.
 (defun note-undefined-reference (name kind)
-  ;; A convenience: in the cross-compiler, assume that any function
-  ;; in any SB! package will eventually be defined.
-  ;; This may be untrue, but is true enough that it correctly muffles
-  ;; far more warnings than it incorrectly muffles (if any).
-  ;; Warnings about failure to inline will still be shown.
   #+sb-xc-host
-  (when (eq kind :function)
-    (let ((package (symbol-package (fun-name-block-name name))))
-      (when (= (mismatch (string (package-name package)) "SB!") 3)
-        (return-from note-undefined-reference (values)))))
+  ;; Whitelist functions are looked up prior to UNCROSS,
+  ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
+  (when (and (eq kind :function)
+             (gethash name sb-cold::*undefined-fun-whitelist*))
+    (return-from note-undefined-reference (values)))
+  (setq name (uncross name))
   (unless (and
            ;; Check for boundness so we don't blow up if we're called
            ;; when IR1 conversion isn't going on.
@@ -638,14 +634,17 @@ has written, having proved that it is unreachable."))
                  ;; so that repeated proclamations don't warn. NIL is a valid
                  ;; value for :inlinep in the globaldb so use the 2nd result.
                  (not (nth-value 1 (info :function :inlinep name))))
-        (compiler-style-warn
+        ;; This will be a STYLE-WARNING for the target, but a full warning
+        ;; for the host. There's no constraint to use _only_ STYLE-WARN
+        ;; to signal a (subtype of) STYLE-WARNING. But conversely we enforce
+        ;; that STYLE-WARN not signal things that aren't style-warnings.
+        (compiler-warn
          'inlining-dependency-failure
          :format-control
-         (!uncross-format-control
          "~@<Proclaiming ~/sb!impl:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
 ~:*~[~;was~:;were~] previously compiled. A declaration of NOTINLINE ~
 at the call site~:P will eliminate this warning, as will proclaiming ~
-and defining the function before its first potential use.~@:>")
+and defining the function before its first potential use.~@:>"
          :format-arguments (list name warning-count))))))
 
 ;; Inlining failure scenario 2 [at time of call]:
@@ -695,16 +694,14 @@ and defining the function before its first potential use.~@:>")
        'inlining-dependency-failure
        :format-control
        (if (info :function :assumed-type name)
-           (!uncross-format-control
            "~@<Call to ~/sb!impl:print-symbol-with-prefix/ could not be inlined because no definition ~
-for it was seen prior to its first use.~:@>")
+for it was seen prior to its first use.~:@>"
          ;; This message sort of implies that source form is the
          ;; only reasonable representation in which an inline definition
          ;; could have been saved, which isn't in general true - it could
          ;; be saved as a parsed AST - but I don't really know how else to
          ;; phrase this. And it happens to be true in SBCL, so it's not wrong.
-           (!uncross-format-control
            "~@<Call to ~/sb!impl:print-symbol-with-prefix/ could not be inlined because its source code ~
 was not saved. A global INLINE or SB-EXT:MAYBE-INLINE proclamation must be ~
-in effect to save function definitions for inlining.~:@>"))
+in effect to save function definitions for inlining.~:@>")
        :format-arguments (list name)))))

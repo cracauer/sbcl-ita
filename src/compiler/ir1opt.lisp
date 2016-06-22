@@ -28,7 +28,7 @@
            ;; check for EQL types and singleton numeric types
            (values (type-singleton-p (lvar-type thing))))))
 
-;;; Same as above except for EQL types
+;;; Same as above except it doesn't consider EQL types
 (defun strictly-constant-lvar-p (thing)
   (declare (type (or lvar null) thing))
   (and (lvar-p thing)
@@ -75,12 +75,6 @@
               (t
                (,accessor uses))))))
 
-#!-sb-fluid (declaim (inline lvar-derived-type))
-(defun lvar-derived-type (lvar)
-  (declare (type lvar lvar))
-  (or (lvar-%derived-type lvar)
-      (setf (lvar-%derived-type lvar)
-            (%lvar-derived-type lvar))))
 (defun %lvar-derived-type (lvar)
   (lvar-type-using lvar node-derived-type))
 
@@ -235,20 +229,8 @@
                               (t (coerce-to-values type)))))
                dest)))))
   (or (lvar-%externally-checkable-type lvar) *wild-type*))
-#!-sb-fluid(declaim (inline flush-lvar-externally-checkable-type))
-(defun flush-lvar-externally-checkable-type (lvar)
-  (declare (type lvar lvar))
-  (setf (lvar-%externally-checkable-type lvar) nil))
 
 ;;;; interface routines used by optimizers
-
-(declaim (inline reoptimize-component))
-(defun reoptimize-component (component kind)
-  (declare (type component component)
-           (type (member nil :maybe t) kind))
-  (aver kind)
-  (unless (eq (component-reoptimize component) t)
-    (setf (component-reoptimize component) kind)))
 
 ;;; This function is called by optimizers to indicate that something
 ;;; interesting has happened to the value of LVAR. Optimizers must
@@ -903,7 +885,7 @@
     (let ((*compiler-error-context* node))
       (compiler-style-warn
        "The return value of ~A should not be discarded."
-       (lvar-fun-name (basic-combination-fun node))))))
+       (lvar-fun-name (basic-combination-fun node) t)))))
 
 ;;; Do IR1 optimizations on a COMBINATION node.
 (declaim (ftype (function (combination) (values)) ir1-optimize-combination))
@@ -931,15 +913,13 @@
        (cond (info
               (check-important-result node info)
               (let ((fun (fun-info-destroyed-constant-args info)))
-                (when fun
-                  (let ((destroyed-constant-args (funcall fun args)))
-                    (when destroyed-constant-args
-                      (let ((*compiler-error-context* node))
-                        (warn 'constant-modified
-                              :fun-name (lvar-fun-name
-                                         (basic-combination-fun node)))
-                        (setf (basic-combination-kind node) :error)
-                        (return-from ir1-optimize-combination))))))
+                (when (and fun (funcall fun args))
+                  (let ((*compiler-error-context* node))
+                    (warn 'constant-modified
+                          :fun-name (lvar-fun-name
+                                     (basic-combination-fun node) t))
+                    (setf (basic-combination-kind node) :error)
+                    (return-from ir1-optimize-combination))))
               (let ((fun (fun-info-derive-type info)))
                 (when fun
                   (let ((res (funcall fun node)))
@@ -978,14 +958,7 @@
                  (return-from ir1-optimize-combination))))))
 
        (let ((attr (fun-info-attributes info)))
-         (when (and (ir1-attributep attr foldable)
-                    ;; KLUDGE: The next test could be made more sensitive,
-                    ;; only suppressing constant-folding of functions with
-                    ;; CALL attributes when they're actually passed
-                    ;; function arguments. -- WHN 19990918
-                    (not (ir1-attributep attr call))
-                    (every #'constant-lvar-p args)
-                    (node-lvar node))
+         (when (constant-fold-call-p node)
            (constant-fold-call node)
            (return-from ir1-optimize-combination))
          (when (and (ir1-attributep attr commutative)
@@ -1369,7 +1342,8 @@
 ;;; good idea to go OO, representing the reasons by objects, using
 ;;; CLOS methods on the objects instead of CASE, and (possibly) using
 ;;; SIGNAL instead of THROW.
-(declaim (ftype (function (&rest t) nil) give-up-ir1-transform))
+(declaim (ftype (function (&rest t) #+(and sb-xc-host ccl) *
+                                    #-(and sb-xc-host ccl) nil) give-up-ir1-transform))
 (defun give-up-ir1-transform (&rest args)
   (throw 'give-up-ir1-transform (values :failure args)))
 (defun abort-ir1-transform (&rest args)
@@ -1469,6 +1443,37 @@
         (locall-analyze-component *current-component*))))
   (values))
 
+(defun constant-fold-arg-p (name)
+  (typecase name
+    (null
+     t)
+    ((or symbol cons)
+     (let* ((info (info :function :info name))
+            (attributes (and info
+                             (fun-info-attributes info))))
+       (and info
+            (ir1-attributep attributes foldable)
+            (not (ir1-attributep attributes call)))))))
+
+;;; Return T if the function is foldable and if it's marked as CALL
+;;; all function arguments are FOLDABLE too.
+(defun constant-fold-call-p (combination)
+  (let* ((info (basic-combination-fun-info combination))
+         (attr (fun-info-attributes info))
+         (args (basic-combination-args combination)))
+    (cond ((not (ir1-attributep attr foldable))
+           nil)
+          ((ir1-attributep attr call)
+           (apply (fun-info-foldable-call-check info)
+                  (mapcar (lambda (lvar)
+                            (or (lvar-fun-name lvar t)
+                                (if (constant-lvar-p lvar)
+                                    (lvar-value lvar)
+                                    (return-from constant-fold-call-p nil))))
+                          args)))
+          (t
+           (every #'constant-lvar-p args)))))
+
 ;;; Replace a call to a foldable function of constant arguments with
 ;;; the result of evaluating the form. If there is an error during the
 ;;; evaluation, we give a warning and leave the call alone, making the
@@ -1477,7 +1482,12 @@
 ;;; If there is more than one value, then we transform the call into a
 ;;; VALUES form.
 (defun constant-fold-call (call)
-  (let ((args (mapcar #'lvar-value (combination-args call)))
+  (let ((args (mapcar (lambda (lvar)
+                        (let ((name (lvar-fun-name lvar t)))
+                          (if name
+                              (fdefinition name)
+                              (lvar-value lvar))))
+                      (combination-args call)))
         (fun-name (combination-fun-source-name call)))
     (multiple-value-bind (values win)
         (careful-call fun-name
@@ -2210,7 +2220,11 @@
 (defun delete-cast (cast)
   (declare (type cast cast))
   (let ((value (cast-value cast))
-        (lvar (node-lvar cast)))
+        (lvar (cast-lvar cast)))
+    (when (and (bound-cast-p cast)
+               (bound-cast-check cast))
+      (flush-combination (bound-cast-check cast))
+      (setf (bound-cast-check cast) nil))
     (delete-filter cast lvar value)
     (when lvar
       (reoptimize-lvar lvar)
@@ -2252,9 +2266,18 @@
         (atype (cast-asserted-type cast)))
     (unless (or do-not-optimize
                 (not (may-delete-vestigial-exit cast)))
+      (when (and (bound-cast-p cast)
+                 (bound-cast-check cast)
+                 (constant-lvar-p (bound-cast-bound cast)))
+        (setf atype
+              (specifier-type `(integer 0 (,(lvar-value (bound-cast-bound cast)))))
+              (cast-asserted-type cast) atype
+              (bound-cast-derived cast) t))
       (let ((lvar (node-lvar cast)))
-        (when (values-subtypep (lvar-derived-type value)
-                               (cast-asserted-type cast))
+        (when (and (or (not (bound-cast-p cast))
+                       (bound-cast-derived cast))
+                   (values-subtypep (lvar-derived-type value)
+                                    (cast-asserted-type cast)))
           (delete-cast cast)
           (return-from ir1-optimize-cast t))
 
@@ -2283,41 +2306,54 @@
                              (eq (basic-combination-kind use) :local))
                     (merges use))))
               (dolist (use (merges))
-                (merge-tail-sets use)))))))
+                (merge-tail-sets use))))))
+
+      (when (and (bound-cast-p cast)
+                 (bound-cast-check cast)
+                 (policy cast (= insert-array-bounds-checks 0)))
+        (flush-combination (bound-cast-check cast))
+        (setf (bound-cast-check cast) nil)))
 
     (let* ((value-type (lvar-derived-type value))
            (int (values-type-intersection value-type atype)))
       (derive-node-type cast int)
-      (when (eq int *empty-type*)
-        (unless (eq value-type *empty-type*)
-
-          ;; FIXME: Do it in one step.
-          (let ((context (node-source-form cast))
-                (detail (lvar-all-sources (cast-value cast))))
-            (filter-lvar
-             value
-             (if (cast-single-value-p cast)
-                 `(list 'dummy)
-                 `(multiple-value-call #'list 'dummy)))
-            (filter-lvar
-             (cast-value cast)
-             ;; FIXME: Derived type.
-             `(%compile-time-type-error 'dummy
-                                        ',(type-specifier atype)
-                                        ',(type-specifier value-type)
-                                        ',detail
-                                        ',(compile-time-type-error-context context))))
-          ;; KLUDGE: FILTER-LVAR does not work for non-returning
-          ;; functions, so we declare the return type of
-          ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type
-          ;; here.
-          (setq value (cast-value cast))
-          (derive-node-type (lvar-uses value) *empty-type*)
-          (maybe-terminate-block (lvar-uses value) nil)
-          ;; FIXME: Is it necessary?
-          (aver (null (block-pred (node-block cast))))
-          (delete-block-lazily (node-block cast))
-          (return-from ir1-optimize-cast)))
+      (cond ((or
+              (neq int *empty-type*)
+              (eq value-type *empty-type*)))
+            ;; No need to transform into an analog of
+            ;; %COMPILE-TIME-TYPE-ERROR, %CHECK-BOUND will signal at
+            ;; run-time and %CHECK-BOUND ir2-converter will signal at
+            ;; compile-time if it survives further stages of ir1
+            ;; optimization.
+            ((bound-cast-p cast))
+            (t
+             ;; FIXME: Do it in one step.
+             (let ((context (node-source-form cast))
+                   (detail (lvar-all-sources (cast-value cast))))
+               (filter-lvar
+                value
+                (if (cast-single-value-p cast)
+                    `(list 'dummy)
+                    `(multiple-value-call #'list 'dummy)))
+               (filter-lvar
+                (cast-value cast)
+                ;; FIXME: Derived type.
+                `(%compile-time-type-error 'dummy
+                                           ',(type-specifier atype)
+                                           ',(type-specifier value-type)
+                                           ',detail
+                                           ',(compile-time-type-error-context context))))
+             ;; KLUDGE: FILTER-LVAR does not work for non-returning
+             ;; functions, so we declare the return type of
+             ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type
+             ;; here.
+             (setq value (cast-value cast))
+             (derive-node-type (lvar-uses value) *empty-type*)
+             (maybe-terminate-block (lvar-uses value) nil)
+             ;; FIXME: Is it necessary?
+             (aver (null (block-pred (node-block cast))))
+             (delete-block-lazily (node-block cast))
+             (return-from ir1-optimize-cast)))
       (when (eq (node-derived-type cast) *empty-type*)
         (maybe-terminate-block cast nil))
 

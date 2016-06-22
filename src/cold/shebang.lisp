@@ -22,6 +22,19 @@
 (declaim (type list *shebang-features*))
 (defvar *shebang-features*)
 
+(defun target-platform-name ()
+  (let ((arch (intersection '(:alpha :arm :arm64 :hppa :mips :ppc :sparc :x86 :x86-64)
+                            *shebang-features*)))
+    (cond ((not arch) (error "No architecture selected"))
+          ((> (length arch) 1) (error "More than one architecture selected")))
+    (string-downcase (car arch))))
+
+;;; Not necessarily the logical place to define BACKEND-ASM-PACKAGE-NAME,
+;;; but a convenient one, because *shebang-features* needs to have been
+;;; DEFVARed, and because 'chill' loads this and only this file.
+(defun backend-asm-package-name ()
+  (concatenate 'string "SB!" (string-upcase (target-platform-name)) "-ASM"))
+
 (defun feature-in-list-p (feature list)
   (labels ((sane-expr-p (x)
              (typecase x
@@ -131,59 +144,3 @@
 (compile 'make-quote-reader)
 
 (set-macro-character #\" (make-quote-reader (get-macro-character #\" nil)))
-
-;;;; FIXME: Would it be worth implementing this?
-#|
-;;;; readmacro syntax to remove spaces from FORMAT strings at compile time
-;;;; instead of leaving them to be skipped over at runtime
-
-;;; a counter of the number of bytes that we think we've avoided having to
-;;; compile into the system by virtue of doing compile-time processing
-(defvar *shebang-double-quote--approx-bytes-saved* 0)
-
-;;; Read a string, strip out any #\~ #\NEWLINE whitespace sequence,
-;;; and return the result. (This is a subset of the processing performed
-;;; by FORMAT, but we perform it at compile time instead of postponing
-;;; it until run-time.
-(defun shebang-double-quote (stream)
-  (labels ((rc () (read-char stream))
-           (white-p (char)
-             ;; Putting non-standard characters in the compiler source is
-             ;; generally a bad idea, since we'd like to be really portable.
-             ;; It's specifically a bad idea in strings intended to be
-             ;; processed by SHEBANG-DOUBLE-QUOTE, because there seems to be no
-             ;; portable way to test a non-STANDARD-CHAR for whitespaceness.
-             ;; (The most common problem would be to put a #\TAB -- which is
-             ;; not a STANDARD-CHAR -- into the string. If this is part of the
-             ;; to-be-skipped-over whitespace after a #\~ #\NEWLINE sequence in
-             ;; the string, it won't work, because it won't be recognized as
-             ;; whitespace.)
-             (unless (typep char 'standard-char)
-               (warn "non-STANDARD-CHAR in #!\": ~C" result))
-             (or (char= char #\newline)
-                 (char= char #\space)))
-           (skip-white ()
-             (do ((char (rc) (rc))
-                  (count 0 (1+ count)))
-                 ((not (white-p char))
-                  (unread-char char stream)
-                  count))))
-    (do ((adj-string (make-array 0 :element-type 'char :adjustable t))
-         (char (rc) (rc)))
-        ((char= char #\") (coerce adj-string 'simple-string))
-      (cond ((char= char #\~)
-             (let ((next-char (read-char stream)))
-               (cond ((char= next-char #\newline)
-                      (incf *shebang-double-quote--approx-bytes-saved*
-                            (+ 2 (skip-white))))
-                     (t
-                      (vector-push-extend      char adj-string)
-                      (vector-push-extend next-char adj-string)))))
-            ((char= char #\\)
-             (vector-push-extend char adj-string)
-             (vector-push-extend (rc) adj-string))
-            (t (vector-push-extend char adj-string))))))
-
-(setf (gethash #\" *shebang-dispatch*)
-      #'shebang-double-quote)
-|#

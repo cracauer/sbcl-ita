@@ -9,6 +9,15 @@
 
 (in-package "SB-COLD")
 
+(defparameter *full-calls-to-warn-about*
+  '(;mask-signed-field ;; Too many to fix
+    ))
+
+;;; Set of function names whose definition will never be seen in make-host-2,
+;;; as they are deferred until warm load.
+;;; The table is populated later in this file.
+(defparameter *undefined-fun-whitelist* (make-hash-table :test 'equal))
+
 (export '*symbol-values-for-genesis*)
 (let ((pathname "output/init-symbol-values.lisp-expr"))
   (defvar *symbol-values-for-genesis*
@@ -17,6 +26,65 @@
     (with-open-file (f pathname :direction :output :if-exists :supersede)
       (declare (special *symbol-values-for-genesis*)) ; non-toplevel DEFVAR
       (write *symbol-values-for-genesis* :stream f :readably t))))
+
+(when (make-host-1-parallelism)
+  (require :sb-posix))
+#+#.(cl:if (cl:find-package "SB-POSIX") '(and) '(or))
+(defun parallel-make-host-1 (max-jobs)
+  (let ((subprocess-count 0)
+        (subprocess-list nil))
+    (flet ((wait ()
+             (multiple-value-bind (pid status) (sb-posix:wait)
+               (format t "~&; Subprocess ~D exit status ~D~%"  pid status)
+               (setq subprocess-list (delete pid subprocess-list)))
+             (decf subprocess-count)))
+      (do-stems-and-flags (stem flags)
+        (unless (position :not-host flags)
+          (when (>= subprocess-count max-jobs)
+            (wait))
+          (let ((pid (sb-posix:fork)))
+            (when (zerop pid)
+              (in-host-compilation-mode
+               (lambda () (compile-stem stem flags :host-compile)))
+              ;; FIXME: convey exit code based on COMPILE result.
+              (sb-sys:os-exit 0))
+            (push pid subprocess-list)
+            (incf subprocess-count)
+            ;; Do not wait for the compile to finish. Just load as source.
+            (let ((source (merge-pathnames (stem-remap-target stem)
+                                           (make-pathname :type "lisp"))))
+              (let ((sb-ext:*evaluator-mode* :interpret))
+                (in-host-compilation-mode
+                 (lambda ()
+                   (load source :verbose t :print nil))))))))
+      (loop (if (plusp subprocess-count) (wait) (return)))))
+
+  ;; We want to load compiled files, because that's what this function promises.
+  ;; Reloading is tricky because constructors for interned ctypes will construct
+  ;; new objects via their LOAD-TIME-VALUE forms, but globaldb already stored
+  ;; some objects from the interpreted pre-load.
+  ;; So wipe everything out that causes problems down the line.
+  ;; (Or perhaps we could make their effects idempotent)
+  (format t "~&; Parallel build: Clearing globaldb~%")
+  (do-all-symbols (s)
+    (when (get s :sb-xc-globaldb-info)
+      (remf (symbol-plist s) :sb-xc-globaldb-info)))
+  (fill (symbol-value 'sb!c::*info-types*) nil)
+  (clrhash (symbol-value 'sb!kernel::*forward-referenced-layouts*))
+  (setf (symbol-value 'sb!kernel:*type-system-initialized*) nil)
+  (makunbound 'sb!c::*backend-primitive-type-names*)
+  (makunbound 'sb!c::*backend-primitive-type-aliases*)
+
+  (format t "~&; Parallel build: Reloading compilation artifacts~%")
+  ;; Now it works to load fasls.
+  (in-host-compilation-mode
+   (lambda ()
+     (handler-bind ((sb-kernel:redefinition-warning #'muffle-warning))
+       (do-stems-and-flags (stem flags)
+         (unless (position :not-host flags)
+           (load (stem-object-path stem flags :host-compile)
+                 :verbose t :print nil))))))
+  (format t "~&; Parallel build: Fasl loading complete~%"))
 
 ;;; Either load or compile-then-load the cross-compiler into the
 ;;; cross-compilation host Common Lisp.
@@ -57,7 +125,6 @@
                     "BOOLE-XOR"
                     "CALL-ARGUMENTS-LIMIT"
                     "CHAR-CODE-LIMIT"
-                    "DEFMETHOD"
                     "DOUBLE-FLOAT-EPSILON"
                     "DOUBLE-FLOAT-NEGATIVE-EPSILON"
                     "INTERNAL-TIME-UNITS-PER-SECOND"
@@ -144,6 +211,10 @@
                     "UPGRADED-COMPLEX-PART-TYPE"
                     "WITH-COMPILATION-UNIT"))
       (export (intern name package-name) package-name)))
+  ;; Symbols that can't be entered into the whitelist
+  ;; until this function executes.
+  (setf (gethash (intern "MAKE-LOAD-FORM" "SB-XC")
+                 *undefined-fun-whitelist*) t)
   ;; don't watch:
   (dolist (package (list-all-packages))
     (when (= (mismatch (package-name package) "SB!") 3)
@@ -169,10 +240,14 @@
   ;; with the ordinary Lisp compiler, and this is intentional, in
   ;; order to make the compiler aware of the definitions of assembly
   ;; routines.
-  (do-stems-and-flags (stem flags)
-    (unless (find :not-host flags)
-      (funcall load-or-cload-stem stem flags)
-      #!+sb-show (warn-when-cl-snapshot-diff *cl-snapshot*)))
+  (if (and (make-host-1-parallelism)
+           (eq load-or-cload-stem #'host-cload-stem))
+      (funcall (intern "PARALLEL-MAKE-HOST-1" 'sb-cold)
+               (make-host-1-parallelism))
+      (do-stems-and-flags (stem flags)
+        (unless (find :not-host flags)
+          (funcall load-or-cload-stem stem flags)
+          #!+sb-show (warn-when-cl-snapshot-diff *cl-snapshot*))))
 
   ;; If the cross-compilation host is SBCL itself, we can use the
   ;; PURIFY extension to freeze everything in place, reducing the
@@ -188,3 +263,121 @@
   (sb-ext:purify)
 
   (values))
+
+;; Keep these in order by package, then symbol.
+(dolist (sym
+         (append
+          ;; CL, EXT, KERNEL
+          '(allocate-instance
+            compute-applicable-methods
+            slot-makunbound
+            make-load-form-saving-slots
+            sb!ext:run-program
+            sb!kernel:profile-deinit)
+          ;; CLOS implementation
+          '(sb!mop:class-finalized-p
+            sb!mop:class-prototype
+            sb!mop:class-slots
+            sb!mop:eql-specializer-object
+            sb!mop:finalize-inheritance
+            sb!mop:generic-function-name
+            sb!mop:slot-definition-allocation
+            sb!mop:slot-definition-name
+            sb!pcl::%force-cache-flushes
+            sb!pcl::check-wrapper-validity
+            sb!pcl::class-has-a-forward-referenced-superclass-p
+            sb!pcl::class-wrapper
+            sb!pcl::compute-gf-ftype
+            sb!pcl::definition-source
+            sb!pcl:ensure-class-finalized)
+          ;; CLOS-based packages
+          '(sb!gray:stream-clear-input
+            sb!gray:stream-clear-output
+            sb!gray:stream-file-position
+            sb!gray:stream-finish-output
+            sb!gray:stream-force-output
+            sb!gray:stream-fresh-line
+            sb!gray:stream-line-column
+            sb!gray:stream-line-length
+            sb!gray:stream-listen
+            sb!gray:stream-peek-char
+            sb!gray:stream-read-byte
+            sb!gray:stream-read-char
+            sb!gray:stream-read-char-no-hang
+            sb!gray:stream-read-line
+            sb!gray:stream-read-sequence
+            sb!gray:stream-terpri
+            sb!gray:stream-unread-char
+            sb!gray:stream-write-byte
+            sb!gray:stream-write-char
+            sb!gray:stream-write-sequence
+            sb!gray:stream-write-string
+            sb!sequence:concatenate
+            sb!sequence:copy-seq
+            sb!sequence:count
+            sb!sequence:count-if
+            sb!sequence:count-if-not
+            sb!sequence:delete
+            sb!sequence:delete-duplicates
+            sb!sequence:delete-if
+            sb!sequence:delete-if-not
+            (setf sb!sequence:elt)
+            sb!sequence:elt
+            sb!sequence:emptyp
+            sb!sequence:fill
+            sb!sequence:find
+            sb!sequence:find-if
+            sb!sequence:find-if-not
+            (setf sb!sequence:iterator-element)
+            sb!sequence:iterator-endp
+            sb!sequence:iterator-step
+            sb!sequence:length
+            sb!sequence:make-sequence-iterator
+            sb!sequence:make-sequence-like
+            sb!sequence:map
+            sb!sequence:merge
+            sb!sequence:mismatch
+            sb!sequence:nreverse
+            sb!sequence:nsubstitute
+            sb!sequence:nsubstitute-if
+            sb!sequence:nsubstitute-if-not
+            sb!sequence:position
+            sb!sequence:position-if
+            sb!sequence:position-if-not
+            sb!sequence:reduce
+            sb!sequence:remove
+            sb!sequence:remove-duplicates
+            sb!sequence:remove-if
+            sb!sequence:remove-if-not
+            sb!sequence:replace
+            sb!sequence:reverse
+            sb!sequence:search
+            sb!sequence:sort
+            sb!sequence:stable-sort
+            sb!sequence:subseq
+            sb!sequence:substitute
+            sb!sequence:substitute-if
+            sb!sequence:substitute-if-not)
+          ;; Fast interpreter
+          #!+sb-fasteval
+          '(sb!interpreter:%fun-type
+            sb!interpreter:env-policy
+            sb!interpreter:eval-in-environment
+            sb!interpreter:find-lexical-fun
+            sb!interpreter:find-lexical-var
+            sb!interpreter::flush-everything
+            sb!interpreter::fun-lexically-notinline-p
+            sb!interpreter:lexenv-from-env
+            sb!interpreter::lexically-unlocked-symbol-p
+            sb!interpreter:list-locals
+            sb!interpreter:prepare-for-compile
+            sb!interpreter::reconstruct-syntactic-closure-env)
+          ;; Other
+          '(sb!debug::find-interrupted-name-and-frame
+            sb!impl::encapsulate-generic-function
+            sb!impl::encapsulated-generic-function-p
+            sb!impl::get-processes-status-changes
+            sb!impl::step-form
+            sb!impl::step-values
+            sb!impl::unencapsulate-generic-function)))
+  (setf (gethash sym *undefined-fun-whitelist*) t))

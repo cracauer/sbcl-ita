@@ -24,7 +24,8 @@
 ;;;
 ;;; ASSERT-ERROR isn't defined until a later file because it uses the
 ;;; macro RESTART-CASE, which isn't defined until a later file.
-(defmacro-mundanely assert (test-form &optional places datum &rest arguments
+;;;
+(sb!xc:defmacro assert (test-form &optional places datum &rest arguments
                             &environment env)
   #!+sb-doc
   "Signals an error if the value of TEST-FORM is NIL. Returns NIL.
@@ -45,53 +46,42 @@
    CL:OR, CL:AND, etc.) the results of evaluating the ARGs will be
    included in the error report if the assertion fails."
   (collect ((bindings) (infos))
-    (let ((new-test
-            (flet ((process-place (place)
-                     (if (sb!xc:constantp place env)
-                         place
-                         (with-unique-names (temp)
-                           (bindings `(,temp ,place))
-                           (infos `(list ',place ,temp))
-                           temp))))
-              (cond
-                ;; TEST-FORM looks like a function call. We do not
-                ;; attempt this if TEST-FORM is the application of a
-                ;; special operator because of argument evaluation
-                ;; order issues.
-               ((when (typep test-form '(cons symbol list))
-                   (let* ((name (first test-form))
-                          (global-fun-p
-                           (eq (info :function :kind name) :function)))
-                     (when (typecase env
-                             (sb!kernel:lexenv
-                              (let ((f (cdr (assoc name (sb!c::lexenv-funs env)))))
-                                (if (not f) global-fun-p (sb!c::functional-p f))))
-                             #!+sb-fasteval
-                             (sb!interpreter:basic-env
-                              (let ((kind
-                                     (sb!interpreter::find-lexical-fun env name)))
-                                (if (null kind) global-fun-p (eq kind :function))))
-                             (null global-fun-p))
-                       `(,name ,@(mapcar #'process-place (rest test-form)))))))
-                ;; For all other cases, just evaluate TEST-FORM and do
-                ;; not report any details if the assertion fails.
-                (t
-                 test-form)))))
+    (let* ((func (if (listp test-form) (car test-form)))
+           (new-test
+            (if (and (typep func '(and symbol (not null)))
+                     (not (sb!xc:macro-function func env))
+                     (not (sb!xc:special-operator-p func))
+                     (proper-list-p (cdr test-form)))
+                ;; TEST-FORM is a function call. We do not attempt this
+                ;; if TEST-FORM is a macro invocation or special form.
+                `(,func ,@(mapcar (lambda (place)
+                                    (if (sb!xc:constantp place env)
+                                        place
+                                        (with-unique-names (temp)
+                                          (bindings `(,temp ,place))
+                                          (infos `(list ',place ,temp))
+                                          temp)))
+                                  (rest test-form)))
+                ;; For all other cases, just evaluate TEST-FORM
+                ;; and don't report any details if the assertion fails.
+                test-form))
+           (try '#:try)
+           (done  '#:done))
       ;; If TEST-FORM, potentially using values from BINDINGS, does not
       ;; hold, enter a loop which reports the assertion error,
       ;; potentially changes PLACES, and retries TEST-FORM.
       `(tagbody
-        :try
+        ,try
           (let ,(bindings)
             (when ,new-test
-              (go :done))
+              (go ,done))
             (assert-error ',test-form (list ,@(infos))
                           ',places ,datum ,@arguments))
           ,@(mapcar (lambda (place)
                       `(setf ,place (assert-prompt ',place ,place)))
                     places)
-          (go :try)
-        :done))))
+          (go ,try)
+        ,done))))
 
 (defun assert-prompt (name value)
   (cond ((y-or-n-p "The old value of ~S is ~S.~
@@ -114,7 +104,7 @@
 ;;;
 ;;; CHECK-TYPE-ERROR isn't defined until a later file because it uses
 ;;; the macro RESTART-CASE, which isn't defined until a later file.
-(defmacro-mundanely check-type (place type &optional type-string
+(sb!xc:defmacro check-type (place type &optional type-string
                                 &environment env)
   #!+sb-doc
   "Signal a restartable error of type TYPE-ERROR if the value of PLACE
@@ -144,7 +134,7 @@ invoked. In that case it will store into PLACE and start over."
 
 ;;;; DEFINE-SYMBOL-MACRO
 
-(defmacro-mundanely define-symbol-macro (name expansion)
+(sb!xc:defmacro define-symbol-macro (name expansion)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
     (sb!c::%define-symbol-macro ',name ',expansion (sb!c:source-location))))
 
@@ -158,7 +148,7 @@ invoked. In that case it will store into PLACE and start over."
   (let ((kind (info :variable :kind name)))
     (case kind
      ((:macro :unknown)
-      (sb!c:with-source-location (source-location)
+      (when source-location
         (setf (info :source-location :symbol-macro name) source-location))
       (setf (info :variable :kind name) :macro)
       (setf (info :variable :macro-expansion name) expansion))
@@ -176,7 +166,7 @@ invoked. In that case it will store into PLACE and start over."
 
 ;;;; DEFINE-COMPILER-MACRO
 
-(defmacro-mundanely define-compiler-macro (name lambda-list &body body)
+(sb!xc:defmacro define-compiler-macro (name lambda-list &body body)
   #!+sb-doc
   "Define a compiler-macro for NAME."
   (legal-fun-name-or-type-error name)
@@ -347,33 +337,36 @@ invoked. In that case it will store into PLACE and start over."
         `(let ((,keyform-value ,keyform))
            (block ,block
              (tagbody
-              ,again
-              (return-from
-               ,block
-               (cond ,@(nreverse clauses)
-                     (t
-                      (setf ,keyform-value
-                            (setf ,keyform
-                                  (case-body-error
-                                   ',name ',keyform ,keyform-value
-                                   ',expected-type ',keys)))
-                      (go ,again))))))))
+                ,again
+                (return-from
+                 ,block
+                  (cond ,@(nreverse clauses)
+                        (t
+                         (setf ,keyform-value
+                               (setf ,keyform
+                                     (case-body-error
+                                      ',name ',keyform ,keyform-value
+                                      ',expected-type ',keys)))
+                         (go ,again))))))))
       `(let ((,keyform-value ,keyform))
          (declare (ignorable ,keyform-value)) ; e.g. (CASE KEY (T))
          (cond
-          ,@(nreverse clauses)
-          ,@(if errorp
-                `((t (case-failure ',name ,keyform-value ',keys))))))))
+           ,@(nreverse clauses)
+           ,@(when errorp
+               `((t (,(ecase name
+                        (etypecase 'etypecase-failure)
+                        (ecase 'ecase-failure))
+                     ,keyform-value ',keys))))))))
 ) ; EVAL-WHEN
 
-(defmacro-mundanely case (keyform &body cases)
+(sb!xc:defmacro case (keyform &body cases)
   #!+sb-doc
   "CASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If a singleton key is T then the clause is a default clause."
   (case-body 'case keyform cases t 'eql nil nil nil))
 
-(defmacro-mundanely ccase (keyform &body cases)
+(sb!xc:defmacro ccase (keyform &body cases)
   #!+sb-doc
   "CCASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
@@ -381,37 +374,52 @@ invoked. In that case it will store into PLACE and start over."
   signalled."
   (case-body 'ccase keyform cases t 'eql t t t))
 
-(defmacro-mundanely ecase (keyform &body cases)
+(sb!xc:defmacro ecase (keyform &body cases)
   #!+sb-doc
   "ECASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If none of the keys matches then an error is signalled."
   (case-body 'ecase keyform cases t 'eql t nil t))
 
-(defmacro-mundanely typecase (keyform &body cases)
+(sb!xc:defmacro typecase (keyform &body cases)
   #!+sb-doc
   "TYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true."
   (case-body 'typecase keyform cases nil 'typep nil nil nil))
 
-(defmacro-mundanely ctypecase (keyform &body cases)
+(sb!xc:defmacro ctypecase (keyform &body cases)
   #!+sb-doc
   "CTYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true. If no form is satisfied then a correctable error is signalled."
   (case-body 'ctypecase keyform cases nil 'typep t t t))
 
-(defmacro-mundanely etypecase (keyform &body cases)
+(sb!xc:defmacro etypecase (keyform &body cases)
   #!+sb-doc
   "ETYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true. If no form is satisfied then an error is signalled."
   (case-body 'etypecase keyform cases nil 'typep t nil t))
+
+;;; Compile a version of BODY for all TYPES, and dispatch to the
+;;; correct one based on the value of VAR. This was originally used
+;;; only for strings, hence the name. Renaming it to something more
+;;; generic might not be a bad idea.
+(sb!xc:defmacro string-dispatch ((&rest types) var &body body)
+  (let ((fun (sb!xc:gensym "STRING-DISPATCH-FUN")))
+    `(flet ((,fun (,var)
+              ,@body))
+       (declare (inline ,fun))
+       (etypecase ,var
+         ,@(loop for type in types
+                 ;; TRULY-THE allows transforms to take advantage of the type
+                 ;; information without need for constraint propagation.
+                 collect `(,type (,fun (truly-the ,type ,var))))))))
 
 ;;;; WITH-FOO i/o-related macros
 
-(defmacro-mundanely with-open-stream ((var stream) &body forms-decls)
+(sb!xc:defmacro with-open-stream ((var stream) &body forms-decls)
   (multiple-value-bind (forms decls) (parse-body forms-decls nil)
     (let ((abortp (gensym)))
       `(let ((,var ,stream)
@@ -424,12 +432,12 @@ invoked. In that case it will store into PLACE and start over."
            (when ,var
              (close ,var :abort ,abortp)))))))
 
-(defmacro-mundanely with-open-file ((stream filespec &rest options)
+(sb!xc:defmacro with-open-file ((stream filespec &rest options)
                                     &body body)
   `(with-open-stream (,stream (open ,filespec ,@options))
      ,@body))
 
-(defmacro-mundanely with-input-from-string ((var string &key index start end)
+(sb!xc:defmacro with-input-from-string ((var string &key index start end)
                                             &body forms-decls)
   (multiple-value-bind (forms decls) (parse-body forms-decls nil)
     `(let ((,var
@@ -448,7 +456,7 @@ invoked. In that case it will store into PLACE and start over."
            ,@(when index
                `((setf ,index (string-input-stream-current ,var))))))))
 
-(defmacro-mundanely with-output-to-string
+(sb!xc:defmacro with-output-to-string
     ((var &optional string &key (element-type ''character))
      &body forms-decls)
   (multiple-value-bind (forms decls) (parse-body forms-decls nil)
@@ -477,7 +485,7 @@ invoked. In that case it will store into PLACE and start over."
 
 ;;;; miscellaneous macros
 
-(defmacro-mundanely nth-value (n form &environment env)
+(sb!xc:defmacro nth-value (n form &environment env)
   #!+sb-doc
   "Evaluate FORM and return the Nth value (zero based)
  without consing a temporary list of values."
@@ -503,7 +511,7 @@ invoked. In that case it will store into PLACE and start over."
              (lambda (n &rest list) (nth (truly-the index n) list))
            (the index ,n) ,form))))
 
-(defmacro-mundanely declaim (&rest specs)
+(sb!xc:defmacro declaim (&rest specs)
   #!+sb-doc
   "DECLAIM Declaration*
   Do a declaration or declarations for the global environment."
@@ -515,20 +523,20 @@ invoked. In that case it will store into PLACE and start over."
 ;; Avoid unknown return values in emitted code for PRINT-UNREADABLE-OBJECT
 (declaim (ftype (sfunction (t t t t &optional t) null)
                 %print-unreadable-object))
-(defmacro-mundanely print-unreadable-object ((object stream &key type identity)
+(sb!xc:defmacro print-unreadable-object ((object stream &key type identity)
                                              &body body)
   #!+sb-doc
   "Output OBJECT to STREAM with \"#<\" prefix, \">\" suffix, optionally
   with object-type prefix and object-identity suffix, and executing the
   code in BODY to provide possible further output."
   ;; Note: possibly out-of-order keyword argument evaluation.
-  (if body
-      (let ((fun (make-symbol "THUNK")))
-        `(dx-flet ((,fun () ,@body))
-           (%print-unreadable-object ,object ,stream ,type ,identity #',fun)))
-      `(%print-unreadable-object ,object ,stream ,type ,identity)))
+  (let ((call `(%print-unreadable-object ,object ,stream ,type ,identity)))
+    (if body
+        (let ((fun (make-symbol "THUNK")))
+          `(dx-flet ((,fun () ,@body)) (,@call #',fun)))
+        call)))
 
-(defmacro-mundanely ignore-errors (&rest forms)
+(sb!xc:defmacro ignore-errors (&rest forms)
   #!+sb-doc
   "Execute FORMS handling ERROR conditions, returning the result of the last
   form, or (VALUES NIL the-ERROR-that-was-caught) if an ERROR was handled."
@@ -539,7 +547,8 @@ invoked. In that case it will store into PLACE and start over."
 (defun funarg-bind/call-forms (funarg arg-forms)
   (if (typep funarg
              '(or (cons (eql function) (cons (satisfies legal-fun-name-p) null))
-                  (cons (eql quote) (cons symbol null))))
+                  (cons (eql quote) (cons symbol null))
+                  (cons (eql lambda))))
       (values nil `(funcall ,funarg . ,arg-forms))
     (let ((fn-sym (sb!xc:gensym))) ; for ONCE-ONLY-ish purposes
       (values `((,fn-sym (%coerce-callable-to-fun ,funarg)))

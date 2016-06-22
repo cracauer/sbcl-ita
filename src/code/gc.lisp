@@ -14,14 +14,6 @@
 ;;;; DYNAMIC-USAGE and friends
 
 #!-sb-fluid
-(declaim (inline current-dynamic-space-start))
-#!+gencgc
-(defun current-dynamic-space-start () sb!vm:dynamic-space-start)
-#!-gencgc
-(defun current-dynamic-space-start ()
-  (extern-alien "current_dynamic_space" unsigned-long))
-
-#!-sb-fluid
 (declaim (inline dynamic-usage))
 #!+gencgc
 (defun dynamic-usage ()
@@ -379,7 +371,7 @@ guaranteed to be collected."
 (defun unsafe-clear-roots (gen)
   #!-gencgc (declare (ignore gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
-  ;; as having these cons more then we have space left leads to huge
+  ;; as having these cons more than we have space left leads to huge
   ;; badness.
   (scrub-control-stack)
   ;; Power cache of the bignum printer: drops overly large bignums and
@@ -387,8 +379,12 @@ guaranteed to be collected."
   (scrub-power-cache)
   ;; Clear caches depending on the generation being collected.
   #!+gencgc
-  (cond ((eql 0 gen))
+  (cond ((eql 0 gen)
+         ;; Drop strings because the hash is pointer-hash
+         ;; but there is no automatic cache rehashing after GC.
+         (sb!format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
+         (sb!format::tokenize-control-string-cache-clear)
          (ctype-of-cache-clear))
         (t
          (drop-all-hash-caches)))

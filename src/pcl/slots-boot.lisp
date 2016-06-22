@@ -56,53 +56,6 @@
     (setf reader-specializers (mapcar #'find-class reader-specializers))
     (setf writer-specializers (mapcar #'find-class writer-specializers))))
 
-(defmacro quiet-funcall (fun &rest args)
-  ;; Don't give a style-warning about undefined function here.
-  `(funcall (locally (declare (muffle-conditions style-warning))
-              ,fun)
-            ,@args))
-
-(defmacro accessor-slot-value (object slot-name &environment env)
-  (aver (constantp slot-name env))
-  (let* ((slot-name (constant-form-value slot-name env))
-         (reader-name (slot-reader-name slot-name)))
-    `(let ((.ignore. (load-time-value
-                      (ensure-accessor 'reader ',reader-name ',slot-name))))
-       (declare (ignore .ignore.))
-       (truly-the (values t &optional)
-                  (quiet-funcall #',reader-name ,object)))))
-
-(defmacro accessor-set-slot-value (object slot-name new-value &environment env)
-  (aver (constantp slot-name env))
-  (setq object (%macroexpand object env))
-  (let* ((slot-name (constant-form-value slot-name env))
-         (bind-object (unless (or (constantp new-value env) (atom new-value))
-                        (let* ((object-var (gensym))
-                               (bind `((,object-var ,object))))
-                          (setf object object-var)
-                          bind)))
-         (writer-name (slot-writer-name slot-name))
-         (form
-          `(let ((.ignore.
-                  (load-time-value
-                   (ensure-accessor 'writer ',writer-name ',slot-name)))
-                 (.new-value. ,new-value))
-            (declare (ignore .ignore.))
-            (quiet-funcall #',writer-name .new-value. ,object)
-            .new-value.)))
-    (if bind-object
-        `(let ,bind-object ,form)
-        form)))
-
-(defmacro accessor-slot-boundp (object slot-name &environment env)
-  (aver (constantp slot-name env))
-  (let* ((slot-name (constant-form-value slot-name env))
-         (boundp-name (slot-boundp-name slot-name)))
-    `(let ((.ignore. (load-time-value
-                      (ensure-accessor 'boundp ',boundp-name ',slot-name))))
-      (declare (ignore .ignore.))
-      (funcall #',boundp-name ,object))))
-
 (defun make-structure-slot-boundp-function (slotd)
   (declare (ignore slotd))
   (named-lambda always-bound (object)

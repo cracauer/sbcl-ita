@@ -14,15 +14,6 @@
 
 ;;;; type format database
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (def!struct (room-info (:make-load-form-fun just-dump-it-normally))
-    ;; the name of this type
-    (name nil :type symbol)
-    ;; kind of type (how to reconstitute an object)
-    (kind (missing-arg)
-          :type (member :other :small-other :closure :instance :list
-                        :code :vector-nil :weak-pointer))))
-
 (defun room-info-type-name (info)
   (if (specialized-array-element-type-properties-p info)
       (saetp-primitive-type-name info)
@@ -142,6 +133,14 @@
 (declaim (type fixnum
                *static-space-free-pointer*
                *read-only-space-free-pointer*))
+
+#!-sb-fluid
+(declaim (inline current-dynamic-space-start))
+#!+gencgc
+(defun current-dynamic-space-start () sb!vm:dynamic-space-start)
+#!-gencgc
+(defun current-dynamic-space-start ()
+  (extern-alien "current_dynamic_space" unsigned-long))
 
 (defun space-bounds (space)
   (declare (type spaces space))
@@ -401,6 +400,7 @@
 ;;; Return a list of 3-lists (bytes object type-name) for the objects
 ;;; allocated in Space.
 (defun type-breakdown (space)
+  (declare (muffle-conditions t))
   (let ((sizes (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.sb!vm:n-word-bits)))
         (counts (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.sb!vm:n-word-bits))))
     (map-allocated-objects
@@ -692,7 +692,7 @@
   (declare (type spaces space)
            (type (or index null) larger smaller type count)
            (type (or function null) test)
-           (inline map-allocated-objects))
+           #!-sb-fluid (inline map-allocated-objects))
   (unless *ignore-after*
     (setq *ignore-after* (cons 1 2)))
   (collect ((counted 0 1+))
@@ -708,6 +708,15 @@
              (return-from list-allocated-objects res))))
        space)
       res)))
+
+;;; Convert the descriptor into a SAP. The bits all stay the same, we just
+;;; change our notion of what we think they are.
+;;;
+;;; Defining this here (as opposed to in 'debug-int' where it belongs)
+;;; is the path of least resistance to avoiding an inlining failure warning.
+#!-sb-fluid (declaim (inline sb!di::descriptor-sap))
+(defun sb!di::descriptor-sap (x)
+  (int-sap (get-lisp-obj-address x)))
 
 ;;; Calls FUNCTION with all object that have (possibly conservative)
 ;;; references to them on current stack.
@@ -730,7 +739,8 @@
                    #!-stack-grows-downward-not-upward (sap+ sp (- n-word-bytes))))))
 
 (defun map-referencing-objects (fun space object)
-  (declare (type spaces space) (inline map-allocated-objects))
+  (declare (type spaces space)
+           #!-sb-fluid (inline map-allocated-objects))
   (unless *ignore-after*
     (setq *ignore-after* (cons 1 2)))
   (flet ((maybe-call (fun obj)

@@ -65,11 +65,6 @@
 (defvar *handled-conditions* nil)
 (defvar *disabled-package-locks* nil)
 
-;;; Objects whose subclass is this class show up as the environment
-;;; to macroexpanders and inquiry functions.
-(defstruct (abstract-lexenv
-             (:constructor nil) (:copier nil) (:predicate nil)))
-
 ;;; The LEXENV represents the lexical environment used for IR1 conversion.
 ;;; (This is also what shows up as an ENVIRONMENT value in macroexpansion.)
 #!-sb-fluid (declaim (inline internal-make-lexenv)) ; only called in one place
@@ -83,6 +78,9 @@
                       (write-string "NULL-LEXENV" stream))
                     (default-structure-print lexenv stream depth))))
              (:constructor make-null-lexenv ())
+             (:constructor make-package-lock-lexenv
+                           (disabled-package-locks %policy
+                            &aux (handled-conditions nil)))
              (:constructor internal-make-lexenv
                            (funs vars blocks tags
                             type-restrictions
@@ -136,7 +134,11 @@
   ;; are of the form (:declare name . value),
   ;; (:variable name key . value), or (:function name key . value)
   (user-data nil :type list)
-  parent)
+  parent
+  ;; Cache of all visible variables, including the ones coming from
+  ;; (call-lexenv lambda)
+  ;; Used for LEAF-VISIBLE-TO-DEBUGGER-P
+  (var-cache nil :type (or null hash-table)))
 
 ;;; the lexical environment we are currently converting in
 (defvar *lexenv*)
@@ -144,7 +146,7 @@
 
 ;;; an object suitable for input to standard functions that accept
 ;;; "environment objects" (of the ANSI glossary)
-(deftype lexenv-designator () '(or abstract-lexenv null))
+(def!type lexenv-designator () '(or abstract-lexenv null))
 
 (defvar *policy*)
 (defun lexenv-policy (lexenv)

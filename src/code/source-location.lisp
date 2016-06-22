@@ -14,8 +14,7 @@
 (def!struct (definition-source-location
              (:constructor %make-definition-source-location
                            (namestring toplevel-form-number form-number))
-             (:copier nil)
-             (:make-load-form-fun just-dump-it-normally))
+             (:copier nil))
   ;; Namestring of the source file that the definition was compiled from.
   ;; This is null if the definition was not compiled from a file.
   (namestring nil :type (or string null) :read-only t)
@@ -25,6 +24,7 @@
   (form-number nil :type (or fixnum null) :read-only t)
   ;; plist from WITH-COMPILATION-UNIT
   (plist *source-plist* :read-only t))
+(!set-load-form-method definition-source-location  (:xc :target))
 
 (defun make-definition-source-location ()
   (let* ((source-info (and (boundp '*source-info*) *source-info*))
@@ -43,6 +43,8 @@
                   form-number (source-path-form-number *current-path*)))
            ((and source-info (source-info-file-info source-info))
             (setf tlf-number (1- (fill-pointer (file-info-forms it))))))
+    ;; FIXME: Probably can never coalesce entries now that both a tlf number
+    ;; and subform number are stored. Maybe delete this.
     (if (and last
              (eql (definition-source-location-toplevel-form-number last) tlf-number)
              (eql (definition-source-location-form-number last) form-number)

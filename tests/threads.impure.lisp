@@ -190,6 +190,10 @@
                  (multiple-value-list
                   (join-thread (make-thread (lambda () (values 1 2 3))))))))
 
+;; Used to signal a SIMPLE-ERROR about a recursive lock attempt.
+(with-test (:name (join-thread :self-join))
+  (assert-error (join-thread *current-thread*) join-thread-error))
+
 ;;; We had appalling scaling properties for a while.  Make sure they
 ;;; don't reappear.
 (defun scaling-test (function &optional (nthreads 5))
@@ -543,6 +547,22 @@
       (assert (zerop (count-live-threads triers)))
       (assert (zerop (count-live-threads waiters)))
       (assert (zerop (count-live-threads more-waiters))))))
+
+;; At some point %DECREMENT-SEMAPHORE did not adjust the remaining
+;; timeout after spurious wakeups, potentially leading to
+;; longer/infinite waiting despite the specified timeout.
+(with-test (:name (:semaphore :timeout :spurious-wakeup))
+  (let* ((semaphore (make-semaphore))
+         (done nil)
+         (thread (make-thread (lambda ()
+                                (let ((mutex (semaphore-mutex semaphore))
+                                      (queue (semaphore-queue semaphore)))
+                                  (loop :until done :do
+                                     (with-mutex (mutex)
+                                       (condition-notify queue))))))))
+    (assert (eq nil (wait-on-semaphore semaphore :timeout .5)))
+    (setf done t)
+    (join-thread thread)))
 
 (format t "~&semaphore tests done~%")
 

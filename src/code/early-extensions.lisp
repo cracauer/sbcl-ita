@@ -67,7 +67,9 @@
          (let ((bound (ash 1 s)))
            `(integer 0 ,(- bound bite 1))))
         (t
-         (error "Bad size specified for UNSIGNED-BYTE type specifier: ~S." s))))
+         (error "Bad size specified for UNSIGNED-BYTE type specifier: ~
+                  ~/sb!impl:print-type-specifier/."
+                s))))
 
 ;;; Motivated by the mips port. -- CSR, 2002-08-22
 (def!type signed-byte-with-a-bite-out (s bite)
@@ -76,7 +78,9 @@
          (let ((bound (ash 1 (1- s))))
            `(integer ,(- bound) ,(- bound bite 1))))
         (t
-         (error "Bad size specified for SIGNED-BYTE type specifier: ~S." s))))
+         (error "Bad size specified for SIGNED-BYTE type specifier: ~
+                  ~/sb!impl:print-type-specifier/."
+                s))))
 
 (def!type load/store-index (scale lowtag min-offset
                                  &optional (max-offset min-offset))
@@ -111,20 +115,6 @@
                                                           element-size
                                                           data-offset)
         `(integer ,min ,max)))))
-
-;;; Similar to FUNCTION, but the result type is "exactly" specified:
-;;; if it is an object type, then the function returns exactly one
-;;; value, if it is a short form of VALUES, then this short form
-;;; specifies the exact number of values.
-(def!type sfunction (args &optional result)
-  (let ((result (cond ((eq result '*) '*)
-                      ((or (atom result)
-                           (not (eq (car result) 'values)))
-                       `(values ,result &optional))
-                      ((intersection (cdr result) sb!xc:lambda-list-keywords)
-                       result)
-                      (t `(values ,@(cdr result) &optional)))))
-    `(function ,args ,result)))
 
 ;;; the default value used for initializing character data. The ANSI
 ;;; spec says this is arbitrary, so we use the value that falls
@@ -241,19 +231,11 @@
 ;;;;
 ;;;; comment from CMU CL: "the ultimate collection macro..."
 
-;;; helper functions for COLLECT, which become the expanders of the
-;;; MACROLET definitions created by COLLECT
-;;;
-;;; COLLECT-NORMAL-EXPANDER handles normal collection macros.
-;;;
-;;; COLLECT-LIST-EXPANDER handles the list collection case. N-TAIL
-;;; is the pointer to the current tail of the list, or NIL if the list
-;;; is empty.
+;;; helper function for COLLECT, which becomes the expander of the
+;;; MACROLET definitions created by COLLECT if collecting a list.
+;;; N-TAIL is the pointer to the current tail of the list,  or NIL
+;;; if the list is empty.
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun collect-normal-expander (n-value fun forms)
-    `(progn
-       ,@(mapcar (lambda (form) `(setq ,n-value (,fun ,form ,n-value))) forms)
-       ,n-value))
   (defun collect-list-expander (n-value n-tail forms)
     (let ((n-res (gensym)))
       `(progn
@@ -291,29 +273,23 @@
         (binds ())
         (ignores ()))
     (dolist (spec collections)
-      (unless (proper-list-of-length-p spec 1 3)
-        (error "malformed collection specifier: ~S" spec))
-      (let* ((name (first spec))
-             (default (second spec))
-             (kind (or (third spec) 'collect))
-             (n-value (gensym (concatenate 'string
-                                           (symbol-name name)
-                                           "-N-VALUE-"))))
+      (destructuring-bind (name &optional default collector
+                                &aux (n-value (copy-symbol name))) spec
         (push `(,n-value ,default) binds)
-        (if (eq kind 'collect)
-          (let ((n-tail (gensym (concatenate 'string
-                                             (symbol-name name)
-                                             "-N-TAIL-"))))
-            (push n-tail ignores)
-            (if default
-              (push `(,n-tail (last ,n-value)) binds)
-              (push n-tail binds))
-            (push `(,name (&rest args)
-                     (collect-list-expander ',n-value ',n-tail args))
-                  macros))
-          (push `(,name (&rest args)
-                   (collect-normal-expander ',n-value ',kind args))
-                macros))))
+        (let ((macro-body
+               (if (or (null collector) (eq collector 'collect))
+                   (let ((n-tail
+                          (make-symbol
+                           (concatenate 'string (symbol-name name) "-TAIL"))))
+                     (push n-tail ignores)
+                     (push `(,n-tail ,(if default `(last ,n-value))) binds)
+                     `(collect-list-expander ',n-value ',n-tail args))
+                   ``(progn
+                       ,@(mapcar (lambda (x)
+                                   `(setq ,',n-value (,',collector ,x ,',n-value)))
+                                 args)
+                       ,',n-value))))
+          (push `(,name (&rest args) ,macro-body) macros))))
     `(macrolet ,macros
        (let* ,(nreverse binds)
          ;; Even if the user reads each collection result,
@@ -444,20 +420,16 @@
 
 ;;; Iterate over the entries in a HASH-TABLE, first obtaining the lock
 ;;; if the table is a synchronized table.
+;;; An implicit block named NIL exists around the iteration, as is the custom.
 (defmacro dohash (((key-var value-var) table &key result locked) &body body)
-  (multiple-value-bind (forms decls) (parse-body body nil)
-    (with-unique-names (gen n-more n-table)
-      (let ((iter-form `(with-hash-table-iterator (,gen ,n-table)
-                         (loop
-                           (multiple-value-bind (,n-more ,key-var ,value-var) (,gen)
-                             ,@decls
-                             (unless ,n-more (return ,result))
-                             ,@forms)))))
-        `(let ((,n-table ,table))
-           ,(if locked
-                `(with-locked-system-table (,n-table)
-                   ,iter-form)
-                iter-form))))))
+  (let* ((n-table (make-symbol "HT"))
+         (iter-form `(block nil
+                       (maphash (lambda (,key-var ,value-var) ,@body) ,n-table)
+                       ,result)))
+    `(let ((,n-table ,table))
+       ,(if locked
+            `(with-locked-system-table (,n-table) ,iter-form)
+            iter-form))))
 
 ;;; Executes BODY for all entries of PLIST with KEY and VALUE bound to
 ;;; the respective keys and values.
@@ -486,7 +458,7 @@
 ;;; Of course, since some other host Lisps don't seem to think that's
 ;;; acceptable syntax anyway, you're pretty much prevented from writing it.
 ;;;
-(def!macro binding* ((&rest clauses) &body body)
+(defmacro binding* ((&rest clauses) &body body)
   (unless clauses ; wrap in LET to preserve non-toplevelness
     (return-from binding* `(let () ,@body)))
   (multiple-value-bind (body decls) (parse-body body nil)
@@ -863,6 +835,7 @@
 ;;; PACKAGE-DESIGNATOR is actually a deleted package, and in that case
 ;;; you generally do want to signal an error instead of proceeding.)
 (defun %find-package-or-lose (package-designator)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (or (find-package package-designator)
       (error 'simple-package-error
              :package package-designator
@@ -873,6 +846,7 @@
 ;;; consequences of most operations on deleted packages are
 ;;; unspecified. We try to signal errors in such cases.
 (defun find-undeleted-package-or-lose (package-designator)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (let ((maybe-result (%find-package-or-lose package-designator)))
     (if (package-%name maybe-result)    ; if not deleted
         maybe-result
@@ -892,6 +866,7 @@
 
 ;;; Signal an error unless NAME is a legal function name.
 (defun legal-fun-name-or-type-error (name)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (unless (legal-fun-name-p name)
     (error 'simple-type-error
            :datum name
@@ -967,7 +942,8 @@
 ;;; error indicating that a required &KEY argument was not supplied.
 ;;; This function is also useful for DEFSTRUCT slot defaults
 ;;; corresponding to required arguments.
-(declaim (ftype (function () nil) missing-arg))
+(declaim (ftype (function () #+(and sb-xc-host ccl) *
+                             #-(and sb-xc-host ccl) nil) missing-arg))
 (defun missing-arg ()
   #!+sb-doc
   (/show0 "entering MISSING-ARG")
@@ -985,7 +961,7 @@
      (%failed-aver ',expr)))
 
 (defun %failed-aver (expr)
-  (bug "~@<failed AVER: ~2I~_~A~:>" expr))
+  (bug "~@<failed AVER: ~2I~_~S~:>" expr))
 
 (defun bug (format-control &rest format-arguments)
   (error 'bug
@@ -1013,10 +989,12 @@
       (destructuring-bind (result) x result)
       x))
 
-;;; some commonly-occuring CONSTANTLY forms
+;;; some commonly-occurring CONSTANTLY forms
 (macrolet ((def-constantly-fun (name constant-expr)
-             `(setf (symbol-function ',name)
-                    (constantly ,constant-expr))))
+             `(progn
+                (declaim (ftype (sfunction * (eql ,constant-expr)) ,name))
+                (setf (symbol-function ',name)
+                      (constantly ,constant-expr)))))
   (def-constantly-fun constantly-t t)
   (def-constantly-fun constantly-nil nil)
   (def-constantly-fun constantly-0 0))
@@ -1174,7 +1152,7 @@
                        (:test (setq test (second option)))
                        (t
                         (error "bad option: ~S" (first option)))))))))))
-    `(sb!xc:defmethod print-object ((structure ,name) ,stream)
+    `(defmethod print-object ((structure ,name) ,stream)
        (pprint-logical-block (,stream nil)
          (print-unreadable-object (structure
                                    ,stream
@@ -1192,6 +1170,28 @@
   ;; symbol will not be printed without a prefix.
   (let ((*package* *keyword-package*))
     (write symbol :stream stream :escape t)))
+
+(declaim (special sb!pretty:*pprint-quote-with-syntactic-sugar*))
+(defun print-type-specifier (stream type-specifier &optional colon at)
+  (declare (ignore colon at))
+  ;; Binding *PPRINT-QUOTE-WITH-SYNTACTIC-SUGAR* prevents certain
+  ;; [f]types from being printed unhelpfully:
+  ;;
+  ;;   (function ())           => #'NIL
+  ;;   (function *)            => #'*
+  ;;   (function (function a)) => #'#'A
+  ;;
+  ;; Binding *PACKAGE* to the COMMON-LISP package causes specifiers
+  ;; like CL:FUNCTION, CL:INTEGER, etc. to be printed without package
+  ;; prefix but forces printing with package prefix for other
+  ;; specifiers.
+  (let ((sb!pretty:*pprint-quote-with-syntactic-sugar* nil)
+        (*package* *cl-package*))
+    (prin1 type-specifier stream)))
+
+(defun print-type (stream type &optional colon at)
+  (print-type-specifier stream (type-specifier type) colon at))
+
 
 ;;;; etc.
 
@@ -1254,6 +1254,7 @@
               (deprecation-info-replacements info)))))
 
 (defun deprecation-error (software version namespace name replacements)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (error 'deprecation-error
          :namespace namespace
          :name name
@@ -1383,24 +1384,23 @@
 
 (defun print-deprecation-replacements (stream replacements &optional colonp atp)
   (declare (ignore colonp atp))
+  ;; I don't think this is callable during cross-compilation, is it?
   (apply #'format stream
-         (!uncross-format-control
-          "~#[~;~
-             Use ~/sb!impl:print-symbol-with-prefix/ instead.~;~
-             Use ~/sb!impl:print-symbol-with-prefix/ or ~
-             ~/sb!impl:print-symbol-with-prefix/ instead.~:;~
+         "~#[~;~
+             Use ~/sb-impl:print-symbol-with-prefix/ instead.~;~
+             Use ~/sb-impl:print-symbol-with-prefix/ or ~
+             ~/sb-impl:print-symbol-with-prefix/ instead.~:;~
              Use~@{~#[~; or~] ~
-             ~/sb!impl:print-symbol-with-prefix/~^,~} instead.~
-           ~]")
+             ~/sb-impl:print-symbol-with-prefix/~^,~} instead.~
+           ~]"
          replacements))
 
 (defun print-deprecation-message (namespace name software version
                                   &optional replacements stream)
   (format stream
-          (!uncross-format-control
            "The ~(~A~) ~/sb!impl:print-symbol-with-prefix/ has been ~
             deprecated as of ~@[~A ~]version ~A.~
-            ~@[~2%~/sb!impl::print-deprecation-replacements/~]")
+            ~@[~2%~/sb!impl::print-deprecation-replacements/~]"
           namespace name software version replacements))
 
 (defun setup-function-in-final-deprecation
@@ -1601,22 +1601,6 @@
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")
 
-;;; Helper for making the DX closure allocation in macros expanding
-;;; to CALL-WITH-FOO less ugly.
-(def!macro dx-flet (functions &body forms)
-  `(flet ,functions
-     (declare (truly-dynamic-extent ,@(mapcar (lambda (func) `#',(car func))
-                                              functions)))
-     ,@forms))
-
-;;; Another similar one.
-(def!macro dx-let (bindings &body forms)
-  `(let ,bindings
-     (declare (truly-dynamic-extent
-               ,@(mapcar (lambda (bind) (if (listp bind) (car bind) bind))
-                         bindings)))
-     ,@forms))
-
 ;; This is not my preferred name for this function, but chosen for harmony
 ;; with everything else that refers to these as 'hash-caches'.
 ;; Hashing is just one particular way of memoizing, and it would have been
@@ -1710,3 +1694,10 @@ to :INTERPRET, an interpreter will be used.")
            ,@forms
            (truly-the (simple-array character (*))
                       (get-output-stream-string ,var))))))
+
+(defun self-evaluating-p (x)
+  (typecase x
+    (null t)
+    (symbol (or (eq x t) (eq (symbol-package x) *keyword-package*)))
+    (cons nil)
+    (t t)))

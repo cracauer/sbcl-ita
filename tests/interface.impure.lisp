@@ -16,16 +16,18 @@
 (use-package "ASSERTOID")
 (use-package "TEST-UTIL")
 
+(defmacro silently (&rest things)
+  `(let ((*standard-output* (make-broadcast-stream))) ,@things))
 
 ;; Interpreted closure is a problem for COMPILE
 (with-test (:name :disassemble :skipped-on :interpreter)
 ;;; DISASSEMBLE shouldn't fail on closures or unpurified functions
   (defun disassemble-fun (x) x)
-  (disassemble 'disassemble-fun))
+  (silently (disassemble 'disassemble-fun)))
 
 (with-test (:name :disassemble-closure :skipped-on :interpreter)
   (let ((x 1)) (defun disassemble-closure (y) (if y (setq x y) x)))
-  (disassemble 'disassemble-closure))
+  (silently (disassemble 'disassemble-closure)))
 
 #+sb-eval
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -39,20 +41,20 @@
     ;; Nor should it fail on interpreted functions
     (let ((sb-ext:*evaluator-mode* :interpret))
       (eval `(defun disassemble-eval (x) x))
-      (disassemble 'disassemble-eval))
+      (silently (disassemble 'disassemble-eval)))
 
     ;; disassemble-eval should still be an interpreted function.
     ;; clhs disassemble: "(If that function is an interpreted function,
     ;; it is first compiled but the result of this implicit compilation
     ;; is not installed.)"
-    (assert (interpreted-function-p #'disassemble-eval)))
+    (assert (interpreted-function-p (symbol-function 'disassemble-eval))))
 
 (with-test (:name :disassemble-generic)
   ;; nor should it fail on generic functions or other funcallable instances
   (defgeneric disassemble-generic (x))
-  (disassemble 'disassemble-generic)
+  (silently (disassemble 'disassemble-generic))
   (let ((fin (make-instance 'sb-mop:funcallable-standard-object)))
-    (disassemble fin)))
+    (silently (disassemble fin))))
 
 ;;; while we're at it, much the same applies to
 ;;; FUNCTION-LAMBDA-EXPRESSION:
@@ -76,10 +78,10 @@
     (progn
       (let ((sb-ext:*evaluator-mode* :interpret))
         (eval `(defun fle-eval (x) x))
-        (assert (eql (fle-name #'fle-eval) 'fle-eval)))
+        (assert (eql (fle-name (symbol-function 'fle-eval)) 'fle-eval)))
 
       ;; fle-eval should still be an interpreted function.
-      (assert (interpreted-function-p #'fle-eval)))))
+      (assert (interpreted-function-p (symbol-function 'fle-eval))))))
 
 
 ;;; support for DESCRIBE tests
@@ -88,12 +90,17 @@
 (let ((sb-ext:*evaluator-mode* :compile))
   (eval `(let (x) (defun closure-to-describe () (incf x)))))
 
-(with-test (:name :describe-empty-gf)
-  (describe (make-instance 'generic-function))
-  (describe (make-instance 'standard-generic-function)))
+(with-test (:name (describe :empty-gf))
+  (assert-no-signal
+   (silently (describe (make-instance 'generic-function)))
+   warning)
+  (assert-signal
+   (silently (describe (make-instance 'standard-generic-function)))
+   warning))
 
 ;;; DESCRIBE should run without signalling an error.
 (with-test (:name (describe :no-error))
+ (silently
   (describe (make-to-be-described))
   (describe 12)
   (describe "a string")
@@ -102,39 +109,50 @@
   (describe '(a list))
   (describe #(a vector))
 ;; bug 824974
-  (describe 'closure-to-describe))
+  (describe 'closure-to-describe)))
 
 ;;; The DESCRIBE-OBJECT methods for built-in CL stuff should do
 ;;; FRESH-LINE and TERPRI neatly.
-(dolist (i (list (make-to-be-described :a 14) 12 "a string"
-                 #0a0 #(1 2 3) #2a((1 2) (3 4)) 'sym :keyword
-                 (find-package :keyword) (list 1 2 3)
-                 nil (cons 1 2) (make-hash-table)
-                 (let ((h (make-hash-table)))
-                   (setf (gethash 10 h) 100
-                         (gethash 11 h) 121)
-                   h)
-                 (make-condition 'simple-error)
-                 (make-condition 'simple-error :format-control "fc")
-                 #'car #'make-to-be-described (lambda (x) (+ x 11))
-                 (constantly 'foo) #'(setf to-be-described-a)
-                 #'describe-object (find-class 'to-be-described)
-                 (find-class 'forward-describe-class)
-                 (find-class 'forward-describe-ref) (find-class 'cons)))
-  (let ((s (with-output-to-string (s)
-             (write-char #\x s)
-             (describe i s))))
-    (macrolet ((check (form)
-                 `(or ,form
-                      (error "misbehavior in DESCRIBE of ~S:~%   ~S" i ',form))))
-      (check (char= #\x (char s 0)))
-      ;; one leading #\NEWLINE from FRESH-LINE or the like, no more
-      (check (char= #\newline (char s 1)))
-      (check (char/= #\newline (char s 2)))
-      ;; one trailing #\NEWLINE from TERPRI or the like, no more
-      (let ((n (length s)))
-        (check (char= #\newline (char s (- n 1))))
-        (check (char/= #\newline (char s (- n 2))))))))
+(with-test (:name (describe fresh-line terpri))
+  (dolist (i (list (make-to-be-described :a 14) 12 "a string"
+                   #0a0 #(1 2 3) #2a((1 2) (3 4)) 'sym :keyword
+                   (find-package :keyword) (list 1 2 3)
+                   nil (cons 1 2) (make-hash-table)
+                   (let ((h (make-hash-table)))
+                     (setf (gethash 10 h) 100
+                           (gethash 11 h) 121)
+                     h)
+                   (make-condition 'simple-error)
+                   (make-condition 'simple-error :format-control "fc")
+                   #'car #'make-to-be-described (lambda (x) (+ x 11))
+                   (constantly 'foo) #'(setf to-be-described-a)
+                   #'describe-object (find-class 'to-be-described)
+                   (find-class 'forward-describe-class)
+                   (find-class 'forward-describe-ref) (find-class 'cons)))
+    (let ((s (with-output-to-string (s)
+               (write-char #\x s)
+               (describe i s))))
+      (macrolet ((check (form)
+                   `(or ,form
+                        (error "misbehavior in DESCRIBE of ~S:~%   ~S" i ',form))))
+        (check (char= #\x (char s 0)))
+        ;; one leading #\NEWLINE from FRESH-LINE or the like, no more
+        (check (char= #\newline (char s 1)))
+        (check (char/= #\newline (char s 2)))
+        ;; one trailing #\NEWLINE from TERPRI or the like, no more
+        (let ((n (length s)))
+          (check (char= #\newline (char s (- n 1))))
+          (check (char/= #\newline (char s (- n 2)))))))))
+
+(with-test (:name (describe :argument-precedence-order))
+  ;; Argument precedence order information is only interesting for two
+  ;; or more required parameters.
+  (assert (not (search "Argument precedence order"
+                       (with-output-to-string (stream)
+                         (describe #'class-name stream)))))
+  (assert (search "Argument precedence order"
+                  (with-output-to-string (stream)
+                    (describe #'add-method stream)))))
 
 
 ;;; Tests of documentation on types and classes
@@ -207,6 +225,50 @@
 
   (with-test (:name (documentation condition))
     (do-class baz "BAZ")))
+
+(defclass documentation-metaclass (standard-class)
+  ()
+  (:documentation "metaclass with methods on DOCUMENTATION."))
+
+(defmethod documentation ((thing documentation-metaclass)
+                          (doc-type (eql 't)))
+  (sb-int:awhen (call-next-method)
+    (concatenate 'string ":" sb-int:it)))
+
+(defmethod (setf documentation) (new-value
+                                 (thing documentation-metaclass)
+                                 (doc-type (eql 't)))
+  (call-next-method (when new-value
+                      (substitute #\! #\. new-value))
+                    thing doc-type))
+
+(defmethod sb-mop:validate-superclass ((class documentation-metaclass)
+                                       (superclass standard-class))
+  t)
+
+(defclass documentation-class ()
+  ()
+  (:metaclass documentation-metaclass)
+  (:documentation "normal"))
+
+(with-test (:name (documentation :non-stanadard :metaclass))
+  (flet ((check (expected class-name)
+           (let ((class (find-class class-name)))
+             (assert-documentation class-name 'type expected)
+             (assert-documentation class 'type expected)
+             (assert-documentation class t expected))))
+    ;; Make sure methods specialized on the metaclass are not bypassed
+    ;; when retrieving and modifying class documentation.
+    (check ":normal" 'documentation-class)
+    (setf (documentation 'documentation-class 'type) "2.")
+    (check ":2!" 'documentation-class)
+    (setf (documentation 'documentation-class 'type) nil)
+    (check nil 'documentation-class)
+
+    ;; Sanity check: make sure the metaclass has its own documentation
+    ;; and is not affected by the above modifications.
+    (check "metaclass with methods on DOCUMENTATION."
+           'documentation-metaclass)))
 
 (defstruct (frob (:type vector)) "FROB")
 
@@ -353,11 +415,15 @@
        (declare (ignore x))
        nil))))
 
-(with-test (:name :describe-generic-function-with-assumed-type)
+(with-test (:name (describe generic-function :assumed-type))
   ;; Signalled an error at one point
-  (flet ((zoo () (gogo)))
-    (defmethod gogo () nil)
-    (describe 'gogo)))
+  (let ((fun (checked-compile '(lambda ()
+                                 (flet ((zoo () (gogo)))
+                                   (defmethod gogo () nil)
+                                   (describe 'gogo)))
+                              :allow-style-warnings t)))
+    (handler-bind ((warning #'muffle-warning)) ; implicit gf
+      (silently (funcall fun)))))
 
 (defmacro bug-643958-test ()
   "foo"
@@ -437,4 +503,37 @@
 
 (with-test (:name (apropos :once-only))
   (assert (= (length (apropos-list "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")) 1)))
+
+(defgeneric gf-arglist-1 (x &key y))
+(defmethod gf-arglist-1 (x &key (y nil) (z nil z-p))
+  (list x y z z-p))
+
+(defgeneric gf-arglist-2 (x &key y))
+(defmethod gf-arglist-2 ((x integer) &key (y nil) ((z f) nil z-p)) (list x y f z-p))
+(defmethod gf-arglist-2 ((x string) &key (y nil) ((z w) nil z-p)) (list x y w z-p))
+
+(defgeneric gf-arglist-3 (x &key ((:y y))))
+
+(defgeneric gf-arglist-4 (x &key ((:y z))))
+
+(defgeneric gf-arglist-5 (x &key y))
+(defmethod gf-arglist-5 ((x integer) &key z &allow-other-keys) (list x z))
+
+(with-test (:name (:generic-function-pretty-arglist 1))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-1)
+                 '(x &key y z))))
+(with-test (:name (:generic-function-pretty-arglist 2))
+  (assert (or (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-2)
+                     '(x &key y ((z w))))
+              (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-2)
+                     '(x &key y ((z f)))))))
+(with-test (:name (:generic-function-pretty-arglist 3))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-3)
+                 '(x &key y))))
+(with-test (:name (:generic-function-pretty-arglist 4))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-4)
+                 '(x &key ((:y z))))))
+(with-test (:name (:generic-function-pretty-arglist 5))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-5)
+                 '(x &key y z &allow-other-keys))))
 ;;;; success

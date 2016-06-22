@@ -8,49 +8,56 @@
 ;;; to elide bounds checking.
 (defmacro with-fop-stack (((stack-var &optional stack-expr) ptr-var count)
                           &body body)
-  `(let* (,@(when stack-expr
-              (list `(,stack-var (the simple-vector ,stack-expr))))
-          (,ptr-var (truly-the index (fop-stack-pop-n ,stack-var ,count))))
-     (macrolet ((fop-stack-ref (i)
-                  `(locally
-                       #-sb-xc-host
-                       (declare (optimize (sb!c::insert-array-bounds-checks 0)))
-                     (svref ,',stack-var (truly-the index ,i)))))
+  `(macrolet ((fop-stack-ref (i)
+                `(locally
+                     #-sb-xc-host
+                     (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                   (svref ,',stack-var (truly-the index ,i)))))
+     (let* (,@(when stack-expr
+                (list `(,stack-var (the simple-vector ,stack-expr))))
+            (,ptr-var (truly-the index (fop-stack-pop-n ,stack-var ,count))))
        ,@body)))
 
-;;; Define NAME as a fasl operation, with op-code FOP-CODE. PUSHP
-;;; describes what the body does to the fop stack:
-;;;   T
-;;;     The body might pop the fop stack. The result of the body is
-;;;     pushed on the fop stack.
-;;;   NIL
-;;;     The body might pop the fop stack. The result of the body is
-;;;     discarded.
+;;; Define NAME as a fasl operation, with op-code FOP-CODE.
+;;; PUSHP describes what the body does to the fop stack:
+;;;   T   - The result of the body is pushed on the fop stack.
+;;;   NIL - The result of the body is discarded.
+;;; In either case, the body is permitted to pop the stack.
 ;;;
-(defmacro !define-fop (fop-code (name &optional arglist (pushp t)) &body forms)
-  (aver (member pushp '(nil t)))
-  (multiple-value-bind (operands stack-args)
-      (if (consp (car arglist))
-          (ecase (caar arglist)
-            (:operands (values (cdar arglist) (cdr arglist))))
-          (values nil arglist))
-    (assert (<= (length operands) 2))
+(defmacro !define-fop (fop-code &rest stuff)
+  (multiple-value-bind (name allowp operands stack-args pushp forms)
+      (let ((allowp (if (eq (car stuff) :not-host)
+                        (progn (pop stuff) (or #+sb-xc t))
+                        t)))
+        (destructuring-bind ((name &optional arglist (pushp t)) . forms) stuff
+          (aver (member pushp '(nil t)))
+          (multiple-value-bind (operands stack-args)
+              (if (atom (car arglist))
+                  (values nil arglist)
+                  (ecase (caar arglist)
+                    (:operands (values (cdar arglist) (cdr arglist)))))
+            (assert (<= (length operands) 2))
+            (values name allowp operands stack-args pushp forms))))
     `(progn
        (defun ,name (.fasl-input. ,@operands)
          (declare (ignorable .fasl-input.))
-         (macrolet ((fasl-input () '(truly-the fasl-input .fasl-input.))
+         ,@(if allowp
+               `((macrolet
+                   ((fasl-input () '(truly-the fasl-input .fasl-input.))
                     (fasl-input-stream () '(%fasl-input-stream (fasl-input)))
                     (operand-stack () '(%fasl-input-stack (fasl-input)))
                     (skip-until () '(%fasl-input-skip-until (fasl-input))))
-           ,@(if (null stack-args)
-                 forms
-                 (with-unique-names (stack ptr)
-                   `((with-fop-stack ((,stack (operand-stack))
-                                      ,ptr ,(length stack-args))
-                       (multiple-value-bind ,stack-args
-                           (values ,@(loop for i below (length stack-args)
-                                           collect `(fop-stack-ref (+ ,ptr ,i))))
-                         ,@forms)))))))
+                  ,@(if (null stack-args)
+                        forms
+                        (with-unique-names (stack ptr)
+                         `((with-fop-stack ((,stack (operand-stack))
+                                            ,ptr ,(length stack-args))
+                             (multiple-value-bind ,stack-args
+                                 (values ,@(loop for i below (length stack-args)
+                                                 collect `(fop-stack-ref (+ ,ptr ,i))))
+                               ,@forms)))))))
+               `((declare (ignore ,@operands))
+                 (error ,(format nil "Not-host fop invoked: ~A" name)))))
        (!%define-fop ',name ,fop-code ,(length operands) ,(if pushp 1 0)))))
 
 (defun !%define-fop (name base-opcode n-operands pushp)
@@ -102,13 +109,12 @@
       (setf (aref string i)
             (sb!xc:code-char (fast-read-byte)))))
   string)
-#!+sb-unicode
+#!+(and sb-unicode (host-feature sb-xc))
 (defun read-string-as-unsigned-byte-32
     (stream string &optional (length (length string)))
   (declare (type (simple-array character (*)) string)
            (type index length)
            (optimize speed))
-  #+sb-xc-host (bug "READ-STRING-AS-UNSIGNED-BYTE-32 called")
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
@@ -146,56 +152,39 @@
   (push-fop-table x (fasl-input))
   x)
 
-;;; CMU CL had FOP-POP-FOR-EFFECT as fop 65, but it was never used and seemed
-;;; to have no possible use.
-(!define-fop 66 (fop-misc-trap)
-  #+sb-xc-host ; since xc host doesn't know how to compile %PRIMITIVE
-  (error "FOP-MISC-TRAP can't be defined without %PRIMITIVE.")
-  #-sb-xc-host
+(!define-fop 66 :not-host (fop-misc-trap)
   (%primitive sb!c:make-unbound-marker))
 
 (!define-fop 76 (fop-character ((:operands char-code)))
   (code-char char-code))
 
-(!define-fop 48 (fop-struct ((:operands size) layout))
-  (let* ((res (%make-instance size)) ; number of words excluding header
-         ;; Compute count of elements to pop from stack, sans layout.
-         ;; If instance-data-start is 0, then size is the count,
-         ;; otherwise subtract 1 because the layout consumes a slot.
-         (n-data-words (- size sb!vm:instance-data-start)))
-    (declare (type index size))
+;; %MAKE-INSTANCE does not exist on the host.
+(!define-fop 48 :not-host (fop-struct ((:operands size) layout))
+  (let ((res (%make-instance size)) ; number of words excluding header
+        ;; Discount the layout from number of user-visible words.
+        (n-data-words (- size sb!vm:instance-data-start)))
+    (setf (%instance-layout res) layout)
     (with-fop-stack ((stack (operand-stack)) ptr n-data-words)
-      (let ((ptr (+ ptr n-data-words)))
-        (declare (type index ptr))
-        (setf (%instance-layout res) layout)
-        #!-interleaved-raw-slots
-        (let* ((nuntagged (layout-n-untagged-slots layout))
-               (ntagged (- size nuntagged)))
-          (dotimes (n (1- ntagged))
-            (declare (type index n))
-            (setf (%instance-ref res (1+ n)) (fop-stack-ref (decf ptr))))
-          (dotimes (n nuntagged)
-            (declare (type index n))
-            (setf (%raw-instance-ref/word res (- nuntagged n 1))
-                  (fop-stack-ref (decf ptr)))))
-        #!+interleaved-raw-slots
-        (let ((metadata (layout-untagged-bitmap layout)))
-          (do ((i sb!vm:instance-data-start (1+ i)))
-              ((>= i size))
-            (declare (type index i))
-            (let ((val (fop-stack-ref (decf ptr))))
-              (if (logbitp i metadata)
-                  (setf (%raw-instance-ref/word res i) val)
-                  (setf (%instance-ref res i) val)))))))
+      (declare (type index ptr))
+      (let ((bitmap (layout-bitmap layout)))
+        ;; Values on the stack are in the same order as in the structure itself.
+        (do ((i sb!vm:instance-data-start (1+ i)))
+            ((>= i size))
+          (declare (type index i))
+          (let ((val (fop-stack-ref ptr)))
+            (if (logbitp i bitmap)
+                (setf (%raw-instance-ref/word res i) val)
+                (setf (%instance-ref res i) val))
+            (incf ptr)))))
     res))
 
-(!define-fop 45 (fop-layout (name inherits depthoid length metadata))
-  (find-and-init-or-check-layout name length inherits depthoid metadata))
+(!define-fop 45 (fop-layout (name inherits depthoid length bitmap))
+  (find-and-init-or-check-layout name length inherits depthoid bitmap))
 
 ;; Allocate a CLOS object. This is used when the compiler detects that
 ;; MAKE-LOAD-FORM returned a simple use of MAKE-LOAD-FORM-SAVING-SLOTS,
 ;; or possibly a hand-written equivalent (however unlikely).
-(!define-fop 68 (fop-allocate-instance (name) nil)
+(!define-fop 68 :not-host (fop-allocate-instance (name) nil)
   (let ((instance (allocate-instance (find-class (the symbol name)))))
     (push-fop-table instance (fasl-input))))
 
@@ -204,18 +193,17 @@
 ;; This wants a 'count' as the first item in the SLOT-NAMES argument
 ;; rather than using read-arg because many calls of this might share
 ;; the list, which must be constructed into the fop-table no matter what.
-(!define-fop 69 (fop-initialize-instance (slot-names obj) nil)
+(!define-fop 69 :not-host (fop-set-slot-values (slot-names obj) nil)
   (let* ((n-slots (pop slot-names))
          (stack (operand-stack))
          (ptr (fop-stack-pop-n stack n-slots)))
       (dotimes (i n-slots)
         (let ((val (svref stack (+ ptr i)))
               (slot-name (pop slot-names)))
-          (if (eq val 'sb!pcl::..slot-unbound..)
+          (if (eq val sb!pcl:+slot-unbound+)
               ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
               (slot-makunbound obj slot-name)
-              ;; FIXME: the DEFSETF for this isn't defined until warm load
-              (sb!pcl::set-slot-value obj slot-name val))))))
+              (setf (slot-value obj slot-name) val))))))
 
 (!define-fop 64 (fop-end-group () nil)
   (/show0 "THROWing FASL-GROUP-END")
@@ -235,29 +223,18 @@
 
 ;;;; fops for loading symbols
 
-(defstruct (undefined-package
-            (:copier nil))
-  error)
-
+(defstruct (undefined-package (:copier nil))
+  (error nil :read-only t))
 (declaim (freeze-type undefined-package))
 
-;; Not the same as the real definition, but nobody cares.
-;; We'd just better not get this error.
-#+sb-xc-host
-(deftype simple-package-error () 'simple-error)
-
+;; cold loader has its own implementation of this and all symbol fops.
+#-sb-xc-host
 (defun aux-fop-intern (size package fasl-input)
   (declare (optimize speed))
   (let ((input-stream (%fasl-input-stream fasl-input))
         (buffer (make-string size)))
-    #+sb-xc-host
-    (read-string-as-bytes input-stream buffer size)
-    #-sb-xc-host
-    (progn
-      #!+sb-unicode
-      (read-string-as-unsigned-byte-32 input-stream buffer size)
-      #!-sb-unicode
-      (read-string-as-bytes input-stream buffer size))
+    #!+sb-unicode (read-string-as-unsigned-byte-32 input-stream buffer size)
+    #!-sb-unicode (read-string-as-bytes input-stream buffer size)
     (if (undefined-package-p package)
         (error 'simple-package-error
                :format-control "Error finding package for symbol ~s:~% ~a"
@@ -268,9 +245,9 @@
                           (%intern buffer size package nil))
                         fasl-input))))
 
-(!define-fop 80 (fop-lisp-symbol-save ((:operands namelen)))
+(!define-fop 80 :not-host (fop-lisp-symbol-save ((:operands namelen)))
   (aux-fop-intern namelen *cl-package* (fasl-input)))
-(!define-fop 84 (fop-keyword-symbol-save ((:operands namelen)))
+(!define-fop 84 :not-host (fop-keyword-symbol-save ((:operands namelen)))
   (aux-fop-intern namelen *keyword-package* (fasl-input)))
 
 ;; But srsly? Most of the space is wasted by UCS4 encoding of ASCII.
@@ -280,7 +257,7 @@
   ;; probably resulting in bloated fasl files. A new
   ;; FOP-SYMBOL-IN-LAST-PACKAGE-SAVE/FOP-SMALL-SYMBOL-IN-LAST-PACKAGE-SAVE
   ;; cloned fop pair could undo some of this bloat.
-(!define-fop #xF0 (fop-symbol-in-package-save ((:operands pkg-index namelen)))
+(!define-fop #xF0 :not-host (fop-symbol-in-package-save ((:operands pkg-index namelen)))
   (aux-fop-intern namelen (ref-fop-table (fasl-input) pkg-index) (fasl-input)))
 
 ;;; Symbol-hash is usually computed lazily and memoized into a symbol.
@@ -293,16 +270,14 @@
              `(let ((symbol ,symbol-form))
                 (ensure-symbol-hash symbol)
                 symbol)))
-  (!define-fop 96 (fop-uninterned-symbol-save ((:operands namelen)))
+  (!define-fop 96 :not-host (fop-uninterned-symbol-save ((:operands namelen)))
     (let ((res (make-string namelen)))
-      #!-sb-unicode
-      (read-string-as-bytes (fasl-input-stream) res)
-      #!+sb-unicode
-      (read-string-as-unsigned-byte-32 (fasl-input-stream) res)
+      #!-sb-unicode (read-string-as-bytes (fasl-input-stream) res)
+      #!+sb-unicode (read-string-as-unsigned-byte-32 (fasl-input-stream) res)
       (push-fop-table (ensure-hashed (make-symbol res))
                       (fasl-input))))
 
-  (!define-fop 104 (fop-copy-symbol-save ((:operands table-index)))
+  (!define-fop 104 :not-host (fop-copy-symbol-save ((:operands table-index)))
     (push-fop-table (ensure-hashed
                      (copy-symbol (ref-fop-table (fasl-input) table-index)))
                     (fasl-input))))
@@ -310,16 +285,10 @@
 (!define-fop 44 (fop-package (pkg-designator))
   (find-undeleted-package-or-lose pkg-designator))
 
-(!define-fop 156 (fop-named-package-save ((:operands length)) nil)
+(!define-fop 156 :not-host (fop-named-package-save ((:operands length)) nil)
   (let ((package-name (make-string length)))
-    #+sb-xc-host
-    (read-string-as-bytes (fasl-input-stream) package-name)
-    #-sb-xc-host
-    (progn
-      #!-sb-unicode
-      (read-string-as-bytes (fasl-input-stream) package-name)
-      #!+sb-unicode
-      (read-string-as-unsigned-byte-32 (fasl-input-stream) package-name))
+    #!-sb-unicode (read-string-as-bytes (fasl-input-stream) package-name)
+    #!+sb-unicode (read-string-as-unsigned-byte-32 (fasl-input-stream) package-name)
     (push-fop-table
      (handler-case (find-undeleted-package-or-lose package-name)
        (simple-package-error (c)
@@ -356,9 +325,11 @@
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
     (fast-read-s-integer 1)))
 
-(!define-fop 70 (fop-ratio (num den)) (%make-ratio num den))
+;; No %MAKE-RATIO on host
+(!define-fop 70 :not-host (fop-ratio (num den)) (%make-ratio num den))
 
-(!define-fop 71 (fop-complex (realpart imagpart))
+;; No %MAKE-COMPLEX on host
+(!define-fop 71 :not-host (fop-complex (realpart imagpart))
   (%make-complex realpart imagpart))
 
 (macrolet ((fast-read-single-float ()
@@ -442,24 +413,15 @@
 ;;;; fops for loading arrays
 
 (!define-fop 100 (fop-base-string ((:operands length)))
-  (let ((res (make-string length :element-type 'base-char)))
-    (read-base-string-as-bytes (fasl-input-stream) res)
-    res))
+  (read-base-string-as-bytes (fasl-input-stream)
+                             (make-string length :element-type 'base-char)))
 
-#!+sb-unicode
 ;; FIXME: can save space by UTF-8 encoding, or use 1 bit to indicate pure ASCII
 ;; in the fasl even though the result will be a non-base string.
-(progn
-  #+sb-xc-host
-  (!define-fop 160 (fop-character-string ((:operands length)))
-    length ; touch the argument to avoid style-warning
-    (bug "CHARACTER-STRING FOP encountered"))
-
-  #-sb-xc-host
-  (!define-fop 160 (fop-character-string ((:operands length)))
-    (let ((res (make-string length)))
-      (read-string-as-unsigned-byte-32 (fasl-input-stream) res)
-      res)))
+#!+sb-unicode
+(!define-fop 160 :not-host (fop-character-string ((:operands length)))
+  (read-string-as-unsigned-byte-32 (fasl-input-stream)
+                                   (make-string length)))
 
 (!define-fop 92 (fop-vector ((:operands size)))
   (let ((res (make-array size))
@@ -470,7 +432,8 @@
         (replace res stack :start2 ptr)))
     res))
 
-(!define-fop 89 (fop-array (vec))
+;; No MAKE-ARRAY-HEADER on host
+(!define-fop 89 :not-host (fop-array (vec))
   (let* ((rank (read-word-arg (fasl-input-stream)))
          (length (length vec))
          (res (make-array-header sb!vm:simple-array-widetag rank)))
@@ -495,7 +458,8 @@
 (declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb!vm:widetag-mask)))
                **saetp-bits-per-length**))
 
-(!define-fop 43 (fop-spec-vector)
+;; No ALLOCATE-VECTOR on host (nor READ-N-BYTES)
+(!define-fop 43 :not-host (fop-spec-vector)
   (let* ((length (read-word-arg (fasl-input-stream)))
          (widetag (read-byte-arg (fasl-input-stream)))
          (bits-per-length (aref **saetp-bits-per-length** widetag))
@@ -553,10 +517,11 @@
          (obj (ref-fop-table (fasl-input) obi))
          (idx (read-word-arg (fasl-input-stream))))
     (if (%instancep obj) ; suspicious. should have been FOP-STRUCTSET
-        (setf (%instance-ref obj idx) val)
+        #+sb-xc (setf (%instance-ref obj idx) val)
+        #-sb-xc (bug "%instance-set?")
         (setf (svref obj idx) val))))
 
-(!define-fop 204 (fop-structset (val) nil)
+(!define-fop 204 :not-host (fop-structset (val) nil)
   (setf (%instance-ref (ref-fop-table (fasl-input)
                                       (read-word-arg (fasl-input-stream)))
                        (read-word-arg (fasl-input-stream)))
@@ -576,22 +541,24 @@
 ;;; putting the implementation and version in required fields in the
 ;;; fasl file header.)
 
-(!define-fop #xE0 (fop-code ((:operands n-boxed-words n-unboxed-bytes)))
+;; Cold-load calls COLD-LOAD-CODE instead
+(!define-fop #xE0 :not-host (fop-code ((:operands n-boxed-words n-unboxed-bytes)))
   (with-fop-stack ((stack (operand-stack)) ptr (1+ n-boxed-words))
     (load-code n-boxed-words n-unboxed-bytes stack ptr (fasl-input-stream))))
 
 ;; this gets you an #<fdefn> object, not the result of (FDEFINITION x)
-(!define-fop 60 (fop-fdefn (name))
+;; cold-loader uses COLD-FDEFINITION-OBJECT instead.
+(!define-fop 60 :not-host (fop-fdefn (name))
   (awhen (deprecated-thing-p 'function name) ; returns the stage of deprecation
     (pushnew (list* it name :function)
              (%fasl-input-deprecated-stuff (fasl-input)) :test 'equal))
   (find-or-create-fdefn name))
 
-(!define-fop 65 (fop-known-fun (name))
+(!define-fop 65 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
 
 #!-(or x86 x86-64)
-(!define-fop 61 (fop-sanctify-for-execution (component))
+(!define-fop 61 :not-host (fop-sanctify-for-execution (component))
   (sb!vm:sanctify-for-execution component)
   component)
 
@@ -605,15 +572,11 @@ a bug.~@:>")
         (file-write-date (sb!c::debug-source-namestring debug-source))))
 
 ;;; Modify a slot in a CONSTANTS object.
-(!define-fop 140 (fop-alter-code ((:operands index) code value) nil)
+(!define-fop 140 :not-host (fop-alter-code ((:operands index) code value) nil)
   (setf (code-header-ref code index) value)
   (values))
 
-(!define-fop 139 (fop-fun-entry (code-object name arglist type info))
-  #+sb-xc-host ; since xc host doesn't know how to compile %PRIMITIVE
-  (progn code-object name arglist type info ; touch the arguments
-         (error "FOP-FUN-ENTRY can't be defined without %PRIMITIVE."))
-  #-sb-xc-host
+(!define-fop 139 :not-host (fop-fun-entry (code-object name arglist type info))
   (let ((offset (read-word-arg (fasl-input-stream))))
     (declare (type index offset))
     (unless (zerop (logand offset sb!vm:lowtag-mask))
@@ -648,14 +611,14 @@ a bug.~@:>")
 (!define-fop 145 (fop-assembler-routine)
   (error "cannot load assembler code except at cold load"))
 
-(!define-fop 146 (fop-symbol-tls-fixup (code-object kind symbol))
+(!define-fop 146 :not-host (fop-symbol-tls-fixup (code-object kind symbol))
   (sb!vm:fixup-code-object code-object
                            (read-word-arg (fasl-input-stream))
                            (ensure-symbol-tls-index symbol)
                            kind)
   code-object)
 
-(!define-fop 147 (fop-foreign-fixup (code-object kind))
+(!define-fop 147 :not-host (fop-foreign-fixup (code-object kind))
   (let* ((len (read-byte-arg (fasl-input-stream)))
          (sym (make-string len :element-type 'base-char)))
     (read-n-bytes (fasl-input-stream) sym 0 len)
@@ -665,7 +628,7 @@ a bug.~@:>")
                              kind)
     code-object))
 
-(!define-fop 148 (fop-assembler-fixup (code-object kind routine))
+(!define-fop 148 :not-host (fop-assembler-fixup (code-object kind routine))
   (multiple-value-bind (value found) (gethash routine *assembler-routines*)
     (unless found
       (error "undefined assembler routine: ~S" routine))
@@ -673,7 +636,7 @@ a bug.~@:>")
                              value kind))
   code-object)
 
-(!define-fop 149 (fop-code-object-fixup (code-object kind))
+(!define-fop 149 :not-host (fop-code-object-fixup (code-object kind))
     ;; Note: We don't have to worry about GC moving the code-object after
     ;; the GET-LISP-OBJ-ADDRESS and before that value is deposited, because
     ;; we can only use code-object fixups when code-objects don't move.
@@ -682,7 +645,7 @@ a bug.~@:>")
   code-object)
 
 #!+linkage-table
-(!define-fop 150 (fop-foreign-dataref-fixup (code-object kind))
+(!define-fop 150 :not-host (fop-foreign-dataref-fixup (code-object kind))
   (let* ((len (read-byte-arg (fasl-input-stream)))
          (sym (make-string len :element-type 'base-char)))
     (read-n-bytes (fasl-input-stream) sym 0 len)
@@ -747,7 +710,6 @@ a bug.~@:>")
                           specs))))
   (frob (#x6c t)
         (#x6d structure-object)
-        (#x6e structure!object)
         (#x6f definition-source-location)
         (#x70 sb!c::debug-fun)
         (#x71 sb!c::compiled-debug-fun)

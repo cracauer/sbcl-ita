@@ -95,11 +95,15 @@
                           (list nil))))
                    (declare (truly-dynamic-extent ,map-result))
                    (do-anonymous ((,temp ,map-result) . ,(do-clauses))
-                     (,endtest (truly-the list (cdr ,map-result)))
+                     (,endtest
+                      (%rplacd ,temp nil) ;; replace the 0
+                      (truly-the list (cdr ,map-result)))
                      ;; Accumulate using %RPLACD. RPLACD becomes (SETF CDR)
                      ;; which becomes %RPLACD but relies on "defsetfs".
                      ;; This is for effect, not value, so makes no difference.
-                     (%rplacd ,temp (setq ,temp (list ,call)))))))
+                     (%rplacd ,temp (setq ,temp
+                                          ;; 0 is not written to the heap
+                                          (cons ,call 0)))))))
              ((nil)
               `(let ((,n-first ,(first arglists)))
                  (do-anonymous ,(do-clauses)
@@ -392,7 +396,7 @@
              (sequence-bounding-indices-bad-error vector start end)))))
 
 (def!type eq-comparable-type ()
-  '(or fixnum (not number)))
+  '(or fixnum #!+64-bit single-float (not number)))
 
 ;;; True if EQL comparisons involving type can be simplified to EQ.
 (defun eq-comparable-type-p (type)
@@ -711,12 +715,12 @@
                   `(let* ((len (length seq))
                           (end (or end len))
                           (bound (1+ end)))
-                     ;; Minor abuse %CHECK-BOUND for bounds checking.
+                     ;; Minor abuse CHECK-BOUND for bounds checking.
                      ;; (- END START) may still end up negative, but
                      ;; the basher handle that.
                      (,basher ,bash-value seq
-                              (%check-bound seq bound start)
-                              (- (if end (%check-bound seq bound end) len)
+                              (check-bound seq bound start)
+                              (- (if end (check-bound seq bound end) len)
                                  start)))
                `(with-array-data ((data seq)
                                   (start start)
@@ -1123,75 +1127,79 @@
              (values spec (ir1-transform-specifier-type spec))))
     (unless type
       (give-up-ir1-transform))
-    (multiple-value-bind (elt-type dim complexp)
-        (cond ((and (union-type-p type)
-                    (csubtypep type (specifier-type 'string)))
-               (let* ((types (union-type-types type))
-                      (first (first types)))
-                 (when (array-type-p first)
-                   (let ((dim (first (array-type-dimensions first)))
-                         (complexp (array-type-complexp first)))
-                     ;; Require sameness of dim and complexp. Give up on
-                     ;;   (OR (VECTOR CHARACTER) (VECTOR BASE-CHAR 2))
-                     ;; which eventually fails in the call to the function.
-                     (when (every (lambda (x)
-                                    (and (array-type-p x)
-                                         (eql (first (array-type-dimensions x))
-                                              dim)
-                                         (eq (array-type-complexp x) complexp)))
-                                  (rest types))
-                       (values
-                        `(or ,@(mapcar
-                                (lambda (x)
-                                  (type-specifier (array-type-element-type x)))
-                                types))
-                        dim complexp))))))
-              ((and (array-type-p type)
-                    (csubtypep type (specifier-type 'vector)))
-               (when (contains-unknown-type-p (array-type-element-type type))
-                 (give-up-ir1-transform "~S is an unknown vector type" spec))
-               (values (let ((et (array-type-element-type type)))
-                         ;; VECTOR means (VECTOR T)
-                         (if (type= et *wild-type*) 't (type-specifier et)))
-                       (first (array-type-dimensions type))
-                       (array-type-complexp type))))
-      ;; Don't transform if size is present in the specifier
-      ;; and the SIZE argument is not known to be equal.
-      (if (and (or (eq '* dim)
-                   (and dim (constant-lvar-p size) (eql (lvar-value size) dim)))
-               ;; not sure what it would mean to make it non-simple
-               (neq complexp t))
-          `(make-array size :element-type ',elt-type
-                       ,@(when initial-element
-                           `(:initial-element initial-element)))
-          ;; no transform, but we can detect some style issues
-          (progn
-            (when dim ; was a recognizable vector subtype
-              (let* ((elt-ctype (specifier-type elt-type))
-                     (saetp (find-saetp-by-ctype elt-ctype)))
-                (cond ((not initial-element)
-                       (let ((default-initial-element
-                               (sb!vm:saetp-initial-element-default saetp)))
-                         (unless (ctypep default-initial-element elt-ctype)
-                           ;; As with MAKE-ARRAY, this is merely undefined
-                           ;; behavior, not an error.
-                           (compiler-style-warn
-                            "The default initial element ~S is not a ~S."
-                            default-initial-element elt-type))))
-                      ;; In would be possible in some cases,
-                      ;; like :INITIAL-ELEMENT (IF X #\x #\y) in a call
-                      ;; to MAKE-SEQUENCE '(VECTOR (MEMBER #\A #\B))
-                      ;; to detect erroneous non-constants initializers,
-                      ;; but it is not important enough to bother with.
-                      ((and (constant-lvar-p initial-element)
-                            (not (ctypep (lvar-value initial-element)
-                                         elt-ctype)))
-                       ;; MAKE-ARRAY considers this a warning, not an error.
-                       (compiler-warn "~S ~S is not a ~S"
-                                      :initial-element
-                                      (lvar-value initial-element)
-                                      elt-type)))))
-            (give-up-ir1-transform))))))
+    (if (type= type (specifier-type 'list))
+        `(%make-list size initial-element)
+        (multiple-value-bind (elt-type dim complexp)
+            (cond ((and (union-type-p type)
+                        (csubtypep type (specifier-type 'string)))
+                   (let* ((types (union-type-types type))
+                          (first (first types)))
+                     (when (array-type-p first)
+                       (let ((dim (first (array-type-dimensions first)))
+                             (complexp (array-type-complexp first)))
+                         ;; Require sameness of dim and complexp. Give up on
+                         ;;   (OR (VECTOR CHARACTER) (VECTOR BASE-CHAR 2))
+                         ;; which eventually fails in the call to the function.
+                         (when (every (lambda (x)
+                                        (and (array-type-p x)
+                                             (eql (first (array-type-dimensions x))
+                                                  dim)
+                                             (eq (array-type-complexp x) complexp)))
+                                      (rest types))
+                           (values
+                            `(or ,@(mapcar
+                                    (lambda (x)
+                                      (type-specifier (array-type-element-type x)))
+                                    types))
+                            dim complexp))))))
+                  ((and (array-type-p type)
+                        (csubtypep type (specifier-type 'vector)))
+                   (when (contains-unknown-type-p (array-type-element-type type))
+                     (give-up-ir1-transform "~S is an unknown vector type" spec))
+                   (values (let ((et (array-type-element-type type)))
+                             ;; VECTOR means (VECTOR T)
+                             (if (type= et *wild-type*)
+                                 t
+                                 (type-specifier et)))
+                           (first (array-type-dimensions type))
+                           (array-type-complexp type))))
+          ;; Don't transform if size is present in the specifier
+          ;; and the SIZE argument is not known to be equal.
+          (cond ((and (or (eq '* dim)
+                          (and dim (constant-lvar-p size) (eql (lvar-value size) dim)))
+                      ;; not sure what it would mean to make it non-simple
+                      (neq complexp t))
+                 `(make-array size :element-type ',elt-type
+                              ,@(when initial-element
+                                  `(:initial-element initial-element))))
+                ;; no transform, but we can detect some style issues
+                (t
+                 (when dim         ; was a recognizable vector subtype
+                   (let* ((elt-ctype (specifier-type elt-type))
+                          (saetp (find-saetp-by-ctype elt-ctype)))
+                     (cond ((not initial-element)
+                            (let ((default-initial-element
+                                    (sb!vm:saetp-initial-element-default saetp)))
+                              (unless (ctypep default-initial-element elt-ctype)
+                                ;; As with MAKE-ARRAY, this is merely undefined
+                                ;; behavior, not an error.
+                                (compiler-style-warn
+                                 "The default initial element ~S is not a ~S."
+                                 default-initial-element elt-type))))
+                           ;; In would be possible in some cases,
+                           ;; like :INITIAL-ELEMENT (IF X #\x #\y) in a call
+                           ;; to MAKE-SEQUENCE '(VECTOR (MEMBER #\A #\B))
+                           ;; to detect erroneous non-constants initializers,
+                           ;; but it is not important enough to bother with.
+                           ((and (constant-lvar-p initial-element)
+                                 (not (ctypep (lvar-value initial-element)
+                                              elt-ctype)))
+                            ;; MAKE-ARRAY considers this a warning, not an error.
+                            (compiler-warn "~S ~S is not a ~S"
+                                           :initial-element
+                                           (lvar-value initial-element)
+                                           elt-type)))))
+                 (give-up-ir1-transform)))))))
 
 (deftransform subseq ((seq start &optional end)
                       (vector t &optional t)
@@ -1347,22 +1355,27 @@
 ;;; in the right ballpark.
 (defvar *concatenate-open-code-limit* 129)
 
-(deftransform concatenate ((result-type &rest lvars)
-                           ((constant-arg
-                             (member string simple-string base-string simple-base-string))
-                            &rest sequence)
-                           * :node node)
-  (let ((vars (make-gensym-list (length lvars)))
-        (type (lvar-value result-type)))
+(defun string-concatenate-transform (node type lvars)
+  (let ((vars (make-gensym-list (length lvars))))
     (if (policy node (<= speed space))
         ;; Out-of-line
-        `(lambda (.dummy. ,@vars)
-           (declare (ignore .dummy.))
-           ,(ecase type
-              ((string simple-string)
-               `(%concatenate-to-string ,@vars))
-              ((base-string simple-base-string)
-               `(%concatenate-to-base-string ,@vars))))
+        (let ((constants-to-string
+                ;; Strings are handled more efficiently by
+                ;; %concatenate-to-* functions
+                (loop for var in vars
+                      for lvar in lvars
+                      collect (if (and (constant-lvar-p lvar)
+                                       (every #'characterp (lvar-value lvar)))
+                                  (coerce (lvar-value lvar) 'string)
+                                  var))))
+          `(lambda (.dummy. ,@vars)
+             (declare (ignore .dummy.)
+                      (ignorable ,@vars))
+             ,(ecase type
+                ((string simple-string)
+                 `(%concatenate-to-string ,@constants-to-string))
+                ((base-string simple-base-string)
+                 `(%concatenate-to-base-string ,@constants-to-string)))))
         ;; Inline
         (let* ((element-type (ecase type
                                ((string simple-string) 'character)
@@ -1384,7 +1397,7 @@
                (non-constant-start
                  (loop for value in lvar-values
                        while (and (stringp value)
-                                    (< (length value) *concatenate-open-code-limit*))
+                                  (< (length value) *concatenate-open-code-limit*))
                        sum (length value))))
           `(lambda (.dummy. ,@vars)
              (declare (ignore .dummy.)
@@ -1397,7 +1410,6 @@
                         #-sb-xc-host (muffle-conditions compiler-note)
                         (ignorable .pos.))
                ,@(loop with constants = -1
-                       for first = t then nil
                        for value in lvar-values
                        for var in vars
                        collect
@@ -1433,6 +1445,69 @@
                                      (incf (truly-the index .pos.) (length ,var)))
                                 (setf constants nil)))))
                .string.))))))
+
+(defun vector-specifier-widetag (type)
+  ;; FIXME: This only accepts vectors without dimensions even though
+  ;; it's not that hard to support them for the concatenate transform,
+  ;; but it's probably not used often enough to bother.
+  (cond ((and (array-type-p type)
+              (equal (array-type-dimensions type) '(*)))
+         (let* ((el-ctype (array-type-element-type type))
+                (el-ctype (if (eq el-ctype *wild-type*)
+                              *universal-type*
+                              el-ctype))
+                (saetp (find-saetp-by-ctype el-ctype)))
+           (when saetp
+             (sb!vm:saetp-typecode saetp))))
+        ((and (union-type-p type)
+              (csubtypep type (specifier-type 'string))
+              (loop for type in (union-type-types type)
+                    always (equal (array-type-dimensions type) '(*))))
+         #!+sb-unicode
+         sb!vm:simple-character-string-widetag
+         #!-sb-unicode
+         sb!vm:simple-base-string-widetag)))
+
+(deftransform concatenate ((result-type &rest lvars)
+                           ((constant-arg t)
+                            &rest sequence)
+                           * :node node)
+  (let* ((type (ir1-transform-specifier-type (lvar-value result-type)))
+         (vector-widetag (vector-specifier-widetag type)))
+    (flet ((coerce-constants (vars type)
+             ;; Lists are faster to iterate over than vectors of
+             ;; unknown type.
+             (loop for var in vars
+                   for lvar in lvars
+                   collect (if (constant-lvar-p lvar)
+                               `',(coerce (lvar-value lvar) type)
+                               var))))
+
+      (cond ((type= type (specifier-type 'list))
+             (let ((vars (make-gensym-list (length lvars))))
+               `(lambda (type ,@vars)
+                  (declare (ignore type)
+                           (ignorable ,@vars))
+                  (%concatenate-to-list ,@(coerce-constants vars 'list)))))
+            ((not vector-widetag)
+             (give-up-ir1-transform))
+            ((= vector-widetag sb!vm:simple-base-string-widetag)
+             (string-concatenate-transform node 'simple-base-string lvars))
+            #!+sb-unicode
+            ((= vector-widetag sb!vm:simple-character-string-widetag)
+             (string-concatenate-transform node 'string lvars))
+            ;; FIXME: other vectors may use inlined expansion from
+            ;; STRING-CONCATENATE-TRANSFORM as well.
+            (t
+             (let ((vars (make-gensym-list (length lvars))))
+               `(lambda (type ,@vars)
+                  (declare (ignore type)
+                           (ignorable ,@vars))
+                  ,(if (= vector-widetag sb!vm:simple-vector-widetag)
+                       `(%concatenate-to-simple-vector
+                         ,@(coerce-constants vars 'vector))
+                       `(%concatenate-to-vector
+                         ,vector-widetag ,@(coerce-constants vars 'list))))))))))
 
 ;;;; CONS accessor DERIVE-TYPE optimizers
 
@@ -1610,7 +1685,7 @@
                           (maybe-return))))
            (values nil nil))))))
 
-(def!macro %find-position-vector-macro (item sequence
+(sb!xc:defmacro %find-position-vector-macro (item sequence
                                              from-end start end key test)
   (with-unique-names (element)
     (%find-position-or-find-position-if-vector-expansion
@@ -1624,7 +1699,7 @@
      ;; or after the checked sequence element.)
      `(funcall ,test ,item (funcall ,key ,element)))))
 
-(def!macro %find-position-if-vector-macro (predicate sequence
+(sb!xc:defmacro %find-position-if-vector-macro (predicate sequence
                                                      from-end start end key)
   (with-unique-names (element)
     (%find-position-or-find-position-if-vector-expansion
@@ -1635,7 +1710,7 @@
      element
      `(funcall ,predicate (funcall ,key ,element)))))
 
-(def!macro %find-position-if-not-vector-macro (predicate sequence
+(sb!xc:defmacro %find-position-if-not-vector-macro (predicate sequence
                                                          from-end start end key)
   (with-unique-names (element)
     (%find-position-or-find-position-if-vector-expansion
@@ -1909,3 +1984,118 @@
       `(lambda ,gensyms
          (declare (ignore ,@ignored))
          (append ,@arguments)))))
+
+(deftransform reverse ((sequence) (vector) * :important nil)
+  `(sb!impl::vector-reverse sequence))
+
+(deftransform reverse ((sequence) (list) * :important nil)
+  `(sb!impl::list-reverse sequence))
+
+(deftransform nreverse ((sequence) (vector) * :important nil)
+  `(sb!impl::vector-nreverse sequence))
+
+(deftransform nreverse ((sequence) (list) * :important nil)
+  `(sb!impl::list-nreverse sequence))
+
+(deftransforms (intersection nintersection)
+    ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((or (csubtypep (lvar-type list1) null-type)
+               (csubtypep (lvar-type list2) null-type))
+           nil)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           'list1)
+          (t
+           (give-up-ir1-transform)))))
+
+(deftransforms (union nunion) ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((csubtypep (lvar-type list1) null-type)
+           'list2)
+          ((csubtypep (lvar-type list2) null-type)
+           'list1)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           'list1)
+          (t
+           (give-up-ir1-transform)))))
+
+(defoptimizer (union derive-type) ((list1 list2 &rest args))
+  (declare (ignore args))
+  (let ((cons-type (specifier-type 'cons)))
+    (if (or (csubtypep (lvar-type list1) cons-type)
+            (csubtypep (lvar-type list2) cons-type))
+        cons-type
+        (specifier-type 'list))))
+
+(defoptimizer (nunion derive-type) ((list1 list2 &rest args))
+  (declare (ignore args))
+  (let ((cons-type (specifier-type 'cons)))
+    (if (or (csubtypep (lvar-type list1) cons-type)
+            (csubtypep (lvar-type list2) cons-type))
+        cons-type
+        (specifier-type 'list))))
+
+(deftransforms (set-difference nset-difference)
+    ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((csubtypep (lvar-type list1) null-type)
+           nil)
+          ((csubtypep (lvar-type list2) null-type)
+           'list1)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           nil)
+          (t
+           (give-up-ir1-transform)))))
+
+(deftransform subsetp ((list1 list2 &key key test test-not))
+  (cond ((csubtypep (lvar-type list1) (specifier-type 'null))
+         t)
+        ((and (same-leaf-ref-p list1 list2)
+              (not test-not)
+              (not key)
+              (or (not test)
+                  (lvar-fun-is test '(eq eql equal equalp))))
+         t)
+        (t
+         (give-up-ir1-transform))))
+
+(deftransforms (set-exclusive-or nset-exclusive-or)
+    ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((csubtypep (lvar-type list1) null-type)
+           'list2)
+          ((csubtypep (lvar-type list2) null-type)
+           'list1)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           'list1)
+          (t
+           (give-up-ir1-transform)))))
+
+(deftransform tree-equal ((list1 list2 &key test test-not))
+  (cond ((and (same-leaf-ref-p list1 list2)
+              (not test-not)
+              (or (not test)
+                  (lvar-fun-is test '(eq eql equal equalp))))
+         t)
+        ((and (not test-not)
+              (or (not test)
+                  (lvar-fun-is test '(eql))))
+         `(sb!impl::tree-equal-eql list1 list2))
+        (t
+         (give-up-ir1-transform))))

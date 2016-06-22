@@ -28,7 +28,7 @@
                     ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
-                    (def!constant ,offset-sym ,offset))
+                    (defconstant ,offset-sym ,offset))
                   (setf (svref ,names-vector ,offset-sym)
                         ,(symbol-name name)))))
            ;; FIXME: It looks to me as though DEFREGSET should also
@@ -161,7 +161,7 @@
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
-  (def!constant  register-arg-count 3)
+  (defconstant  register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
   (eval-when (:compile-toplevel :load-toplevel :execute)
     (defparameter *register-arg-names* '(rdx rdi rsi)))
@@ -201,7 +201,7 @@
                (constant-name (symbolicate sc-name "-SC-NUMBER")))
           (forms `(define-storage-class ,sc-name ,index
                     ,@(cdr class)))
-          (forms `(def!constant ,constant-name ,index))
+          (forms `(defconstant ,constant-name ,index))
           (incf index))))
     `(progn
        ,@(forms))))
@@ -385,8 +385,8 @@
                   :save-p t
                   :alternate-scs (single-sse-stack))
 
-  ;; a catch or unwind block
-  (catch-block stack :element-size catch-block-size))
+  (catch-block stack :element-size catch-block-size)
+  (unwind-block stack :element-size unwind-block-size))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defparameter *byte-sc-names*
@@ -499,6 +499,20 @@
 
 (defun boxed-immediate-sc-p (sc)
   (eql sc (sc-number-or-lose 'immediate)))
+
+(defun encode-value-if-immediate (tn &optional (tag t))
+  (if (sc-is tn immediate)
+      (let ((val (tn-value tn)))
+        (etypecase val
+          (integer (if tag
+                       (fixnumize val)
+                       val))
+          (symbol (+ nil-value (static-symbol-offset val)))
+          (character (if tag
+                         (logior (ash (char-code val) n-widetag-bits)
+                                 character-widetag)
+                         (char-code val)))))
+      tn))
 
 ;;;; miscellaneous function call parameters
 
@@ -508,13 +522,13 @@
 ;;; address is at RBP+8, the old control stack frame pointer is at
 ;;; RBP, the magic 3rd slot is at RBP-8. Then come the locals from
 ;;; RBP-16 on.
-(def!constant return-pc-save-offset 0)
-(def!constant ocfp-save-offset 1)
-(def!constant code-save-offset 2)
+(defconstant return-pc-save-offset 0)
+(defconstant ocfp-save-offset 1)
+(defconstant code-save-offset 2)
 ;;; Let SP be the stack pointer before CALLing, and FP is the frame
 ;;; pointer after the standard prologue. SP +
 ;;; FRAME-WORD-OFFSET(SP->FP-OFFSET + I) = FP + FRAME-WORD-OFFSET(I).
-(def!constant sp->fp-offset 2)
+(defconstant sp->fp-offset 2)
 
 (declaim (inline frame-word-offset))
 (defun frame-word-offset (index)
@@ -524,10 +538,10 @@
 (defun frame-byte-offset (index)
   (* (frame-word-offset index) n-word-bytes))
 
-(def!constant lra-save-offset return-pc-save-offset) ; ?
+(defconstant lra-save-offset return-pc-save-offset) ; ?
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 3)
+(defconstant single-value-return-byte-offset 3)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location. It returns a thing that can be printed with PRINC.
@@ -569,7 +583,7 @@
          (hi (ash value -16)))
     (values lo hi)))
 
-(def!constant cfp-offset rbp-offset) ; pfw - needed by stuff in /code
+(defconstant cfp-offset rbp-offset) ; pfw - needed by stuff in /code
 
 (defun combination-implementation-style (node)
   (declare (type sb!c::combination node))

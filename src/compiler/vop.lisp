@@ -48,12 +48,7 @@
   ;; the Lisp type equivalent to this type. If this type could never be
   ;; returned by PRIMITIVE-TYPE, then this is the NIL (or empty) type.
   ;; TYPE-SPECIFIER is too general - this doesn't allow CLASS/CLASSOID.
-  (specifier (missing-arg) :type (or symbol list) :read-only t)
-  ;; the template used to check that an object is of this type. This is a
-  ;; template of one argument and one result, both of primitive-type T. If
-  ;; the argument is of the correct type, then it is delivered into the
-  ;; result. If the type is incorrect, then an error is signalled.
-  (check nil :type (or template null) :read-only nil))
+  (specifier (missing-arg) :type (or symbol list) :read-only t))
 
 (defprinter (primitive-type)
   name)
@@ -461,11 +456,6 @@
   ;; are read and before results are written. This is only filled in
   ;; when VOP-INFO-SAVE-P is non-null.
   (save-set nil :type (or local-tn-bit-vector null)))
-(defprinter (vop)
-  (info :prin1 (vop-info-name info))
-  args
-  results
-  (codegen-info :test codegen-info))
 
 ;;; A TN-REF object contains information about a particular reference
 ;;; to a TN. The information in TN-REFs largely determines how TNs are
@@ -494,10 +484,6 @@
   (target nil :type (or null tn-ref))
   ;; the load TN allocated for this operand, if any
   (load-tn nil :type (or tn null)))
-(defprinter (tn-ref)
-  tn
-  write-p
-  (vop :test vop :prin1 (vop-info-name (vop-info vop))))
 
 ;;; A TEMPLATE object represents a particular IR2 coding strategy for
 ;;; a known function.
@@ -574,9 +560,7 @@
 ;;; A VOP-INFO object holds the constant information for a given
 ;;; virtual operation. We include TEMPLATE so that functions with a
 ;;; direct VOP equivalent can be translated easily.
-(def!struct (vop-info
-             (:include template)
-             (:make-load-form-fun ignore-it))
+(def!struct (vop-info (:include template))
   ;; side effects of this VOP and side effects that affect the value
   ;; of this VOP
   (effects (missing-arg) :type attributes)
@@ -654,6 +638,21 @@
   ;; encodes the source ref (shifted 8, it is also encoded in
   ;; MAX-VOP-TN-REFS) and the dest ref index.
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1))))
+(!set-load-form-method vop-info (:xc :target) :ignore-it)
+
+;; These printers follow the definition of VOP-INFO because they
+;; want to inline VOP-INFO-NAME, and it's less code to move them here
+;; than to move the defstructs of VOP-INFO and TEMPLATE.
+(defprinter (vop)
+  (info :prin1 (vop-info-name info))
+  args
+  results
+  (codegen-info :test codegen-info))
+(defprinter (tn-ref)
+  tn
+  write-p
+  (vop :test vop :prin1 (vop-info-name (vop-info vop))))
+
 
 ;;;; SBs and SCs
 
@@ -696,7 +695,7 @@
 
 ;;; The SB structure represents the global information associated with
 ;;; a storage base.
-(def!struct (sb (:make-load-form-fun just-dump-it-normally))
+(def!struct (sb)
   ;; name, for printing and reference
   (name nil :type symbol)
   ;; the kind of storage base (which determines the packing
@@ -706,6 +705,7 @@
   ;; size. If unbounded, this is the size that the SB is initially
   ;; allocated at.
   (size 0 :type index))
+(!set-load-form-method sb (:host :xc))
 (defprinter (sb)
   name)
 
@@ -942,7 +942,8 @@
   (physenv nil :type (or physenv null))
   ;; The depth of the deepest loop that this TN is used in.
   (loop-depth 0 :type fixnum))
-(def!method print-object ((tn tn) stream)
+(declaim (freeze-type tn))
+(defmethod print-object ((tn tn) stream)
   (print-unreadable-object (tn stream :type t)
     ;; KLUDGE: The distinction between PRINT-TN and PRINT-OBJECT on TN is
     ;; not very mnemonic. -- WHN 20000124

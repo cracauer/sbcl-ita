@@ -98,21 +98,20 @@
   (:args (x :target y
             :scs (any-reg descriptor-reg zero null)
             :load-if (not (location= x y))))
-  (:results (y :scs (any-reg descriptor-reg)
+  (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
   (:effects)
   (:affected)
   (:generator 0
-    (move y x)))
+    (cond ((location= x y))
+          ((sc-is y control-stack)
+           (store-stack-tn y x))
+          (t
+           (move y x)))))
 
 (define-move-vop move :move
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-;;; Make Move the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type.  This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The Move-Arg VOP is used for moving descriptor values into
 ;;; another frame for argument or known value passing.

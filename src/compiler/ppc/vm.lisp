@@ -49,7 +49,7 @@
   (defreg nl4 7)
   (defreg nl5 8)
   (defreg nl6 9)
-  (defreg fdefn 10)                     ; was nl7
+  (defreg fdefn 10)
   (defreg nargs 11)
   ;; FIXME: some kind of comment here would be nice.
   ;;
@@ -78,7 +78,7 @@
   (defreg lip 31)
 
   (defregset non-descriptor-regs
-      nl0 nl1 nl2 nl3 nl4 nl5 nl6 #+nil nl7 cfunc nargs nfp)
+      nl0 nl1 nl2 nl3 nl4 nl5 nl6 cfunc nargs nfp)
 
   (defregset descriptor-regs
       fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 #!-sb-thread l2 )
@@ -240,8 +240,8 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;;; Make some random tns for important registers.
 
@@ -300,7 +300,6 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
 (def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
 (def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 

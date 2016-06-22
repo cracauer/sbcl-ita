@@ -11,12 +11,6 @@
 
 (in-package "SB!VM")
 
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* any-reg-sc-number)
-   env))
-
 ;;; Make a TN for the argument count passing location for a non-local entry.
 (defun make-nlx-entry-arg-start-location ()
   (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ebx-offset))
@@ -24,7 +18,12 @@
 (defun catch-block-ea (tn)
   (aver (sc-is tn catch-block))
   (make-ea :dword :base ebp-tn
-           :disp (frame-byte-offset (+ -1 (tn-offset tn) catch-block-size))))
+                  :disp (frame-byte-offset (+ -1 (tn-offset tn) catch-block-size))))
+
+(defun unwind-block-ea (tn)
+  (aver (sc-is tn unwind-block))
+  (make-ea :dword :base ebp-tn
+           :disp (frame-byte-offset (+ -1 (tn-offset tn) unwind-block-size))))
 
 
 ;;;; Save and restore dynamic environment.
@@ -71,10 +70,10 @@
   (:temporary (:sc unsigned-reg) temp)
   (:results (block :scs (any-reg)))
   (:generator 22
-    (inst lea block (catch-block-ea tn))
+    (inst lea block (unwind-block-ea tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew ebp-tn block unwind-block-current-cont-slot)
+    (storew temp block unwind-block-uwp-slot)
+    (storew ebp-tn block unwind-block-cfp-slot)
     (storew (make-fixup nil :code-object entry-label)
             block catch-block-entry-pc-slot)
     #!+win32
@@ -93,8 +92,8 @@
   (:generator 44
     (inst lea block (catch-block-ea tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block  unwind-block-current-uwp-slot)
-    (storew ebp-tn block  unwind-block-current-cont-slot)
+    (storew temp block  unwind-block-uwp-slot)
+    (storew ebp-tn block  unwind-block-cfp-slot)
     (storew (make-fixup nil :code-object entry-label)
             block catch-block-entry-pc-slot)
     #!+win32
@@ -112,7 +111,7 @@
   (:args (tn))
   (:temporary (:sc unsigned-reg) new-uwp #!+sb-thread tls #!+win32 seh-frame)
   (:generator 7
-    (inst lea new-uwp (catch-block-ea tn))
+    (inst lea new-uwp (unwind-block-ea tn))
     #!+win32
     (progn
       (storew (make-fixup 'uwp-seh-handler :assembly-routine)
@@ -143,7 +142,7 @@
     (progn
       (loadw seh-frame block unwind-block-next-seh-frame-slot)
       (inst mov (make-ea :dword :disp 0) seh-frame :fs))
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-tl-symbol-value block *current-unwind-protect-block* tls)))
 
 ;;;; NLX entry VOPs
@@ -273,9 +272,9 @@
     ;; Set up magic catch / UWP block.
     (move block esp-tn)
     (loadw temp uwp sap-pointer-slot other-pointer-lowtag)
-    (storew temp block unwind-block-current-uwp-slot)
+    (storew temp block unwind-block-uwp-slot)
     (loadw temp ofp sap-pointer-slot other-pointer-lowtag)
-    (storew temp block unwind-block-current-cont-slot)
+    (storew temp block unwind-block-cfp-slot)
 
     (storew (make-fixup nil :code-object entry-label)
             block

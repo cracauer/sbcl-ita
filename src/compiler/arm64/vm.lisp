@@ -82,7 +82,7 @@
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
-  (def!constant  register-arg-count 4)
+  (def!constant register-arg-count 4)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2 r3)
   (defparameter *register-arg-names* '(r0 r1 r2 r3)))
@@ -232,8 +232,8 @@
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;;; Make some random tns for important registers.
 
@@ -280,7 +280,6 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
 (def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
 (def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 
@@ -332,14 +331,11 @@
                                  `(function ,args ,result)))))
     (case (sb!c::combination-fun-source-name node)
       (logtest
-       (cond
-         ((valid-funtype '(fixnum fixnum) '*)
-          (values :maybe nil))
-         ((valid-funtype '(signed-word signed-word) '*)
-          (values :maybe nil))
-         ((valid-funtype '(word word) '*)
-          (values :maybe nil))
-         (t (values :default nil))))
+       (if (or (valid-funtype '(fixnum fixnum) '*)
+               (valid-funtype '(signed-word signed-word) '*)
+               (valid-funtype '(word word) '*))
+           (values :maybe nil)
+           (values :default nil)))
       (logbitp
        (cond
          ((or (valid-funtype '((constant-arg (integer 0 #.(1- n-fixnum-bits))) fixnum) '*)

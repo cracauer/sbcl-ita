@@ -575,8 +575,7 @@
 (defun interpreter-trampoline (fun &rest args)
   (setf (values (interpreted-function-frame fun)
                 (interpreted-function-cookie fun))
-        (proto-fn-frame (interpreted-function-proto-fn fun)
-                        (interpreted-function-env fun)))
+        (proto-fn-frame (fun-proto-fn fun) (interpreted-function-env fun)))
   (apply (setf (funcallable-instance-fun fun) (interpreted-applicator fun))
          args))
 
@@ -828,8 +827,7 @@
 ;;; and checks for a binding of *SELF-APPLYHOOK* on each call.
 (defun interpreter-hooked-trampoline (fun &rest args)
   (multiple-value-bind (frame cookie)
-      (proto-fn-frame (interpreted-function-proto-fn fun)
-                      (interpreted-function-env fun))
+      (proto-fn-frame (fun-proto-fn fun) (interpreted-function-env fun))
     (setf (values (interpreted-function-frame fun)
                   (interpreted-function-cookie fun)) (values frame cookie))
     ;; *SELF-APPLYHOOK* isn't the *APPLYHOOK* as described by CLtL.
@@ -873,18 +871,6 @@ Test case.
 (defmacro thing () ''thing-macro) ; system warns about this
 (get-thinginator) ; errs - it correctly perceives the redefinition
 |#
-
-;;; Figure out if F is supposed to be funcallable, versus is the error trampoline
-;;; that is installed in a global macro's fdefn object.  It is very efficient
-;;; to do this by seeing if F is a closure over the error trampoline, versus asking
-;;; the horribly slow globaldb if F's name's macro-function is NIL.
-;;; In the common case where F isn't a closure, it definitely isn't a macro.
-(declaim (inline %looks-like-macro-p))
-(defun %looks-like-macro-p (f) ; f is a FUNCTION
-  (and (= (fun-subtype (truly-the function f)) sb-vm:closure-header-widetag)
-       ;; compare to a known global macro
-       (eq (load-time-value (%closure-fun (symbol-function 'or)) t)
-           (%closure-fun f))))
 
 ;;; Return T if SYMBOL might get redefined as a macro when it was previously
 ;;; a function and vice versa. Extra checks are done on every use of the symbol
@@ -1108,7 +1094,7 @@ Test case.
     (if (allow-macro-redefinition env)
         (macrolet ((re-expand-p ()
                      '(let ((f (fdefn-fun fdefn)))
-                        (and f (%looks-like-macro-p f)))))
+                        (and f (sb-impl::macro/special-guard-fun-p f)))))
           (generate-switch))
         (macrolet ((re-expand-p () nil)) (generate-switch)))))
 

@@ -83,16 +83,6 @@ enum {
  * that don't have pointers to younger generations? */
 boolean enable_page_protection = 1;
 
-/* the minimum size (in bytes) for a large object*/
-/* NB this logic is unfortunately copied in 'compiler/x86-64/macros.lisp' */
-#if (GENCGC_ALLOC_GRANULARITY >= PAGE_BYTES) && (GENCGC_ALLOC_GRANULARITY >= GENCGC_CARD_BYTES)
-os_vm_size_t large_object_size = 4 * GENCGC_ALLOC_GRANULARITY;
-#elif (GENCGC_CARD_BYTES >= PAGE_BYTES) && (GENCGC_CARD_BYTES >= GENCGC_ALLOC_GRANULARITY)
-os_vm_size_t large_object_size = 4 * GENCGC_CARD_BYTES;
-#else
-os_vm_size_t large_object_size = 4 * PAGE_BYTES;
-#endif
-
 /* Largest allocation seen since last GC. */
 os_vm_size_t large_allocation = 0;
 
@@ -1440,7 +1430,7 @@ gc_alloc_with_region(sword_t nbytes,int page_type_flag, struct alloc_region *my_
 {
     void *new_free_pointer;
 
-    if ((size_t)nbytes>=large_object_size)
+    if (nbytes>=LARGE_OBJECT_SIZE)
         return gc_alloc_large(nbytes, page_type_flag, my_region);
 
     /* Check whether there is room in the current alloc region. */
@@ -1954,24 +1944,6 @@ trans_boxed_large(lispobj object)
 
     return copy_large_object(object, length);
 }
-
-/* Doesn't seem to be used, delete it after the grace period. */
-#if 0
-static lispobj
-trans_unboxed_large(lispobj object)
-{
-    lispobj header;
-    uword_t length;
-
-    gc_assert(is_lisp_pointer(object));
-
-    header = *((lispobj *) native_pointer(object));
-    length = HeaderValue(header) + 1;
-    length = CEILING(length, 2);
-
-    return copy_large_unboxed_object(object, length);
-}
-#endif
 
 /*
  * weak pointers
@@ -3155,7 +3127,7 @@ verify_space(lispobj *start, size_t words)
                 }
                 */
             } else {
-                extern void funcallable_instance_tramp;
+                extern char funcallable_instance_tramp;
                 /* Verify that it points to another valid space. */
                 if (!to_readonly_space && !to_static_space
                     && (thing != (lispobj)&funcallable_instance_tramp)
@@ -3202,17 +3174,9 @@ verify_space(lispobj *start, size_t words)
                             count = 1;
                             break;
                         }
-#ifdef LISP_FEATURE_INTERLEAVED_RAW_SLOTS
                         instance_scan_interleaved(verify_space,
                                                   start, ntotal,
                                                   native_pointer(layout));
-#else
-                        lispobj nuntagged;
-                        nuntagged = ((struct layout *)
-                                     native_pointer(layout))->n_untagged_slots;
-                        verify_space(start + 1,
-                                     ntotal - fixnum_value(nuntagged));
-#endif
                         count = ntotal + 1;
                         break;
                     }
@@ -3588,7 +3552,6 @@ move_pinned_pages_to_newspace()
 static void
 garbage_collect_generation(generation_index_t generation, int raise)
 {
-    uword_t bytes_freed;
     page_index_t i;
     uword_t static_space_size;
     struct thread *th;
@@ -3891,7 +3854,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
     gc_alloc_update_all_page_tables();
 
     /* Free the pages in oldspace, but not those marked dont_move. */
-    bytes_freed = free_oldspace();
+    free_oldspace();
 
     /* If the GC is not raising the age then lower the generation back
      * to its normal generation number */
@@ -4443,7 +4406,7 @@ general_alloc_internal(sword_t nbytes, int page_type_flag, struct alloc_region *
     void *new_free_pointer;
     os_vm_size_t trigger_bytes = 0;
 
-    gc_assert(nbytes>0);
+    gc_assert(nbytes > 0);
 
     /* Check for alignment allocation problems. */
     gc_assert((((uword_t)region->free_pointer & LOWTAG_MASK) == 0)
@@ -4454,7 +4417,7 @@ general_alloc_internal(sword_t nbytes, int page_type_flag, struct alloc_region *
     gc_assert(get_pseudo_atomic_atomic(thread));
 #endif
 
-    if (nbytes > large_allocation)
+    if ((os_vm_size_t) nbytes > large_allocation)
         large_allocation = nbytes;
 
     /* maybe we can do this quickly ... */
@@ -4471,7 +4434,7 @@ general_alloc_internal(sword_t nbytes, int page_type_flag, struct alloc_region *
      * large objects we are in danger of exhausting the heap without
      * running sufficient GCs.
      */
-    if (nbytes >= bytes_consed_between_gcs)
+    if ((os_vm_size_t) nbytes >= bytes_consed_between_gcs)
         trigger_bytes = nbytes;
 
     /* we have to go the long way around, it seems. Check whether we
@@ -4552,7 +4515,7 @@ general_alloc(sword_t nbytes, int page_type_flag)
 }
 
 lispobj AMD64_SYSV_ABI *
-alloc(long nbytes)
+alloc(sword_t nbytes)
 {
 #ifdef LISP_FEATURE_SB_SAFEPOINT_STRICTLY
     struct thread *self = arch_os_get_current_thread();

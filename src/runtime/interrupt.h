@@ -15,28 +15,6 @@
 #include "runtime.h"
 #include <string.h>
 
-/*
- * This is a workaround for some slightly silly Linux/GNU Libc
- * behaviour: glibc defines sigset_t to support 1024 signals, which is
- * more than the kernel.  This is usually not a problem, but becomes
- * one when we want to save a signal mask from a ucontext, and restore
- * it later into another ucontext: the ucontext is allocated on the
- * stack by the kernel, so copying a libc-sized sigset_t into it will
- * overflow and cause other data on the stack to be corrupted */
-/* FIXME: do not rely on NSIG being a multiple of 8 */
-
-#ifdef LISP_FEATURE_WIN32
-# define REAL_SIGSET_SIZE_BYTES (4)
-#else
-# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
-#endif
-
-static inline void
-sigcopyset(sigset_t *new, sigset_t *old)
-{
-    memcpy(new, old, REAL_SIGSET_SIZE_BYTES);
-}
-
 extern void get_current_sigmask(sigset_t *sigset);
 
 /* Set all deferrable signals into *s. */
@@ -62,12 +40,10 @@ extern void check_deferrables_unblocked_or_lose(sigset_t *sigset);
 extern void check_blockables_unblocked_or_lose(sigset_t *sigset);
 extern void check_gc_signals_unblocked_or_lose(sigset_t *sigset);
 
-extern void block_deferrable_signals(sigset_t *where, sigset_t *old);
-extern void block_blockable_signals(sigset_t *where, sigset_t *old);
-extern void block_gc_signals(sigset_t *where, sigset_t *old);
+extern void block_deferrable_signals(sigset_t *old);
+extern void block_blockable_signals(sigset_t *old);
 
 extern void unblock_deferrable_signals(sigset_t *where, sigset_t *old);
-extern void unblock_blockable_signals(sigset_t *where, sigset_t *old);
 extern void unblock_gc_signals(sigset_t *where, sigset_t *old);
 
 extern void maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset);
@@ -163,8 +139,6 @@ extern void undoably_install_low_level_interrupt_handler (
 extern uword_t install_handler(int signal,
                                interrupt_handler_t handler,
                                int synchronous);
-
-extern union interrupt_handler interrupt_handlers[NSIG];
 
 /* The void* casting here avoids having to mess with the various types
  * of function argument lists possible for signal handlers:

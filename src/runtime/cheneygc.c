@@ -107,7 +107,7 @@ collect_garbage(generation_index_t ignore)
 
     /* it's possible that signals are blocked already if this was called
      * from a signal handler (e.g. with the sigsegv gc_trigger stuff) */
-    block_blockable_signals(0, &old);
+    block_blockable_signals(&old);
 
     current_static_space_free_pointer =
         (lispobj *) ((unsigned long)
@@ -431,10 +431,10 @@ void set_auto_gc_trigger(os_vm_size_t dynamic_usage)
              (unsigned long)((os_vm_address_t)dynamic_space_free_pointer
                              - (os_vm_address_t)current_dynamic_space));
 
-    length = os_trunc_size_to_page(dynamic_space_size - dynamic_usage);
-    if (length < 0)
+    if (dynamic_usage > dynamic_space_size)
         lose("set_auto_gc_trigger: tried to set gc trigger too high! (0x%08lx)\n",
              (unsigned long)dynamic_usage);
+    length = os_trunc_size_to_page(dynamic_space_size - dynamic_usage);
 
 #if defined(SUNOS) || defined(SOLARIS) || defined(LISP_FEATURE_HPUX)
     os_invalidate(addr, length);

@@ -36,23 +36,19 @@
 
 (defun vector-to-list* (object)
   (declare (type vector object))
-  (let ((result (list nil))
-        (length (length object)))
-    (declare (fixnum length))
-    (do ((index 0 (1+ index))
-         (splice result (cdr splice)))
-        ((>= index length) (cdr result))
-      (declare (fixnum index))
-      (rplacd splice (list (aref object index))))))
+  (dx-let ((result (list nil)))
+    (let ((splice result))
+      (do-vector-data (elt object (cdr result))
+        (let ((cell (list elt)))
+          (setf (cdr splice) cell splice cell))))))
 
 (defun sequence-to-list (sequence)
   (declare (type sequence sequence))
-  (let* ((result (list nil))
-         (splice result))
-    (sb!sequence:dosequence (i sequence)
-      (rplacd splice (list i))
-      (setf splice (cdr splice)))
-    (cdr result)))
+  (dx-let ((result (list nil)))
+    (let ((splice result))
+      (sb!sequence:dosequence (elt sequence (cdr result))
+        (let ((cell (list elt)))
+          (setf (cdr splice) cell splice cell))))))
 
 ;;; These are used both by the full DEFUN function and by various
 ;;; optimization transforms in the constant-OUTPUT-TYPE-SPEC case.
@@ -69,6 +65,7 @@
   ;; [Also note, we won't encapsulate a macro or special-form, so this
   ;; introspective technique to decide what kind something is works either way]
   (let ((def (fdefinition symbol)))
+    (declare (notinline macro/special-guard-fun-p)) ; not performance-critical
     (if (macro/special-guard-fun-p def)
         (error (ecase (car (%fun-name def))
                 (:macro "~S names a macro.")
@@ -123,8 +120,10 @@
   "Coerce the Object to an object of type Output-Type-Spec."
   (declare (explicit-check))
   (flet ((coerce-error ()
+           (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
-                  :format-control "~S can't be converted to type ~S."
+                  :format-control "~S can't be converted to type ~
+                                    ~/sb!impl:print-type-specifier/."
                   :format-arguments (list object output-type-spec)
                   :datum object
                   :expected-type output-type-spec)))
@@ -269,8 +268,10 @@
   #!+sb-doc
   "Coerces the Object to an object of type Output-Type-Spec."
   (flet ((coerce-error ()
+           (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
-                  :format-control "~S can't be converted to type ~S."
+                  :format-control "~S can't be converted to type ~
+                                    ~/sb!impl:print-type-specifier/."
                   :format-arguments (list object output-type-spec)))
          (check-result (result)
            #!+high-security (aver (typep result output-type-spec))

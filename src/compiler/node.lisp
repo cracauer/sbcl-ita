@@ -34,9 +34,7 @@
 ;;; that works only for compiling the compiler.
 
 ;;; "Lead-in" Control TRANsfer [to some node]
-(def!struct (ctran
-             (:make-load-form-fun ignore-it)
-             (:constructor make-ctran))
+(def!struct (ctran (:constructor make-ctran))
   ;; an indication of the way that this continuation is currently used
   ;;
   ;; :UNUSED
@@ -64,15 +62,13 @@
   ;; :UNUSED continuations.
   (block nil :type (or cblock null)))
 
-(def!method print-object ((x ctran) stream)
+(defmethod print-object ((x ctran) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream "~D" (cont-num x))))
 
 ;;; Linear VARiable. Multiple-value (possibly of unknown number)
 ;;; temporal storage.
-(def!struct (lvar
-             (:make-load-form-fun ignore-it)
-             (:constructor make-lvar (&optional dest)))
+(def!struct (lvar (:constructor make-lvar (&optional dest)))
   ;; The node which receives this value. NIL only temporarily.
   (dest nil :type (or node null))
   ;; cached type of this lvar's value. If NIL, then this must be
@@ -93,10 +89,32 @@
   (dynamic-extent nil :type (or null cleanup))
   ;; something or other that the back end annotates this lvar with
   (info nil))
+(!set-load-form-method lvar (:xc :target) :ignore-it)
 
-(def!method print-object ((x lvar) stream)
+(defmethod print-object ((x lvar) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream "~D" (cont-num x))))
+
+#!-sb-fluid (declaim (inline lvar-has-single-use-p))
+(defun lvar-has-single-use-p (lvar)
+  (typep (lvar-uses lvar) '(not list)))
+
+;;; Return the unique node, delivering a value to LVAR.
+#!-sb-fluid (declaim (inline lvar-use))
+(defun lvar-use (lvar)
+  (the (not list) (lvar-uses lvar)))
+
+#!-sb-fluid (declaim (inline lvar-derived-type))
+(defun lvar-derived-type (lvar)
+  (declare (type lvar lvar))
+  (or (lvar-%derived-type lvar)
+      (setf (lvar-%derived-type lvar)
+            (%lvar-derived-type lvar))))
+
+#!-sb-fluid(declaim (inline flush-lvar-externally-checkable-type))
+(defun flush-lvar-externally-checkable-type (lvar)
+  (declare (type lvar lvar))
+  (setf (lvar-%externally-checkable-type lvar) nil))
 
 (def!struct (node (:constructor nil)
                   (:include sset-element (number (incf *compiler-sset-counter*)))
@@ -149,6 +167,11 @@
   ;; If the back-end breaks tail-recursion for some reason, then it
   ;; can null out this slot.
   (tail-p nil :type boolean))
+
+#!-sb-fluid (declaim (inline node-block))
+(defun node-block (node)
+  (ctran-block (node-prev node)))
+
 (defun %with-ir1-environment-from-node (node fun)
   (declare (type node node) (type function fun))
   (let ((*current-component* (node-component node))
@@ -166,6 +189,10 @@
   ;; Lvar, receiving the values, produced by this node. May be NIL if
   ;; the value is unused.
   (lvar nil :type (or lvar null)))
+
+#!-sb-fluid (declaim (inline node-dest))
+(defun node-dest (node)
+  (awhen (node-lvar node) (lvar-dest it)))
 
 ;;; Flags that are used to indicate various things about a block, such
 ;;; as what optimizations need to be done on it:
@@ -287,7 +314,6 @@
   ;; in copy propagation: list of killed TNs
   (kill nil)
   ;; other sets used in constraint propagation and/or copy propagation
-  (gen nil)
   (in nil)
   (out nil)
   ;; Set of all blocks that dominate this block. NIL is interpreted
@@ -316,7 +342,7 @@
   ;; Cache the physenv of a block during lifetime analysis. :NONE if
   ;; no cached value has been stored yet.
   (physenv-cache :none :type (or null physenv (member :none))))
-(def!method print-object ((cblock cblock) stream)
+(defmethod print-object ((cblock cblock) stream)
   (print-unreadable-object (cblock stream :type t :identity t)
     (format stream "~W :START c~W"
             (block-number cblock)
@@ -471,6 +497,14 @@
   #!+sb-show id
   (reanalyze :test reanalyze))
 
+(declaim (inline reoptimize-component))
+(defun reoptimize-component (component kind)
+  (declare (type component component)
+           (type (member nil :maybe t) kind))
+  (aver kind)
+  (unless (eq (component-reoptimize component) t)
+    (setf (component-reoptimize component) kind)))
+
 ;;; Check that COMPONENT is suitable for roles which involve adding
 ;;; new code. (gotta love imperative programming with lotso in-place
 ;;; side effects...)
@@ -597,9 +631,9 @@
              (:constructor make-nlx-info (cleanup
                                           exit
                                           &aux
-                                          (block (first (block-succ
-                                                         (node-block exit))))))
-             (:make-load-form-fun ignore-it))
+                                          (block
+                                           (first (block-succ
+                                                   (node-block exit)))))))
   ;; the cleanup associated with this exit. In a catch or
   ;; unwind-protect, this is the :CATCH or :UNWIND-PROTECT cleanup,
   ;; and not the cleanup for the escape block. The CLEANUP-KIND of
@@ -627,6 +661,7 @@
   (safe-p nil :type boolean)
   ;; some kind of info used by the back end
   info)
+(!set-load-form-method nlx-info (:xc :target) :ignore-it)
 (defprinter (nlx-info :identity t)
   block
   target
@@ -638,8 +673,7 @@
 ;;; structures. A reference to a LEAF is indicated by a REF node. This
 ;;; allows us to easily substitute one for the other without actually
 ;;; hacking the flow graph.
-(def!struct (leaf (:make-load-form-fun ignore-it)
-                  (:include sset-element (number (incf *compiler-sset-counter*)))
+(def!struct (leaf (:include sset-element (number (incf *compiler-sset-counter*)))
                   (:constructor nil))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
@@ -690,6 +724,7 @@
   (extent nil :type (member nil :maybe-dynamic :always-dynamic :indefinite))
   ;; some kind of info used by the back end
   (info nil))
+(!set-load-form-method leaf (:xc :target) :ignore-it)
 
 (defun leaf-dynamic-extent (leaf)
   (let ((extent (leaf-extent leaf)))
@@ -730,7 +765,7 @@
 (defun fun-locally-defined-p (name env)
   (typecase env
     (null nil)
-    #!+sb-fasteval
+    #!+(and sb-fasteval (host-feature sb-xc))
     (sb!interpreter:basic-env
      (values (sb!interpreter:find-lexical-fun env name)))
     (t
@@ -1427,6 +1462,22 @@
   type-to-check
   vestigial-exit-lexenv
   vestigial-exit-entry-lexenv)
+
+;;; A cast that always follows %check-bound and they are deleted together.
+;;; Created via BOUND-CAST ir1-translator by chaining it together with %check-bound.
+;;; IR1-OPTIMIZE-CAST handles propagation from BOUND to CAST-ASSERTED-TYPE
+;;; DELETE-CAST deletes BOUND-CAST-CHECK
+;;; GENERATE-TYPE-CHECKS ignores it, it never translates to a type check,
+;;; %CHECK-BOUND does all the checking.
+(def!struct (bound-cast (:include cast (%type-check nil)))
+  ;; %check-bound combination before the cast
+  (check (missing-arg) :type (or null combination))
+  ;; Tells whether the type information is in a state where it can be
+  ;; optimized away, i.e. when BOUND is a constant.
+  (derived nil :type boolean)
+  (array (missing-arg) :type lvar)
+  (bound (missing-arg) :type lvar))
+
 
 ;;;; non-local exit support
 ;;;;
@@ -1484,7 +1535,7 @@
 (defun %coerce-to-policy (thing)
   (typecase thing
     (policy thing)
-    #!+sb-fasteval
+    #!+(and sb-fasteval (host-feature sb-xc))
     (sb!interpreter:basic-env (sb!interpreter:env-policy thing))
     (null **baseline-policy**)
     (t (lexenv-policy (etypecase thing

@@ -278,8 +278,8 @@
    :alternate-scs (complex-long-stack))
 
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;;; Make some miscellaneous TNs for important registers.
 (macrolet ((defregtn (name sc)
@@ -326,7 +326,6 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values.
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
 (def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
 (def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 

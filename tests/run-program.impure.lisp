@@ -19,8 +19,9 @@
 ;; (sometimes the handler will manage to WAIT3 a process before
 ;; run-tests WAITPIDs it).
 
-(with-test (:name :run-program-cat-1 :skipped-on :win32)
-  (let* ((process (sb-ext:run-program "/bin/cat" '() :wait nil
+(with-test (:name :run-program-cat-1)
+  (let* ((process (sb-ext:run-program "cat" '() :wait nil
+                                      :search t
                                       :output :stream :input :stream))
          (out (process-input process))
          (in (process-output process)))
@@ -97,22 +98,26 @@
              :start2 start :end2 end)
     seq))
 
-(with-test (:name :run-program-cat-3 :skipped-on :win32)
+(with-test (:name :run-program-cat-3)
   ;; User-defined binary input and output streams.
   (let ((in (make-instance 'buffer-stream))
         (out (make-instance 'buffer-stream))
         (data #(0 1 2 3 4 5 6 7 8 9 10 11 12)))
     (write-sequence data in)
-    (let ((process (sb-ext:run-program "/bin/cat" '() :wait t :output out :input in))
+    (let ((process (sb-ext:run-program "cat" '()
+                                       :search t
+                                       :wait t
+                                       :output out :input in))
           (buf (make-array (length data))))
       (declare (ignore process))
       (assert (= 13 (read-sequence buf out)))
       (assert (= 0 (read-sequence (make-array 8) out)))
       (assert (equalp buf data)))))
 
-(with-test (:name :run-program-cat-4 :skipped-on :win32)
+(with-test (:name :run-program-cat-4)
   ;; Null broadcast stream as output
-  (let* ((process (sb-ext:run-program "/bin/cat" '() :wait nil
+  (let* ((process (sb-ext:run-program "cat" '() :wait nil
+                                      :search t
                                       :output (make-broadcast-stream)
                                       :input :stream))
          (in (process-input process)))
@@ -219,7 +224,7 @@
 
 ;;; This used to crash on Darwin and trigger recursive lock errors on
 ;;; every platform.
-(with-test (:name (:run-program :stress) :fails-on :win32)
+(with-test (:name (:run-program :stress))
   ;; Do it a hundred times in batches of 10 so that with a low limit
   ;; of the number of processes the test can have a chance to pass.
   (loop
@@ -228,8 +233,9 @@
         #'sb-ext:process-wait
         (loop repeat 10
               collect
-              (sb-ext:run-program "/bin/echo" '
-                                  ("It would be nice if this didn't crash.")
+              (sb-ext:run-program "echo"
+                                  '("It would be nice if this didn't crash.")
+                                  :search t
                                   :wait nil :output nil)))))
 
 (with-test (:name (:run-program :pty-stream) :fails-on :win32)
@@ -344,3 +350,12 @@
                       #+win32 '("/c" "cd")
                       :directory nil
                       :search t))
+
+(with-test (:name (:run-program :bad-options))
+  (assert-error
+   (sb-ext:run-program #-win32 "/bin/sh"
+                       #-win32 '("-c" "pwd")
+                       #+win32 "cmd.exe"
+                       #+win32 '("/c" "cd")
+                       :search t
+                       :output :bad)))

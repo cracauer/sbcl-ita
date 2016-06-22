@@ -40,6 +40,7 @@
 ;;;; reader errors
 
 (defun reader-eof-error (stream context)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'reader-eof-error
          :stream stream
          :context context))
@@ -47,6 +48,7 @@
 ;;; If The Gods didn't intend for us to use multiple namespaces, why
 ;;; did They specify them?
 (defun simple-reader-error (stream control &rest args)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'simple-reader-error
          :stream stream
          :format-control control
@@ -525,7 +527,7 @@ standard Lisp readtable when NIL."
   (only-base-chars t :type boolean))
 (declaim (freeze-type token-buf))
 
-(def!method print-object ((self token-buf) stream)
+(defmethod print-object ((self token-buf) stream)
   (print-unreadable-object (self stream :identity t :type t)
     (format stream "~@[next=~S~]" (token-buf-next self))))
 
@@ -658,15 +660,15 @@ standard Lisp readtable when NIL."
 
 ;;;; READ-PRESERVING-WHITESPACE, READ-DELIMITED-LIST, and READ
 
-;;; an alist for #=, used to keep track of objects with labels assigned that
-;;; have been completely read. Each entry is (integer-tag gensym-tag value).
+;;; A list for #=, used to keep track of objects with labels assigned that
+;;; have been completely read. Each entry is a SHARP-EQUAL-WRAPPER object.
 ;;;
-;;; KLUDGE: Should this really be an alist? It seems as though users
+;;; KLUDGE: Should this really be a list? It seems as though users
 ;;; could reasonably expect N log N performance for large datasets.
 ;;; On the other hand, it's probably very very seldom a problem in practice.
-;;; On the third hand, it might be just as easy to use a hash table
-;;; as an alist, so maybe we should. -- WHN 19991202
-(defvar *sharp-equal-alist* ())
+;;; On the third hand, it might be just as easy to use a hash table,
+;;; so maybe we should. -- WHN 19991202
+(defvar *sharp-equal* ())
 
 (declaim (ftype (sfunction (t t) (values bit t)) read-maybe-nothing))
 
@@ -704,7 +706,7 @@ standard Lisp readtable when NIL."
                     (when tracking-p
                       (funcall (form-tracking-stream-observer stream)
                                :reset nil nil))))))))
-      (let ((*sharp-equal-alist* nil))
+      (let ((*sharp-equal* nil))
         (with-read-buffer ()
           (%read-preserving-whitespace stream eof-error-p eof-value t)))))
 
@@ -893,32 +895,59 @@ standard Lisp readtable when NIL."
 
 (defun read-string (stream closech)
   ;; This accumulates chars until it sees same char that invoked it.
-  ;; For a very long string, this could end up bloating the read buffer.
+  ;; We avoid copying any given input character more than twice-
+  ;; once to a temp buffer and then to the result. In the worst case,
+  ;; we can waste space equal the unwasted space, if the final character
+  ;; causes allocation of a new buffer for just that character,
+  ;; because the buffer size is doubled each time it overflows.
+  ;; (Would be better to peek at the frc-buffer if the stream has one.)
+  ;; Scratch vectors are GC-able as soon as this function returns though.
   (declare (character closech))
-  (let ((stream (in-synonym-of stream))
-        (buf *read-buffer*)
-        (rt *readtable*)
-        ;; *read-suppress* => "... macros will not construct any new objects"
-        (suppress *read-suppress*))
-    (reset-read-buffer buf)
-    (macrolet ((scan (read-a-char eofp &optional finish)
-                 `(loop (let ((char ,read-a-char))
-                          (cond (,eofp (error 'end-of-file :stream stream))
-                                ((eql char closech)
-                                 (return ,finish))
-                                ((single-escape-p char rt)
-                                 (setq char ,read-a-char)
-                                 (when ,eofp
-                                   (error 'end-of-file :stream stream))))
+  (macrolet ((scan (read-a-char eofp &optional finish)
+               `(loop (let ((char ,read-a-char))
+                        (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                        (cond (,eofp (error 'end-of-file :stream stream))
+                              ((eql char closech)
+                               (return ,finish))
+                              ((single-escape-p char rt)
+                               (setq char ,read-a-char)
+                               (when ,eofp
+                                 (error 'end-of-file :stream stream))))
+                        (when (>= ptr lim)
                           (unless suppress
-                            (ouch-read-buffer (truly-the character char)
-                                              buf))))))
+                            (push buf chain)
+                            (setq lim (the index (ash lim 1))
+                                  buf (make-array lim :element-type 'character)))
+                          (setq ptr 0))
+                        (setf (schar buf ptr) (truly-the character char))
+                        (incf ptr)))))
+    (let* ((token-buf *read-buffer*)
+           (buf (token-buf-string token-buf))
+           (rt *readtable*)
+           (stream (in-synonym-of stream))
+           (suppress *read-suppress*)
+           (lim (length buf))
+           (ptr 0)
+           (chain))
+      (declare (type (simple-array character (*)) buf))
+      (reset-read-buffer token-buf)
       (if (ansi-stream-p stream)
           (prepare-for-fast-read-char stream
            (scan (fast-read-char t) nil (done-with-fast-read-char)))
-        ;; CLOS stream
-          (scan (read-char stream nil +EOF+) (eq char +EOF+))))
-    (if suppress "" (copy-token-buf-string buf))))
+          ;; CLOS stream
+          (scan (read-char stream nil +EOF+) (eq char +EOF+)))
+      (if suppress
+          ""
+          (let* ((sum (loop for buf in chain sum (length buf)))
+                 (result (make-array (+ sum ptr) :element-type 'character)))
+            (setq ptr sum)
+            ;; Now work backwards from the end
+            (replace result buf :start1 ptr)
+            (dolist (buf chain result)
+              (declare (type (simple-array character (*)) buf))
+              (let ((len (length buf)))
+                (decf ptr len)
+                (replace result buf :start1 ptr))))))))
 
 (defun read-right-paren (stream ignore)
   (declare (ignore ignore))
@@ -952,37 +981,32 @@ standard Lisp readtable when NIL."
                  (or (plusp (fill-pointer (token-buf-escapes read-buffer)))
                      seen-multiple-escapes)
                  colon)))
-    (cond ((single-escape-p char rt)
-           ;; It can't be a number, even if it's 1\23.
-           ;; Read next char here, so it won't be casified.
-           (let ((nextchar (read-char stream nil +EOF+)))
-             (if (eq nextchar +EOF+)
-                 (reader-eof-error stream "after escape character")
-                 (ouch-read-buffer-escaped nextchar read-buffer))))
-          ((multiple-escape-p char rt)
-           (setq seen-multiple-escapes t)
-           ;; Read to next multiple-escape, escaping single chars
-           ;; along the way.
-           (loop
-             (let ((ch (read-char stream nil +EOF+)))
-               (cond
-                ((eq ch +EOF+)
-                 (reader-eof-error stream "inside extended token"))
-                ((multiple-escape-p ch rt) (return))
-                ((single-escape-p ch rt)
-                 (let ((nextchar (read-char stream nil +EOF+)))
-                   (if (eq nextchar +EOF+)
-                       (reader-eof-error stream "after escape character")
-                       (ouch-read-buffer-escaped nextchar read-buffer))))
-                (t
-                 (ouch-read-buffer-escaped ch read-buffer))))))
-          (t
-           (when (and (not colon) ; easiest test first
-                      (constituentp char rt)
-                      (eql (get-constituent-trait char)
-                           +char-attr-package-delimiter+))
-             (setq colon t))
-           (ouch-read-buffer char read-buffer)))))
+    (flet ((escape-1-char ()
+             ;; It can't be a number, even if it's 1\23.
+             ;; Read next char here, so it won't be casified.
+             (let ((nextchar (read-char stream nil +EOF+)))
+               (if (eq nextchar +EOF+)
+                   (reader-eof-error stream "after escape character")
+                   (ouch-read-buffer-escaped nextchar read-buffer)))))
+      (cond ((single-escape-p char rt) (escape-1-char))
+            ((multiple-escape-p char rt)
+             (setq seen-multiple-escapes t)
+             ;; Read to next multiple-escape, escaping single chars
+             ;; along the way.
+             (loop
+              (let ((ch (read-char stream nil +EOF+)))
+                (cond ((eq ch +EOF+)
+                       (reader-eof-error stream "inside extended token"))
+                      ((multiple-escape-p ch rt) (return))
+                      ((single-escape-p ch rt) (escape-1-char))
+                      (t (ouch-read-buffer-escaped ch read-buffer))))))
+            (t
+             (when (and (not colon) ; easiest test first
+                        (constituentp char rt)
+                        (eql (get-constituent-trait char)
+                             +char-attr-package-delimiter+))
+               (setq colon t))
+             (ouch-read-buffer char read-buffer))))))
 
 ;;;; character classes
 
@@ -1744,6 +1768,7 @@ extended <package-name>::<form-in-package> syntax."
 ;;;; General reader for dispatch macros
 
 (defun dispatch-char-error (stream sub-char ignore)
+  (declare (optimize allow-non-returning-tail-call))
   (declare (ignore ignore))
   (if *read-suppress*
       (values)
@@ -1772,16 +1797,6 @@ extended <package-name>::<form-in-package> syntax."
 
 ;;;; READ-FROM-STRING
 
-(defun maybe-note-read-from-string-signature-issue (eof-error-p)
-  ;; The interface is so unintuitive that we explicitly check for the common
-  ;; error.
-  (when (member eof-error-p '(:start :end :preserve-whitespace))
-    (style-warn "~@<~S as EOF-ERROR-P argument to ~S: probable error. ~
-               Two optional arguments must be provided before the ~
-               first keyword argument.~:@>"
-                eof-error-p 'read-from-string)
-    t))
-
 (declaim (ftype (sfunction (string t t index (or null index) t) (values t index))
                 %read-from-string))
 (defun %read-from-string (string eof-error-p eof-value start end preserve-whitespace)
@@ -1806,45 +1821,6 @@ extended <package-name>::<form-in-package> syntax."
   (declare (string string))
   (maybe-note-read-from-string-signature-issue eof-error-p)
   (%read-from-string string eof-error-p eof-value start end preserve-whitespace)))
-
-(define-compiler-macro read-from-string (&whole form string &rest args)
-  ;; Check this at compile-time, and rewrite it so we're silent at runtime.
-  (destructuring-bind (&optional (eof-error-p t) eof-value &rest keys)
-      args
-    (cond ((maybe-note-read-from-string-signature-issue eof-error-p)
-           `(read-from-string ,string t ,eof-value ,@keys))
-          (t
-           (let* ((start (gensym "START"))
-                  (end (gensym "END"))
-                  (preserve-whitespace (gensym "PRESERVE-WHITESPACE"))
-                  bind seen ignore)
-             (do ()
-                 ((not (cdr keys))
-                  ;; Odd number of keys, punt.
-                  (when keys (return-from read-from-string form)))
-               (let* ((key (pop keys))
-                      (value (pop keys))
-                      (var (case key
-                             (:start start)
-                             (:end end)
-                             (:preserve-whitespace preserve-whitespace)
-                             (otherwise
-                              (return-from read-from-string form)))))
-                 (when (member key seen)
-                   (setf var (gensym "IGNORE"))
-                   (push var ignore))
-                 (push key seen)
-                 (push (list var value) bind)))
-             (dolist (default (list (list start 0)
-                                    (list end nil)
-                                    (list preserve-whitespace nil)))
-               (unless (assoc (car default) bind)
-                 (push default bind)))
-             (once-only ((string string))
-               `(let ,(nreverse bind)
-                  ,@(when ignore `((declare (ignore ,@ignore))))
-                  (%read-from-string ,string ,eof-error-p ,eof-value
-                                     ,start ,end ,preserve-whitespace))))))))
 
 ;;;; PARSE-INTEGER
 
@@ -1854,10 +1830,11 @@ extended <package-name>::<form-in-package> syntax."
   (default to the beginning and end of the string)  It skips over
   whitespace characters and then tries to parse an integer. The
   radix parameter must be between 2 and 36."
-  (macrolet ((parse-error (format-control)
-               `(error 'simple-parse-error
-                       :format-control ,format-control
-                       :format-arguments (list string))))
+  (flet ((parse-error (format-control)
+           (declare (optimize allow-non-returning-tail-call))
+           (error 'simple-parse-error
+                  :format-control format-control
+                  :format-arguments (list string))))
     (with-array-data ((string string :offset-var offset)
                       (start start)
                       (end end)
@@ -1892,7 +1869,7 @@ extended <package-name>::<form-in-package> syntax."
                    (incf index)
                    (when (= index end) (return))
                    (unless (whitespace[1]p (char string index))
-                      (parse-error "junk in string ~S")))
+                     (parse-error "junk in string ~S")))
                   (return nil))
                  (t
                   (parse-error "junk in string ~S"))))
@@ -1911,7 +1888,7 @@ extended <package-name>::<form-in-package> syntax."
   (!cold-init-constituent-trait-table)
   (!cold-init-standard-readtable))
 
-(def!method print-object ((readtable readtable) stream)
+(defmethod print-object ((readtable readtable) stream)
   (print-unreadable-object (readtable stream :identity t :type t)))
 
 ;; Backward-compatibility adapter. The "named-readtables" system in
@@ -1945,3 +1922,12 @@ extended <package-name>::<form-in-package> syntax."
   (unless (null new-alist)
     (error "Assignment to virtual DISPATCH-TABLES slot not allowed"))
   new-alist)
+
+;;; like LISTEN, but any whitespace in the input stream will be flushed
+(defun listen-skip-whitespace (&optional (stream *standard-input*))
+  (do ((char (read-char-no-hang stream nil nil nil)
+             (read-char-no-hang stream nil nil nil)))
+      ((null char) nil)
+    (cond ((not (whitespace[1]p char))
+           (unread-char char stream)
+           (return t)))))

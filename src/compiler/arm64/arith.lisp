@@ -292,13 +292,11 @@
 ;;;
 (define-vop (fast-lognor/fixnum=>fixnum fast-fixnum-binop)
   (:translate lognor)
-  (:args (x :target r :scs (any-reg))
-         (y :target r :scs (any-reg)))
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:args (x :scs (any-reg))
+         (y :scs (any-reg)))
   (:generator 3
-    (inst orr temp x y)
-    (inst mvn temp temp)
-    (inst eor r temp fixnum-tag-mask)))
+    (inst orr r x y)
+    (inst eor r r (lognot fixnum-tag-mask))))
 
 (define-vop (fast-logand/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
   (:args (x :scs (signed-reg) :target r)
@@ -345,14 +343,6 @@
     (inst asr temp number (min (- amount) 63))
     (inst and result temp (bic-mask fixnum-tag-mask))))
 
-(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
-             fast-ash-left-c/fixnum=>fixnum)
-  (:translate ash-left-modfx))
-
-(define-vop (fast-ash-left-mod64-c/fixnum=>fixnum
-             fast-ash-left-c/fixnum=>fixnum)
-  (:translate ash-left-mod64))
-
 (define-vop (fast-ash-c/unsigned=>unsigned)
   (:translate ash)
   (:policy :fast-safe)
@@ -387,14 +377,6 @@
           (t
            (inst mov result 0)))))
 
-(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
-             fast-ash-c/unsigned=>unsigned)
-  (:translate ash-left-mod64))
-
-(define-vop (fast-ash-left-mod64-c/signed=>signed
-             fast-ash-c/signed=>signed)
-  (:translate ash-left-mod64))
-
 (define-vop (fast-ash/signed/unsigned)
   (:note "inline ASH")
   (:args (number)
@@ -408,18 +390,18 @@
     (inst cmp temp 0)
     (inst b :ge LEFT)
     (inst neg temp temp)
-    (inst cmp temp sb!vm:n-word-bits)
+    (inst cmp temp n-word-bits)
     (inst b :lt DO)
-    (inst mov temp (1- sb!vm:n-word-bits))
+    (inst mov temp (1- n-word-bits))
     DO
     (ecase variant
       (:signed (inst asr result number temp))
       (:unsigned (inst lsr result number temp)))
     (inst b END)
     LEFT
-    (inst cmp temp sb!vm:n-word-bits)
+    (inst cmp temp n-word-bits)
     (inst b :lt DO2)
-    (inst mov temp (1- sb!vm:n-word-bits))
+    (inst mov temp (1- n-word-bits))
     DO2
     (inst lsl result number temp)
     END))
@@ -447,29 +429,29 @@
                 (:note "inline ASH")
                 (:translate ash)
                 (:args (number :scs (,sc-type))
-                       (amount :scs (signed-reg unsigned-reg)
-                               :target temp))
-                (:temporary (:sc non-descriptor-reg) temp)
+                       (amount :scs (signed-reg unsigned-reg)))
+                ;; For modular variants
+                (:variant-vars cut)
                 (:arg-types ,type positive-fixnum)
                 (:results (result :scs (,result-type)))
                 (:result-types ,type)
                 (:policy :fast-safe)
                 (:generator ,cost
-                  (move temp amount)
-                  (inst cmp temp sb!vm:n-word-bits)
-                  (inst b :lt do)
-                  (inst mov temp (1- sb!vm:n-word-bits))
-                  do
-                  (inst lsl result number temp)))))
+                  (let ((amount (cond (cut
+                                       (inst cmp amount n-word-bits)
+                                       ;; Only the first 6 bits count for shifts.
+                                       ;; This sets all bits to 1 if AMOUNT is larger than 63,
+                                       ;; cutting the amount to 63.
+                                       (inst csinv tmp-tn amount zr-tn :lt)
+                                       tmp-tn)
+                                      (t
+                                       amount))))
+                    (inst lsl result number amount))))))
   ;; FIXME: There's the opportunity for a sneaky optimization here, I
   ;; think: a FAST-ASH-LEFT-C/FIXNUM=>SIGNED vop.  -- CSR, 2003-09-03
   (def fast-ash-left/fixnum=>fixnum any-reg tagged-num any-reg 2)
   (def fast-ash-left/signed=>signed signed-reg signed-num signed-reg 3)
   (def fast-ash-left/unsigned=>unsigned unsigned-reg unsigned-num unsigned-reg 3))
-
-(define-vop (fast-ash-left-mod64/unsigned=>unsigned
-             fast-ash-left/unsigned=>unsigned)
-  (:translate ash-left-mod64))
 
 #!+ash-right-vops
 (define-vop (fast-%ash/right/unsigned)
@@ -508,6 +490,33 @@
   (:generator 3
     (inst asr temp number amount)
     (inst and result temp (bic-mask fixnum-tag-mask))))
+
+(define-vop (fast-ash-left-modfx/fixnum=>fixnum
+             fast-ash-left/fixnum=>fixnum)
+  (:variant t)
+  (:translate ash-left-modfx))
+
+(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
+             fast-ash-left-c/fixnum=>fixnum)
+  (:translate ash-left-modfx))
+
+(define-vop (fast-ash-left-mod64-c/fixnum=>fixnum
+             fast-ash-left-c/fixnum=>fixnum)
+  (:translate ash-left-mod64))
+
+(define-vop (fast-ash-left-mod64/fixnum=>fixnum
+             fast-ash-left/fixnum=>fixnum)
+  (:variant t)
+  (:translate ash-left-mod64))
+
+(define-vop (fast-ash-left-mod64/unsigned=>unsigned
+             fast-ash-left/unsigned=>unsigned)
+  (:variant t)
+  (:translate ash-left-mod64))
+
+(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
+             fast-ash-c/unsigned=>unsigned)
+  (:translate ash-left-mod64))
 
 ;;; Only the lower 6 bits of the shift amount are significant.
 (define-vop (shift-towards-someplace)
@@ -674,31 +683,49 @@
   (:generator 1
     (inst mvn res x)))
 
-(macrolet
-    ((define-modular-backend (fun &optional constantp)
-       (let ((mfun-name (symbolicate fun '-mod64))
-             (modvop (symbolicate 'fast- fun '-mod64/unsigned=>unsigned))
-             (modcvop (symbolicate 'fast- fun 'mod64-c/unsigned=>unsigned))
-             (vop (symbolicate 'fast- fun '/unsigned=>unsigned))
-             (cvop (symbolicate 'fast- fun '-c/unsigned=>unsigned)))
-         `(progn
-            (define-modular-fun ,mfun-name (x y) ,fun :untagged nil 64)
-            (define-vop (,modvop ,vop)
-              (:translate ,mfun-name))
-            ,@(when constantp
-                `((define-vop (,modcvop ,cvop)
-                    (:translate ,mfun-name))))))))
-  (define-modular-backend +)
-  (define-modular-backend -)
-  (define-modular-backend *)
-  ;; (define-modular-backend logeqv)
-  ;; (define-modular-backend lognand)
-  ;; (define-modular-backend lognor)
-  (define-modular-backend logandc1)
-  (define-modular-backend logandc2)
-  ;; (define-modular-backend logorc1)
-  ;; (define-modular-backend logorc2)
-  )
+(defmacro define-mod-binop ((name prototype) function)
+  `(define-vop (,name ,prototype)
+     (:args (x :target r :scs (unsigned-reg signed-reg))
+            (y :scs (unsigned-reg signed-reg)))
+     (:arg-types untagged-num untagged-num)
+     (:results (r :scs (unsigned-reg signed-reg) :from (:argument 0)))
+     (:result-types unsigned-num)
+     (:translate ,function)))
+
+(defmacro define-mod-binop-c ((name prototype) function)
+  `(define-vop (,name ,prototype)
+     (:args (x :target r :scs (unsigned-reg signed-reg)))
+     (:info y)
+     (:arg-types untagged-num (:constant (satisfies add-sub-immediate-p)))
+     (:results (r :scs (unsigned-reg signed-reg) :from (:argument 0)))
+     (:result-types unsigned-num)
+     (:translate ,function)))
+
+(macrolet ((def (name -c-p)
+             (let ((fun64 (intern (format nil "~S-MOD64" name)))
+                   (vopu (intern (format nil "FAST-~S/UNSIGNED=>UNSIGNED" name)))
+                   (vopcu (intern (format nil "FAST-~S-C/UNSIGNED=>UNSIGNED" name)))
+                   (vopf (intern (format nil "FAST-~S/FIXNUM=>FIXNUM" name)))
+                   (vopcf (intern (format nil "FAST-~S-C/FIXNUM=>FIXNUM" name)))
+                   (vop64u (intern (format nil "FAST-~S-MOD64/WORD=>UNSIGNED" name)))
+                   (vop64f (intern (format nil "FAST-~S-MOD64/FIXNUM=>FIXNUM" name)))
+                   (vop64cu (intern (format nil "FAST-~S-MOD64-C/WORD=>UNSIGNED" name)))
+                   (funfx (intern (format nil "~S-MODFX" name)))
+                   (vopfxf (intern (format nil "FAST-~S-MODFX/FIXNUM=>FIXNUM" name)))
+                   (vopfxcf (intern (format nil "FAST-~S-MODFX-C/FIXNUM=>FIXNUM" name))))
+               `(progn
+                  (define-modular-fun ,fun64 (x y) ,name :untagged nil 64)
+                  (define-modular-fun ,funfx (x y) ,name :tagged t
+                                      #.(- n-word-bits n-fixnum-tag-bits))
+                  (define-mod-binop (,vop64u ,vopu) ,fun64)
+                  (define-vop (,vop64f ,vopf) (:translate ,fun64))
+                  (define-vop (,vopfxf ,vopf) (:translate ,funfx))
+                  ,@(when -c-p
+                      `((define-mod-binop-c (,vop64cu ,vopcu) ,fun64)
+                        (define-vop (,vopfxcf ,vopcf) (:translate ,funfx))))))))
+  (def + t)
+  (def - t)
+  (def * nil))
 
 ;;;; Binary conditional VOPs:
 
@@ -807,27 +834,36 @@
   (:arg-types * (:constant (satisfies fixnum-add-sub-immediate-p)))
   (:variant-cost 6))
 
-;; (macrolet ((define-logtest-vops ()
-;;              `(progn
-;;                 ,@(loop for suffix in '(/fixnum -c/fixnum
-;;                                         /signed -c/signed
-;;                                         /unsigned -c/unsigned)
-;;                         for cost in '(4 3 6 5 6 5)
-;;                         collect
-;;                         `(define-vop (,(symbolicate "FAST-LOGTEST" suffix)
-;;                                       ,(symbolicate "FAST-CONDITIONAL" suffix))
-;;                            (:translate logtest)
-;;                            (:conditional :ne)
-;;                            (:generator ,cost
-;;                                        (inst tst x
-;;                                              ,(case suffix
-;;                                                 (-c/fixnum
-;;                                                  `(fixnumize y))
-;;                                                 ((-c/signed -c/unsigned)
-;;                                                  `y)
-;;                                                 (t
-;;                                                  'y)))))))))
-;;   (define-logtest-vops))
+(macrolet ((define-logtest-vops ()
+             `(progn
+                ,@(loop for suffix in '(/fixnum -c/fixnum
+                                        /signed -c/signed
+                                        /unsigned -c/unsigned)
+                        for cost in '(4 3 6 5 6 5)
+                        for arg-types in '(nil
+                                           (fixnum
+                                            (:constant
+                                             (satisfies fixnum-encode-logical-immediate)))
+                                           nil
+                                           (signed-num
+                                            (:constant
+                                             (satisfies encode-logical-immediate)))
+                                           nil
+                                           (unsigned-num
+                                            (:constant (satisfies encode-logical-immediate))))
+                        collect
+                        `(define-vop (,(symbolicate "FAST-LOGTEST" suffix)
+                                      ,(symbolicate "FAST-CONDITIONAL" suffix))
+                           (:translate logtest)
+                           (:conditional :ne)
+                           ,@(and arg-types
+                                  `((:arg-types ,@arg-types)))
+                           (:generator ,cost
+                                       (inst tst x
+                                             ,(if (eq suffix '-c/fixnum)
+                                                  '(fixnumize y)
+                                                  'y))))))))
+  (define-logtest-vops))
 
 (define-source-transform lognand (x y)
   `(lognot (logand ,x ,y)))
@@ -875,9 +911,7 @@
           ((= width 64)
            (move r x))
           (t
-           (let ((delta (- n-word-bits width)))
-             (inst lsl r x delta)
-             (inst asr r r delta))))))
+           (inst sbfm r x 0 (1- width))))))
 
 (define-vop (mask-signed-field-bignum/c)
   (:translate sb!c::mask-signed-field)
@@ -892,9 +926,45 @@
            (inst mov r 0))
           (t
            (loadw r x bignum-digits-offset other-pointer-lowtag)
-           (let ((delta (- n-word-bits width)))
-             (inst lsl r r delta)
-             (inst asr r r delta))))))
+           (inst sbfm r r 0 (1- width))))))
+
+(define-vop (mask-signed-field-fixnum)
+  (:translate sb!c::mask-signed-field)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg) :target r))
+  (:arg-types (:constant (eql #.n-fixnum-bits)) t)
+  (:results (r :scs (any-reg)))
+  (:result-types fixnum)
+  (:info width)
+  (:ignore width)
+  (:generator 5
+    (move r x)
+    (inst tbz r 0 DONE)
+    (loadw tmp-tn r bignum-digits-offset other-pointer-lowtag)
+    (inst lsl r tmp-tn (- n-word-bits n-fixnum-bits))
+    DONE))
+
+(define-vop (logand-word-mask)
+  (:translate logand)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types t (:constant (member #.most-positive-word
+                                   #.(ash most-positive-word -1))))
+  (:results (r :scs (unsigned-reg)))
+  (:info mask)
+  (:result-types unsigned-num)
+  (:generator 10
+    (inst tbnz x 0 BIGNUM)
+    (if (= mask most-positive-word)
+        (inst asr r x n-fixnum-tag-bits)
+        (inst lsr r x n-fixnum-tag-bits))
+    (inst b DONE)
+    BIGNUM
+    (loadw r x bignum-digits-offset other-pointer-lowtag)
+    (unless (= mask most-positive-word)
+      (inst ubfm r r 0 (- n-word-bits 2)))
+    DONE))
+
 ;;;; Bignum stuff.
 
 (define-vop (bignum-length get-header-data)

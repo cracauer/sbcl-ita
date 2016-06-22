@@ -11,14 +11,13 @@
 
 (in-package "SB!VM")
 
-(defun lowest-set-bit-index (integer-value)
-  (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
-
 (defun load-immediate-word (y val)
   (cond ((typep val '(unsigned-byte 16))
          (inst movz y val))
         ((typep val '(and (signed-byte 16) (integer * -1)))
          (inst movn y (lognot val)))
+        ((typep (ldb (byte 64 0) (lognot val)) '(unsigned-byte 16))
+         (inst movn y (ldb (byte 64 0) (lognot val))))
         ((encode-logical-immediate val)
          (inst orr y zr-tn val))
         ((minusp val)
@@ -121,22 +120,27 @@
 (define-vop (move)
   (:args (x :target y
             :scs (any-reg descriptor-reg null)
-            :load-if (not (location= x y))))
-  (:results (y :scs (any-reg descriptor-reg)
+            :load-if (not (or (location= x y)
+                              (and (sc-is x immediate)
+                                   (eql (tn-value x) 0))))))
+  (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
   (:effects)
   (:affected)
   (:generator 0
-    (move y x)))
+    (let ((x (if (and (sc-is x immediate)
+                      (eql (tn-value x) 0))
+                 zr-tn
+                 x)))
+      (cond ((location= x y))
+            ((sc-is y control-stack)
+             (store-stack-tn y x))
+            (t
+             (move y x))))))
 
 (define-move-vop move :move
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type.  This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The MOVE-ARG VOP is used for moving descriptor values into another
 ;;; frame for argument or known value passing.
@@ -157,6 +161,117 @@
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
 
+;;; Use LDP/STP when possible
+(defun load-store-two-words (vop1 vop2)
+  (let ((register-sb (sb-or-lose 'sb!vm::registers))
+        used-load-tn)
+    (declare (notinline sb!c::vop-name)) ; too late
+    (labels ((register-p (tn)
+               (and (tn-p tn)
+                    (eq (sc-sb (tn-sc tn)) register-sb)))
+             (stack-p (tn)
+               (and (tn-p tn)
+                    (sc-is tn control-stack)))
+             (source (vop)
+               (tn-ref-tn (sb!c::vop-args  vop)))
+             (dest (vop)
+               (tn-ref-tn (sb!c::vop-results vop)))
+             (load-tn (vop)
+               (tn-ref-load-tn (sb!c::vop-args vop)))
+             (suitable-offsets-p (tn1 tn2)
+               (and (= (abs (- (tn-offset tn1)
+                               (tn-offset tn2)))
+                       1)
+                    (ldp-stp-offset-p (* (min (tn-offset tn1)
+                                              (tn-offset tn2))
+                                         n-word-bytes)
+                                      n-word-bits)))
+             (load-arg (x load-tn)
+               (sc-case x
+                 (null
+                  null-tn)
+                 ((constant immediate control-stack)
+                  (let ((tn (if (and used-load-tn
+                                     (location= used-load-tn
+                                                load-tn))
+                                tmp-tn
+                                load-tn)))
+                    (sc-case x
+                      (constant
+                       (load-constant vop1 x tn))
+                      (immediate
+                       (load-immediate vop1 x tn))
+                      (control-stack
+                       (load-stack vop1 x tn)))
+                    (setf used-load-tn tn)
+                    tn))
+                 (t
+                  (setf used-load-tn x)
+                  x)))
+             (do-moves (source1 source2 dest1 dest2 &optional (fp cfp-tn))
+               (cond ((and (stack-p dest1)
+                           (stack-p dest2)
+                           (not (location= dest1 source1))
+                           (not (location= dest2 source2))
+                           (or (not (eq fp cfp-tn))
+                               (and (not (location= dest1 source2))
+                                    (not (location= dest2 source1))))
+                           (suitable-offsets-p dest1 dest2))
+                      (if (and (stack-p source1)
+                               (stack-p source2)
+                               (do-moves source1 source2
+                                 (load-tn vop1)
+                                 (if (location= (load-tn vop1) (load-tn vop2))
+                                     tmp-tn
+                                     (load-tn vop2))))
+                          (setf source1 (load-tn vop1)
+                                source2 (if (location= (load-tn vop1) (load-tn vop2))
+                                            tmp-tn
+                                            (load-tn vop2)))
+                          (setf source1 (load-arg source1 (load-tn vop1))
+                                source2 (load-arg source2 (load-tn vop2))))
+                      (assemble (*code-segment* vop1)
+                        (when (> (tn-offset dest1)
+                                 (tn-offset dest2))
+                          (rotatef dest1 dest2)
+                          (rotatef source1 source2))
+                        (inst stp source1 source2
+                              (@ fp (* (tn-offset dest1) n-word-bytes))))
+                      t)
+                     ((and (stack-p source1)
+                           (stack-p source2)
+                           (register-p dest1)
+                           (register-p dest2)
+                           (not (location= dest1 dest2))
+                           (suitable-offsets-p source1 source2))
+                      (assemble (*code-segment* vop1)
+                        (when (> (tn-offset source1)
+                                 (tn-offset source2))
+                          (rotatef dest1 dest2)
+                          (rotatef source1 source2))
+                        (inst ldp dest1 dest2
+                              (@ fp (* (tn-offset source1) n-word-bytes))))
+                      t))))
+      (case (sb!c::vop-name vop1)
+        (move
+         (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))
+        (sb!c::move-operand
+         (cond ((and (equal (sb!c::vop-codegen-info vop1)
+                            (sb!c::vop-codegen-info vop2))
+                     (memq (car (sb!c::vop-codegen-info vop1))
+                           '(load-stack store-stack)))
+                (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))))
+        (move-arg
+         (let ((fp1 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop1))))
+               (fp2 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop2))))
+               (dest1 (dest vop1))
+               (dest2 (dest vop2)))
+           (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)
+             (if (and (stack-p dest1)
+                      (stack-p dest2)
+                      (eq fp1 fp2))
+                 fp1
+                 cfp-tn))))))))
 
 
 ;;;; ILLEGAL-MOVE
@@ -213,8 +328,8 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "integer to untagged word coercion")
   (:generator 4
-    (inst tst x fixnum-tag-mask)
-    (inst b :ne BIGNUM )
+    #.(assert (= fixnum-tag-mask 1))
+    (inst tbnz x 0 BIGNUM)
     (sc-case y
       (signed-reg
        (inst asr y x n-fixnum-tag-bits))

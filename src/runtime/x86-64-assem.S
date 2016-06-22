@@ -95,40 +95,6 @@
 	.text
         .globl  GNAME(all_threads)
         
-	
-
-/* From lower to higher-numbered addresses, the stack contains 
- * return address, arg 0, arg 1, arg 2 ...
- * rax contains the address of the function to call
- * Lisp expects return value in rax, whic is already consistent with C
- * XXXX correct floating point handling is unimplemented so far
- * Based on comments cleaned from x86-assem.S, we believe that 
- * Lisp is expecting us to preserve rsi, rdi, rsp (no idea about r8-15)
- */
-	.text
-	.align	align_16byte,0x90
-	.globl  GNAME(call_into_c)
-	TYPE(GNAME(call_into_c))
-GNAME(call_into_c):
-	push	%rbp		# Save old frame pointer.
-	mov	%rsp,%rbp	# Establish new frame.
-
-	push	%rsi            # args are going in here
-	push	%rdi
-	mov	16(%rbp),%rdi
-	mov	24(%rbp),%rsi
-	mov	32(%rbp),%rdx
-	mov	40(%rbp),%rcx
-	mov	48(%rbp),%rcx
-	mov	56(%rbp),%r8
-	mov	64(%rbp),%r9
-	call	*%rax
-	mov	%rbp,%rsp
-	pop	%rbp
-	ret
-	SIZE(GNAME(call_into_c))
-
-
 	.text	
 	.globl  GNAME(call_into_lisp_first_time)
 	TYPE(GNAME(call_into_lisp_first_time))
@@ -392,7 +358,12 @@ GNAME(alloc_tramp):
 
 		
 /*
- * the closure trampoline
+ * the closure trampoline - entered when a global function is a closure
+ * and the function is called "by name" (normally, as when it is the
+ * head of a form) via an FDEFN. Register %RAX holds the fdefn address,
+ * but the simple-fun which underlies the closure expects %RAX to be the
+ * closure itself. So we grab the closure out of the fdefn pointed to,
+ * then jump to the simple-fun that the closure points to.
  */
 	.text
 	.align	align_16byte,0x90
@@ -400,12 +371,6 @@ GNAME(alloc_tramp):
 	TYPE(GNAME(closure_tramp))
 GNAME(closure_tramp):
 	mov	FDEFN_FUN_OFFSET(%rax),%rax
-	/* FIXME: The '*' after "jmp" in the next line is from PVE's
-	 * patch posted to the CMU CL mailing list Oct 6, 1999. It looks
-	 * reasonable, and it certainly seems as though if CMU CL needs it,
-	 * SBCL needs it too, but I haven't actually verified that it's
-	 * right. It would be good to find a way to force the flow of
-	 * control through here to test it. */
 	jmp	*CLOSURE_FUN_OFFSET(%rax)
 	SIZE(GNAME(closure_tramp))
 

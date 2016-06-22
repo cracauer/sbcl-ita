@@ -70,7 +70,8 @@
 (defvar *prev-segment*)
 (defvar *prev-vop*)
 
-(defun trace-instruction (segment vop inst args)
+(defun trace-instruction (segment vop inst &rest args)
+  (declare (dynamic-extent args))
   (let ((*standard-output* *compiler-trace-output*))
     (unless (eq *prev-segment* segment)
       (format t "in the ~A segment:~%" (sb!assem:segment-type segment))
@@ -85,9 +86,9 @@
       (setf *prev-vop* vop))
     (case inst
       (:label
-       (format t "~A:~%" args))
+       (format t "~A:~%" (car args)))
       (:align
-       (format t "~0,8T.align~0,8T~A~%" args))
+       (format t "~0,8T.align~0,8T~A~%" (car args)))
       (t
        (format t "~0,8T~A~@[~0,8T~{~A~^, ~}~]~%" inst args))))
   (values))
@@ -142,6 +143,86 @@
         *constant-vector*  nil
         *constant-table*   nil))
 
+;;; If a constant is already loaded into a register use that register.
+(defun optimize-constant-loads (component)
+  (let* ((register-sb (sb-or-lose 'sb!vm::registers))
+         (loaded-constants
+           (make-array (sb-size register-sb)
+                       :initial-element nil)))
+    (do-ir2-blocks (block component)
+      (fill loaded-constants nil)
+      (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+          ((null vop))
+        (labels ((register-p (tn)
+                   (and (tn-p tn)
+                        (eq (sc-sb (tn-sc tn)) register-sb)))
+                 (constant-eql-p (a b)
+                   (or (eq a b)
+                       (and (eq (sc-name (tn-sc a)) 'constant)
+                            (eq (tn-sc a) (tn-sc b))
+                            (eql (tn-offset a) (tn-offset b)))))
+                 (remove-constant (tn)
+                   (when (register-p tn)
+                     (setf (svref loaded-constants (tn-offset tn)) nil)))
+                 (remove-written-tns ()
+                   (cond ((memq (vop-info-save-p (vop-info vop))
+                                '(t :force-to-stack))
+                          (fill loaded-constants nil))
+                         (t
+                          (do ((ref (vop-results vop) (tn-ref-across ref)))
+                              ((null ref))
+                            (remove-constant (tn-ref-tn ref))
+                            (remove-constant (tn-ref-load-tn ref)))
+                          (do ((ref (vop-temps vop) (tn-ref-across ref)))
+                              ((null ref))
+                            (remove-constant (tn-ref-tn ref)))
+                          (do ((ref (vop-args vop) (tn-ref-across ref)))
+                              ((null ref))
+                            (remove-constant (tn-ref-load-tn ref))))))
+                 (compatible-scs-p (a b)
+                   (or (eql a b)
+                       (and (eq (sc-name a) 'sb!vm::control-stack)
+                            (eq (sc-name b) 'sb!vm::descriptor-reg))
+                       (and (eq (sc-name b) 'sb!vm::control-stack)
+                            (eq (sc-name a) 'sb!vm::descriptor-reg))))
+                 (find-constant-tn (constant sc)
+                   (loop for (saved-constant . tn) across loaded-constants
+                         when (and saved-constant
+                                   (constant-eql-p saved-constant constant)
+                                   (compatible-scs-p (tn-sc tn) sc))
+                         return tn)))
+          (case (vop-name vop)
+            ((move sb!vm::move-arg)
+             (let* ((args (vop-args vop))
+                    (x (tn-ref-tn args))
+                    (y (tn-ref-tn (vop-results vop)))
+                    constant)
+               (cond ((and (eq (vop-name vop) 'move)
+                           (location= x y))
+                      ;; Helps subsequent optimization of adjacent VOPs
+                      (delete-vop vop))
+                     ((or (eq (sc-name (tn-sc x)) 'null)
+                          (not (eq (tn-kind x) :constant)))
+                      (remove-written-tns))
+                     ((setf constant (find-constant-tn x (tn-sc y)))
+                      (when (register-p y)
+                        (setf (svref loaded-constants (tn-offset y))
+                              (cons x y)))
+                      ;; XOR is more compact on x86oids and many
+                      ;; RISCs have a zero register
+                      (unless (and (constant-p (tn-leaf x))
+                                   (eql (tn-value x) 0)
+                                   (register-p y))
+                        (setf (tn-ref-tn args) constant)
+                        (setf (tn-ref-load-tn args) nil)))
+                     ((register-p y)
+                      (setf (svref loaded-constants (tn-offset y))
+                            (cons x y)))
+                     (t
+                      (remove-written-tns)))))
+            (t
+             (remove-written-tns))))))))
+
 (defun generate-code (component)
   (when *compiler-trace-output*
     (format *compiler-trace-output*
@@ -186,11 +267,19 @@
       (do ((vop (ir2-block-start-vop block) (vop-next vop)))
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
-          (if gen
-            (funcall gen vop)
-            (format t
-                    "missing generator for ~S~%"
-                    (template-name (vop-info vop)))))))
+          (cond ((not gen)
+                 (format t
+                         "missing generator for ~S~%"
+                         (template-name (vop-info vop))))
+                #!+arm64
+                ((and (vop-next vop)
+                      (eq (vop-name vop)
+                          (vop-name (vop-next vop)))
+                      (memq (vop-name vop) '(move move-operand sb!vm::move-arg))
+                      (sb!vm::load-store-two-words vop (vop-next vop)))
+                 (setf vop (vop-next vop)))
+                (t
+                 (funcall gen vop))))))
     (sb!assem:append-segment *code-segment* *elsewhere*)
     (setf *elsewhere* nil)
     #!+inline-constants

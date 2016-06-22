@@ -33,7 +33,8 @@
    xref/8
    xref/12
    (sb-pcl::fast-method xref/10 (t t t t t t t t fixnum))
-   (sb-pcl::fast-method xref/11 (fixnum))))
+   (sb-pcl::fast-method xref/11 (fixnum))
+   (sb-pcl::fast-method xref/11 ((eql z)))))
 
 (define-xref-test who-calls.5
     (who-calls 'xref/3)
@@ -108,6 +109,9 @@
     (who-sets '*a*)
   (xref/2 xref/13))
 
+(define-xref-test who-sets.2
+    (who-sets '**global**)
+  (xref/16))
 
 (define-xref-test who-references.1
     (who-references '*a*)
@@ -117,6 +121,9 @@
     (who-references '+z+)
   (inline/1))
 
+(define-xref-test who-references.3
+    (who-references '**global**)
+  (xref/15))
 
 (define-xref-test who-calls.struct-slot.1
     (who-calls 'struct-slot)

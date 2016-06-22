@@ -158,13 +158,40 @@
 (fmakunbound 'make-load-form)
 (defgeneric make-load-form (object &optional environment))
 
-;; Link bootstrap-time how-to-dump-it information into the shiny new
-;; CLOS system.
-(defmethod make-load-form ((obj sb-sys:structure!object)
-                           &optional (env nil env-p))
-  (if env-p
-      (sb-sys:structure!object-make-load-form obj env)
-      (sb-sys:structure!object-make-load-form obj)))
+(defun !incorporate-cross-compiled-methods (gf-name &key except)
+  (assert (generic-function-p (fdefinition gf-name)))
+  (loop for (specializer lambda-list fmf source-loc)
+        across (remove-if (lambda (x) (member x except))
+                          (cdr (assoc gf-name *!trivial-methods*))
+                          :key #'car)
+        do (multiple-value-bind (specializers arg-info)
+               (ecase gf-name
+                 (print-object
+                  (values (list (find-class specializer) (find-class t))
+                          '(:arg-info (2))))
+                 (make-load-form
+                  (values (list (find-class specializer))
+                          '(:arg-info (1 . t)))))
+             (load-defmethod
+              'standard-method gf-name '() specializers lambda-list
+              `(:function
+                ,(let ((mf (%make-method-function fmf nil)))
+                   (sb-mop:set-funcallable-instance-function
+                    mf (method-function-from-fast-function fmf arg-info))
+                   mf)
+                plist ,arg-info simple-next-method-call t)
+              source-loc))))
+(!incorporate-cross-compiled-methods 'make-load-form :except '(layout))
+
+(defmethod make-load-form ((class class) &optional env)
+  ;; FIXME: should we not instead pass ENV to FIND-CLASS?  Probably
+  ;; doesn't matter while all our environments are the same...
+  (declare (ignore env))
+  (let ((name (class-name class)))
+    (if (and name (eq (find-class name nil) class))
+        `(find-class ',name)
+        (error "~@<Can't use anonymous or undefined class as constant: ~S~:@>"
+               class))))
 
 (defmethod make-load-form ((object layout) &optional env)
   (declare (ignore env))
@@ -176,6 +203,7 @@
         `(classoid-layout (find-classoid ',pname)))
       :ignore-it))
 
+;; FIXME: this seems wrong. NO-APPLICABLE-METHOD should be signaled.
 (defun dont-know-how-to-dump (object)
   (error "~@<don't know how to dump ~S (default ~S method called).~>"
          object 'make-load-form))
@@ -188,38 +216,7 @@
   (define-default-make-load-form-method standard-object)
   (define-default-make-load-form-method condition))
 
-(defmethod make-load-form ((object sb-impl::comma) &optional env)
-  (declare (ignore object env))
-  :sb-just-dump-it-normally)
-
-;; Note that it is possible to produce structure dumping code which yields
-;; illegal slot values in the resurrected structure, violating the assumption
-;; throughout the compiler that slot readers are always safe unless
-;; dictated otherwise by the SAFE-P flag in the DSD.
-;; * (defstruct S a (b (error "Must supply me") :type symbol))
-;; * (defmethod make-load-form ((x S) &optional e) (m-l-f-s-s x :slot-names '(a)))
-;; After these definitions, a dumped S will have 0 in slot B.
-;;
-(defun make-load-form-saving-slots (object &key (slot-names nil slot-names-p) environment)
-  (declare (ignore environment))
-  (if (typep object 'structure-object)
-      (values `(allocate-instance (find-class ',(class-name (class-of object))))
-              `(setf ,@(sb-kernel::structure-obj-slot-saving-forms
-                        object slot-names slot-names-p)))
-      (let* ((class (class-of object))
-             (inits
-              (mapcan
-               (lambda (slot)
-                 (let ((slot-name (slot-definition-name slot)))
-                   (when (if slot-names-p
-                             (memq slot-name slot-names)
-                             (eq :instance (slot-definition-allocation slot)))
-                     (list (if (slot-boundp-using-class class object slot)
-                               `(setf (slot-value ,object ',slot-name)
-                                      ',(slot-value-using-class class object slot))
-                               ;; Why is this needed? Is it not specified that
-                               ;; everything defaults to unbound?
-                               `(slot-makunbound ,object ',slot-name))))))
-               (class-slots class))))
-        (values `(allocate-instance (find-class ',(class-name class)))
-                `(progn ,@inits)))))
+sb-impl::
+(defmethod make-load-form ((host (eql *physical-host*)) &optional env)
+  (declare (ignore env))
+  '*physical-host*)

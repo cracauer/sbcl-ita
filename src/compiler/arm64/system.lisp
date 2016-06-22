@@ -39,8 +39,7 @@
     ;; have a pointer object instead, in which case we need to do more
     ;; work.  Check for a pointer type, set two low-bits.
 
-    (inst tst object #b10)
-    (inst b :eq done)
+    (inst tbz object 1 done)
     ;; If we have a pointer type, we need to compute a different
     ;; answer.  For lists and instances, we just need the lowtag.  For
     ;; functions and "other", we need to load the widetag from the
@@ -54,19 +53,27 @@
     ;; OTHER-POINTER-LOWTAG are both in the upper half of the lowtag
     ;; space, while LIST-POINTER-LOWTAG and INSTANCE-POINTER-LOWTAG
     ;; are in the lower half, so we distinguish with a bit test.
-    (inst tst object 8)
-    (inst b :eq done)
+    (inst tbz object 3 done)
+
     ;; We can't use both register and immediate offsets in the same
     ;; load/store instruction, so we need to bias our register offset
     ;; on big-endian systems.
-    (when (eq *backend-byte-order* :big-endian)
-      (inst sub result result (1- n-word-bytes)))
+    #!+big-endian
+    (inst sub result result (1- n-word-bytes))
 
     ;; And, finally, pick out the widetag from the header.
     (inst neg result result)
     (inst ldrb result (@ object result))
     done))
 
+(define-vop (%other-pointer-widetag)
+  (:translate %other-pointer-widetag)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (load-type result object (- other-pointer-lowtag))))
 
 (define-vop (fun-subtype)
   (:translate fun-subtype)
@@ -126,10 +133,6 @@
       (any-reg
        (inst orr t1 t1 (lsl data (- n-widetag-bits n-fixnum-tag-bits))))
       (immediate
-       ;; FIXME: This will break if DATA has bits spread over more
-       ;; than an eight bit range aligned on an even bit position.
-       ;; See SYS:SRC;COMPILER;ARM;MOVE.LISP for a partial fix...  And
-       ;; maybe it should be promoted to an instruction-macro?
        (inst orr t1 t1 (logical-mask (ash (tn-value data) n-widetag-bits)))))
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
@@ -182,9 +185,8 @@
   (:generator 10
     (loadw ndescr code 0 other-pointer-lowtag)
     (inst lsr ndescr ndescr n-widetag-bits)
-    (inst lsl ndescr ndescr word-shift)
-    (inst sub ndescr ndescr other-pointer-lowtag)
-    (inst add sap code ndescr)))
+    (inst add sap code (lsl ndescr word-shift))
+    (inst sub sap sap other-pointer-lowtag)))
 
 (define-vop (compute-fun)
   (:args (code :scs (descriptor-reg))

@@ -97,6 +97,10 @@
   (declare (ignore a))
   (xref/2))
 
+(defmethod xref/11 ((a (eql 'z)))
+  (declare (ignore a))
+  (xref/2))
+
 (defmethod xref/11 ((a float))
   (declare (ignore a))
   (xref/3))
@@ -122,6 +126,14 @@
 
 (defun xref/14 ()
   *a*)
+
+(sb-ext:defglobal **global** 31)
+
+(defun xref/15 ()
+  **global**)
+
+(defun xref/16 (x)
+  (setf **global** x))
 
 ;; calling a function in a macro body
 (defmacro macro/1 ()

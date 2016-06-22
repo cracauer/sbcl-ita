@@ -40,41 +40,6 @@
     (format stream "~S ~S, ~D" (meta-info-category x) (meta-info-kind x)
             (meta-info-number x))))
 
-(!begin-collecting-cold-init-forms)
-#!+sb-show (!cold-init-forms (/show0 "early in globaldb.lisp cold init"))
-
-;;; This is sorta semantically equivalent to SXHASH, but better-behaved for
-;;; legal function names. It performs more work by not cutting off as soon
-;;; in the CDR direction, thereby improving the distribution of method names.
-;;; More work here equates to less work in the global hashtable.
-;;; To wit: (eq (sxhash '(foo a b c bar)) (sxhash '(foo a b c d))) => T
-;;; but the corresponding globaldb-sxhashoids differ.
-;;; This is no longer inline because for the cases where it is needed -
-;;; names which are not just symbols or (SETF F) - an extra call has no impact.
-(defun globaldb-sxhashoid (name)
-  ;; we can't use MIX because it's in 'target-sxhash',
-  ;; so use the host's sxhash, but ensure that the result is a target fixnum.
-  #+sb-xc-host (logand (sxhash name) sb!xc:most-positive-fixnum)
-  #-sb-xc-host
-  (locally
-      (declare (optimize (safety 0))) ; after the argc check
-    ;; TRAVERSE will walk across more cons cells than RECURSE will descend.
-    ;; That's why this isn't just one self-recursive function.
-    (labels ((traverse (accumulator x length-limit)
-               (declare (fixnum length-limit))
-               (cond ((atom x) (sb!int:mix (sxhash x) accumulator))
-                     ((zerop length-limit) accumulator)
-                     (t (traverse (sb!int:mix (recurse (car x) 4) accumulator)
-                                  (cdr x) (1- length-limit)))))
-             (recurse (x depthoid) ; depthoid = a blend of level and length
-               (declare (fixnum depthoid))
-               (cond ((atom x) (sxhash x))
-                     ((zerop depthoid)
-                      #.(logand sb!xc:most-positive-fixnum #36Rglobaldbsxhashoid))
-                     (t (sb!int:mix (recurse (car x) (1- depthoid))
-                                    (recurse (cdr x) (1- depthoid)))))))
-      (traverse 0 name 10))))
-
 ;;; Given any non-negative integer, return a prime number >= to it.
 ;;;
 ;;; FIXME: This logic should be shared with ALMOST-PRIMIFY in
@@ -101,7 +66,6 @@
 ;;; sources partway through bootstrapping, tch tch, overwriting its
 ;;; version with our version would be unlikely to help, because that
 ;;; would make the cross-compiler very confused.)
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
 (defun !register-meta-info (metainfo)
   (let* ((name (meta-info-kind metainfo))
          (list (!get-meta-infos name)))
@@ -123,8 +87,6 @@
            (!make-meta-info id category kind type-spec type-checker
                             validate-function default)))))
 
-) ; EVAL-WHEN
-
 #-sb-xc
 (setf (get '!%define-info-type :sb-cold-funcall-handler/for-effect)
       (lambda (category kind type-spec checker validator default id)
@@ -142,12 +104,6 @@
             :category category :kind kind :type-spec type-spec
             :type-checker checker :validate-function validator
             :default default :number id)))))
-
-(!cold-init-forms
- (dovector (x (the simple-vector *info-types*))
-   ;; Genesis writes the *INFO-TYPES* array, but setting up the mapping
-   ;; from keyword-pair to object is deferred until cold-init.
-   (when x (!register-meta-info x))))
 
 ;;;; info types, and type numbers, part II: what's
 ;;;; needed only at compile time, not at run time
@@ -181,30 +137,16 @@
   ;; There was formerly a remark that (COPY-TREE TYPE-SPEC) ensures repeatable
   ;; fasls. That's not true now, probably never was. A compiler is permitted to
   ;; coalesce EQUAL quoted lists and there's no defense against it, so why try?
-  (let ((form
-         `(!%define-info-type
+  `(!%define-info-type
            ,category ,kind ',type-spec
-           ,(cond ((eq type-spec 't) '#'identity)
-                  ;; evil KLUDGE to avoid "undefined type" warnings
-                  ;; when building the cross-compiler.
-                  #+sb-xc-host
-                  ((member type-spec
-                           '((or fdefn null)
-                             (or alien-type null) (or heap-alien-info null))
-                           :test 'equal)
-                   `(lambda (x)
-                      (declare (notinline typep))
-                      (if (typep x ',type-spec)
-                          x
-                          (error "~S is not a ~S" x ',type-spec))))
-                  (t
-                   `(named-lambda "check-type" (x) (the ,type-spec x))))
+           ,(if (eq type-spec 't)
+                '#'identity
+                `(named-lambda "check-type" (x) (the ,type-spec x)))
            ,validate-function ,default
            ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
            ,(or (and (eq category :function) (eq kind :definition)
                      +fdefn-info-num+)
                 #+sb-xc (meta-info-number (meta-info category kind))))))
-    `(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute) ,form))))
 
 
 (macrolet ((meta-info-or-lose (category kind)
@@ -269,9 +211,12 @@
 
 ;;;; *INFO-ENVIRONMENT*
 
-(!cold-init-forms
-  (setq *info-environment* (make-info-hashtable))
-  (/show0 "done setting *INFO-ENVIRONMENT*"))
+(defun !globaldb-cold-init ()
+  ;; Genesis writes the *INFO-TYPES* array, but setting up the mapping
+  ;; from keyword-pair to object is deferred until cold-init.
+  (dovector (x (the simple-vector *info-types*))
+    (when x (!register-meta-info x)))
+  (setq *info-environment* (make-info-hashtable)))
 
 ;;;; GET-INFO-VALUE
 
@@ -314,25 +259,6 @@
       (when hookp
         (funcall (truly-the function (cdr hook)) name info-number answer nil))
       (values answer nil))))
-
-;; interface to %ATOMIC-SET-INFO-VALUE
-;; GET-INFO-VALUE-INITIALIZING is a restricted case of this,
-;; and perhaps could be implemented as such.
-;; Atomic update will be important for making the fasloader threadsafe
-;; using a predominantly lock-free design, and other nice things.
-(def!macro atomic-set-info-value (category kind name lambda)
-  (with-unique-names (info-number proc)
-    `(let ((,info-number
-            ,(if (and (keywordp category) (keywordp kind))
-                 (meta-info-number (meta-info category kind))
-                 `(meta-info-number (meta-info ,category ,kind)))))
-       ,(if (and (listp lambda) (eq (car lambda) 'lambda))
-            ;; rewrite as FLET because the compiler is unable to dxify
-            ;;   (DX-LET ((x (LAMBDA <whatever>))) (F x))
-            (destructuring-bind (lambda-list . body) (cdr lambda)
-              `(dx-flet ((,proc ,lambda-list ,@body))
-                 (%atomic-set-info-value ,name ,info-number #',proc)))
-            `(%atomic-set-info-value ,name ,info-number ,lambda)))))
 
 ;; Call FUNCTION once for each Name in globaldb that has information associated
 ;; with it, passing the function the Name as its only argument.
@@ -379,24 +305,6 @@
 
 (declaim (ftype (sfunction (t) ctype)
                 specifier-type ctype-of sb!kernel::ctype-of-array))
-
-;;; The type specifier for this function, or a DEFSTRUCT-DESCRIPTION.
-;;; If a DD, it must contain a constructor whose name is
-;;; the one being sought in globaldb.
-;;; The DD can be used to derive the constructor's type signature.
-(define-info-type (:function :type)
-  :type-spec (or ctype defstruct-description)
-  ;; Again [as in (DEFINE-INFO-TYPE (:FUNCTION :TYPE) ...)] it's
-  ;; not clear how to generalize the FBOUNDP expression to the
-  ;; cross-compiler. -- WHN 19990330
-  :default
-  ;; Delay evaluation of (SPECIFIER-TYPE) since it can't work yet
-  #+sb-xc-host (lambda (x) (declare (ignore x)) (specifier-type 'function))
-  #-sb-xc-host (lambda (name)
-                 (if (fboundp name)
-                     (handler-bind ((style-warning #'muffle-warning))
-                       (specifier-type (sb!impl::%fun-type (fdefinition name))))
-                     (specifier-type 'function))))
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
@@ -450,6 +358,13 @@
 ;;; expansion is inhibited.
 ;;; As an exception, a cons of two atoms represents structure metadata
 ;;; which is recognized and transformed in a stylized way.
+;;;
+;;; This item is almost mutually exclusive with an inline expansion,
+;;; but both are possible in the rare case of a system-defined transform
+;;; that may decline to expand. If it does, an inline expansion could win.
+;;; We don't actually have anything like that any more though.
+;;; For user-defined functions, the invariant is maintained that at most
+;;; one of :source-transform and an inline-expansion exist.
 (define-info-type (:function :source-transform)
   :type-spec (or function null (cons atom atom)))
 
@@ -495,8 +410,10 @@
 ;;; the declared type for this variable
 (define-info-type (:variable :type)
   :type-spec ctype
-  ;; This gets set to *UNIVERSAL-TYPE* in 'late-type'
-  :default (lambda (x) (declare (ignore x)) (error "Too early for INFO")))
+  :default #+sb-xc-host (lambda (x)
+                          (declare (special *universal-type*) (ignore x))
+                          *universal-type*)
+           #-sb-xc-host *universal-type*)
 
 ;;; where this type and kind information came from
 (define-info-type (:variable :where-from)
@@ -585,34 +502,6 @@
 ;;; The classoid-cell for this type
 (define-info-type (:type :classoid-cell) :type-spec t)
 
-(defun find-classoid-cell (name &key create)
-  (let ((real-name (uncross name)))
-    (cond ((info :type :classoid-cell real-name))
-          (create
-           (get-info-value-initializing
-            :type :classoid-cell real-name
-            (sb!kernel::make-classoid-cell real-name))))))
-
-;;; Return the classoid with the specified NAME. If ERRORP is false,
-;;; then NIL is returned when no such class exists.
-(defun find-classoid (name &optional (errorp t))
-  (declare (type symbol name))
-  (let ((cell (find-classoid-cell name)))
-    (cond ((and cell (classoid-cell-classoid cell)))
-          (errorp
-           (error 'simple-type-error
-                  :datum nil
-                  :expected-type 'class
-                  :format-control "Class not yet defined: ~S"
-                  :format-arguments (list name))))))
-
-;;; layout for this type being used by the compiler
-(define-info-type (:type :compiler-layout)
-  :type-spec (or layout null)
-  :default (lambda (name)
-             (let ((class (find-classoid name nil)))
-               (when class (classoid-layout class)))))
-
 ;;; DEFTYPE lambda-list
 ;; FIXME: remove this after making swank-fancy-inspector not use it.
 (define-info-type (:type :lambda-list) :type-spec t)
@@ -663,10 +552,9 @@
 (define-info-type (:alien-type :enum) :type-spec (or alien-type null))
 
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
-(define-info-type (:setf :inverse) :type-spec (or symbol null))
 (define-info-type (:setf :documentation) :type-spec (or string null))
 (define-info-type (:setf :expander)
-    :type-spec (or function (cons integer function) null))
+    :type-spec (or symbol function (cons integer function) null))
 
 ;;;; ":CAS" subsection - Like SETF but there are no "inverses", just expanders
 (define-info-type (:cas :expander) :type-spec (or function null))
@@ -712,5 +600,3 @@
                      (list (meta-info-category type) (meta-info-kind type))))
          (write val :level 1)))
      sym)))
-
-(!defun-from-collected-cold-init-forms !globaldb-cold-init)

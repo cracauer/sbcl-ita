@@ -216,18 +216,27 @@
   '(integer-decode-double-float x))
 
 (deftransform scale-float ((f ex) (single-float *) *)
-  (if (and #!+x86 t #!-x86 nil
-           (csubtypep (lvar-type ex)
-                      (specifier-type '(signed-byte 32))))
-      '(coerce (%scalbn (coerce f 'double-float) ex) 'single-float)
-      '(scale-single-float f ex)))
+  (cond #!+x86
+        ((csubtypep (lvar-type ex)
+                    (specifier-type '(signed-byte 32)))
+         '(coerce (%scalbn (coerce f 'double-float) ex) 'single-float))
+        (t
+         '(scale-single-float f ex))))
 
 (deftransform scale-float ((f ex) (double-float *) *)
-  (if (and #!+x86 t #!-x86 nil
-           (csubtypep (lvar-type ex)
-                      (specifier-type '(signed-byte 32))))
-      '(%scalbn f ex)
-      '(scale-double-float f ex)))
+  (cond #!+x86
+        ((csubtypep (lvar-type ex)
+                    (specifier-type '(signed-byte 32)))
+         '(%scalbn f ex))
+        (t
+         '(scale-double-float f ex))))
+
+;;; Given a number X, create a form suitable as a bound for an
+;;; interval. Make the bound open if OPEN-P is T. NIL remains NIL.
+;;; FIXME: as this is a constructor, shouldn't it be named MAKE-BOUND?
+#!-sb-fluid (declaim (inline set-bound))
+(defun set-bound (x open-p)
+  (if (and x open-p) (list x) x))
 
 ;;; What is the CROSS-FLOAT-INFINITY-KLUDGE?
 ;;;
@@ -306,10 +315,10 @@
                            :high new-hi)))))
 (defoptimizer (scale-single-float derive-type) ((f ex))
   (two-arg-derive-type f ex #'scale-float-derive-type-aux
-                       #'scale-single-float t))
+                       #'scale-single-float))
 (defoptimizer (scale-double-float derive-type) ((f ex))
   (two-arg-derive-type f ex #'scale-float-derive-type-aux
-                       #'scale-double-float t))
+                       #'scale-double-float))
 
 ;;; DEFOPTIMIZERs for %SINGLE-FLOAT and %DOUBLE-FLOAT. This makes the
 ;;; FLOAT function return the correct ranges if the input has some
@@ -752,6 +761,13 @@
                               (fp-pos-zero-p arg-hi)))))))))
 (eval-when (:compile-toplevel :execute)
   (setf *read-default-float-format* 'single-float))
+
+;;; The basic interval type. It can handle open and closed intervals.
+;;; A bound is open if it is a list containing a number, just like
+;;; Lisp says. NIL means unbounded.
+(defstruct (interval (:constructor %make-interval (low high))
+                     (:copier nil))
+  low high)
 
 #-sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (progn
@@ -1612,6 +1628,7 @@
 
 #-sb-xc-host
 (defun %unary-ftruncate/single (x)
+  (declare (muffle-conditions t))
   (declare (type single-float x))
   (declare (optimize speed (safety 0)))
   (let* ((bits (single-float-bits x))
@@ -1630,6 +1647,7 @@
 
 #-sb-xc-host
 (defun %unary-ftruncate/double (x)
+  (declare (muffle-conditions t))
   (declare (type double-float x))
   (declare (optimize speed (safety 0)))
   (let* ((high (double-float-high-bits x))

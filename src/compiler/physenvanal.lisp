@@ -251,40 +251,39 @@
 (defvar *functional-escape-info*)
 
 (defun functional-may-escape-p (functional)
-  (let ((table *functional-escape-info*))
-    (unless table
-      ;; Many components never need the table since they have no escapes -- so
-      ;; we allocate it lazily.
-      (setf table (make-hash-table)
-            *functional-escape-info* table))
-    (multiple-value-bind (bool ok) (gethash functional table)
-      (if ok
-          bool
-          (let ((entry (functional-entry-fun functional)))
-            ;; First stick a NIL in there: break cycles.
-            (setf (gethash functional table) nil)
-            ;; Then compute the real value.
-            (setf (gethash functional table)
-                  (or
-                   ;; If the functional has a XEP, it's kind is :EXTERNAL --
-                   ;; which means it may escape. ...but if it
-                   ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
-                   ;; TL-XEP, which means it's a toplevel function -- which in
-                   ;; turn means our search has bottomed out without an escape
-                   ;; path. AVER just to make sure, though.
-                   (and (eq :external (functional-kind functional))
-                        (if (functional-has-external-references-p functional)
-                            (aver (eq 'tl-xep (car (functional-debug-name functional))))
-                            t))
-                   ;; If it has an entry point that may escape, that just as bad.
-                   (and entry (functional-may-escape-p entry))
-                   ;; If it has references to it in functions that may escape, that's bad
-                   ;; too.
-                   (dolist (ref (functional-refs functional) nil)
-                     (let* ((lvar (ref-lvar ref))
-                            (dest (when lvar (lvar-dest lvar))))
-                       (when (functional-may-escape-p (node-home-lambda dest))
-                         (return t)))))))))))
+  (binding* ((table (or *functional-escape-info*
+                        ;; Many components have no escapes, so we
+                        ;; allocate it lazily.
+                        (setf *functional-escape-info*
+                              (make-hash-table))))
+             ((bool ok) (gethash functional table)))
+    (if ok
+        bool
+        (let ((entry (functional-entry-fun functional)))
+          ;; First stick a NIL in there: break cycles.
+          (setf (gethash functional table) nil)
+          ;; Then compute the real value.
+          (setf (gethash functional table)
+                (or
+                 ;; If the functional has a XEP, it's kind is :EXTERNAL --
+                 ;; which means it may escape. ...but if it
+                 ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
+                 ;; TL-XEP, which means it's a toplevel function -- which in
+                 ;; turn means our search has bottomed out without an escape
+                 ;; path. AVER just to make sure, though.
+                 (and (eq :external (functional-kind functional))
+                      (if (functional-has-external-references-p functional)
+                          (aver (eq 'tl-xep (car (functional-debug-name functional))))
+                          t))
+                 ;; If it has an entry point that may escape, that just as bad.
+                 (and entry (functional-may-escape-p entry))
+                 ;; If it has references to it in functions that may escape, that's bad
+                 ;; too.
+                 (dolist (ref (functional-refs functional) nil)
+                   (binding* ((lvar (ref-lvar ref) :exit-if-null)
+                              (dest (lvar-dest lvar) :exit-if-null))
+                     (when (functional-may-escape-p (node-home-lambda dest))
+                       (return t))))))))))
 
 (defun exit-should-check-tag-p (exit)
   (declare (type exit exit))
@@ -597,7 +596,7 @@
               (setf (node-tail-p use) t)))))))
   ;; The above loop does not find all calls to ERROR.
   (do-blocks (block component)
-    (do-nodes (node lvar block)
+    (do-nodes (node nil block)
       ;; CAUTION: This looks scary because it affects all known nil-returning
       ;; calls even if not in tail position. Use of the policy quality which
       ;; enables tail-p must be confined to a very restricted lexical scope.

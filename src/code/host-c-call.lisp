@@ -29,7 +29,8 @@
 (defun c-string-external-format (type)
   (let ((external-format (alien-c-string-type-external-format type)))
     (if (eq external-format :default)
-        (default-c-string-external-format)
+        #+sb-xc-host (bug "No default c-string-external-format")
+        #-sb-xc-host (default-c-string-external-format)
         external-format)))
 
 (define-alien-type-method (c-string :unparse) (type)
@@ -78,6 +79,7 @@
 
 (declaim (ftype (sfunction (t) nil) null-error))
 (defun null-error (type)
+  #-sb-xc-host(declare (optimize sb!kernel:allow-non-returning-tail-call))
   (aver (alien-c-string-type-not-null type))
   (error 'type-error
          :expected-type `(alien ,(unparse-alien-type type))

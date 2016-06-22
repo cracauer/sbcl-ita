@@ -498,7 +498,7 @@ check_pending_thruptions(os_context_t *ctx)
     if (ctx) fake_foreign_function_call(ctx);
 #else
     sigset_t oldset;
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 #endif
 
     funcall0(StaticSymbolFunction(RUN_INTERRUPTION));
@@ -573,7 +573,7 @@ check_pending_gc(os_context_t *ctx)
             lispobj gc_happened = NIL;
 
             bind_variable(IN_SAFEPOINT,T,self);
-            block_deferrable_signals(NULL,&sigset);
+            block_deferrable_signals(&sigset);
             if(SymbolTlValue(GC_PENDING,self)==T)
                 gc_happened = funcall0(StaticSymbolFunction(SUB_GC));
             unbind(self);
@@ -805,7 +805,7 @@ wake_thread_posix(os_thread_t os_thread)
     /* We are not in a signal handler here, so need to block signals
      * manually. */
     sigset_t oldset;
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 
     gc_state_lock();
     if (gc_state.phase == GC_NONE) {
@@ -898,7 +898,7 @@ thruption_handler(int signal, siginfo_t *info, os_context_t *ctx)
     /* In C code.  As a rule, we assume that running thruptions is OK. */
     *self->csp_around_foreign_call = 0;
     thread_in_lisp_raised(ctx);
-    *self->csp_around_foreign_call = transition_sp;
+    *self->csp_around_foreign_call = (intptr_t) transition_sp;
 }
 # endif
 

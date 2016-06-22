@@ -80,6 +80,8 @@
   (destructuring-bind (decl &rest names) spec
     (ecase decl
       (disable-package-locks
+       ;; Why are we using EQUAL here if the only way to disable the
+       ;; lock on (SETF CAR) is to list the name CAR and not (SETF CAR)?
        (union old names :test #'equal))
       (enable-package-locks
        (set-difference old names :test #'equal)))))
@@ -109,6 +111,10 @@
         (setf (info :variable :always-bound name) info-value)
         (setf (info :variable :kind name) info-value))))
 
+(defun type-proclamation-mismatch-warn (name old new &optional description)
+  (warn 'type-proclamation-mismatch-warning
+        :name name :old old :new new :description description))
+
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
     (error "Cannot proclaim TYPE of a non-symbol: ~S" name))
@@ -123,13 +129,17 @@
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
 
+(defun ftype-proclamation-mismatch-warn (name old new &optional description)
+  (warn 'ftype-proclamation-mismatch-warning
+        :name name :old old :new new :description description))
+
 (defun proclaim-ftype (name type-oid type-specifier where-from)
   (declare (type (or ctype defstruct-description) type-oid))
   (unless (legal-fun-name-p name)
     (error "Cannot declare FTYPE of illegal function name ~S" name))
   (when (and (ctype-p type-oid)
              (not (csubtypep type-oid (specifier-type 'function))))
-    (error "Not a function type: ~S" (type-specifier type-oid)))
+    (error "Not a function type: ~/sb!impl:print-type/" type-oid))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
     (when (eq (info :function :where-from name) :declared)

@@ -29,29 +29,6 @@
       (combination-step-info node)
       nil))
 
-;;; If there is any CHECK-xxx template for TYPE, then return it,
-;;; otherwise return NIL.
-(defun type-check-template (type)
-  (declare (type ctype type))
-  (multiple-value-bind (check-ptype exact) (primitive-type type)
-    (if exact
-        (primitive-type-check check-ptype)
-        (let ((name (hairy-type-check-template-name type)))
-          (if name
-              (template-or-lose name)
-              nil)))))
-
-;;; Emit code in BLOCK to check that VALUE is of the specified TYPE,
-;;; yielding the checked result in RESULT. VALUE and result may be of
-;;; any primitive type. There must be CHECK-xxx VOP for TYPE. Any
-;;; other type checks should have been converted to an explicit type
-;;; test.
-(defun emit-type-check (node block value result type)
-  (declare (type tn value result) (type node node) (type ir2-block block)
-           (type ctype type))
-  (emit-move-template node block (type-check-template type) value result)
-  (values))
-
 ;;; Allocate an indirect value cell.
 (defevent make-value-cell-event "Allocate heap value cell for lexical var.")
 (defun emit-make-value-cell (node block value res)
@@ -61,7 +38,7 @@
 ;;;; leaf reference
 
 ;;; Return the TN that holds the value of THING in the environment ENV.
-(declaim (ftype (function ((or nlx-info lambda-var clambda) physenv) tn)
+(declaim (ftype (sfunction ((or nlx-info lambda-var clambda) physenv) tn)
                 find-in-physenv))
 (defun find-in-physenv (thing physenv)
   (or (cdr (assoc thing (ir2-physenv-closure (physenv-info physenv))))
@@ -562,27 +539,6 @@
           dest))
   (values))
 
-;;; Move each SRC TN into the corresponding DEST TN, checking types
-;;; and defaulting any unsupplied source values to NIL
-(defun move-results-checked (node block src dest types)
-  (declare (type node node) (type ir2-block block) (list src dest types))
-  (let ((nsrc (length src))
-        (ndest (length dest))
-        (ntypes (length types)))
-    (mapc (lambda (from to type)
-            (if type
-                (emit-type-check node block from to type)
-                (emit-move node block from to)))
-          (if (> ndest nsrc)
-              (append src (make-list (- ndest nsrc)
-                                     :initial-element (emit-constant nil)))
-              src)
-          dest
-          (if (> ndest ntypes)
-              (append types (make-list (- ndest ntypes)))
-              types)))
-  (values))
-
 ;;; If necessary, emit coercion code needed to deliver the RESULTS to
 ;;; the specified lvar. NODE and BLOCK provide context for emitting
 ;;; code. Although usually obtained from STANDARD-RESULT-TNs or
@@ -621,27 +577,26 @@
              (2lvar (lvar-info lvar))
              (value (cast-value node))
              (2value (lvar-info value)))
-    (cond ((eq (ir2-lvar-kind 2lvar) :unused))
-          ((eq (ir2-lvar-kind 2lvar) :unknown)
-           (aver (eq (ir2-lvar-kind 2value) :unknown))
-           (aver (not (cast-type-check node)))
-           (move-results-coerced node block
-                                 (ir2-lvar-locs 2value)
-                                 (ir2-lvar-locs 2lvar)))
-          ((eq (ir2-lvar-kind 2lvar) :fixed)
-           (aver (eq (ir2-lvar-kind 2value) :fixed))
-           (if (cast-type-check node)
-               (move-results-checked node block
-                                     (ir2-lvar-locs 2value)
-                                     (ir2-lvar-locs 2lvar)
-                                     (multiple-value-bind (check types)
-                                         (cast-check-types node nil)
-                                       (aver (eq check :simple))
-                                       types))
-               (move-results-coerced node block
-                                     (ir2-lvar-locs 2value)
-                                     (ir2-lvar-locs 2lvar))))
-          (t (bug "CAST cannot be :DELAYED.")))))
+    (ecase (ir2-lvar-kind 2lvar)
+      (:unused)
+      ((:unknown :fixed)
+       (aver (not (cast-type-check node)))
+       (move-results-coerced node block
+                             (ir2-lvar-locs 2value)
+                             (ir2-lvar-locs 2lvar))))))
+
+(defoptimizer (%check-bound ir2-convert)
+    ((array bound index) node block)
+  (when (constant-lvar-p bound)
+    (let* ((bound-type (specifier-type `(integer 0 (,(lvar-value bound)))))
+           (index-type (lvar-type index)))
+      (when (eq (type-intersection bound-type index-type)
+                *empty-type*)
+        (let ((*compiler-error-context* node))
+          (compiler-warn "Derived type ~s is not a suitable index for ~s."
+                         (type-specifier index-type)
+                         (type-specifier (lvar-type array)))))))
+  (ir2-convert-template node block))
 
 ;;;; template conversion
 
@@ -729,9 +684,9 @@
                               (args-type-optional type))
                       (list type))))
          (primitive-t *backend-t-primitive-type*))
-    (loop for rtype in rtypes
-          for type = (or (pop types) primitive-t)
-          collect type)))
+    (mapcar (lambda (rtype)
+              (declare (ignore rtype))
+              (or (pop types) primitive-t)) rtypes)))
 
 ;;; Return a list of TNs usable in a CALL to TEMPLATE delivering values to
 ;;; LVAR. As an efficiency hack, we pick off the common case where the LVAR is
@@ -1181,6 +1136,19 @@
   (let* ((lvar (basic-combination-fun node))
          (fname (lvar-fun-name lvar t)))
     (declare (type (or symbol cons) fname))
+
+    ;; Warn about cross-compiling certain full-calls,
+    ;; as it is indicative of dependency order problems.
+    #+sb-xc-host
+    (let ((compname (component-name (node-component node))))
+      ;; Don't care too much about macro performance.
+      (unless (and (stringp compname) (string/= compname "DEFMACRO"))
+        ;; Catch FOO and (SETF FOO) both.
+        (let ((stem (if (atom fname) fname (second fname))))
+          (when (member stem
+                        sb-cold::*full-calls-to-warn-about*
+                        :test #'string=)
+            (warn "Full call to ~S" fname)))))
 
     (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
                                 (fun-lexically-notinline-p fname))))
@@ -1671,14 +1639,26 @@ not stack-allocated LVAR ~S." source-lvar)))))
 ;;; implementation.
 (defoptimizer (%special-bind ir2-convert) ((var value) node block)
   (let ((name (leaf-source-name (lvar-value var))))
-    #!-(and sb-thread x86-64)
-    (vop bind node block (lvar-tn node block value) (emit-constant name))
-    #!+(and sb-thread x86-64)
-    (progn
-      ;; GC must understand that the symbol is implicitly live even though
-      ;; binding makes no references to the object.
-      (emit-constant name)
-      (vop sb!vm::bind/let node block (lvar-tn node block value) name))))
+    ;; Emit either BIND or DYNBIND, preferring BIND if both exist.
+    ;; If only one exists, it's DYNBIND.
+    ;; Even if the backend supports load-time TLS index assignment,
+    ;; there might be only one vop (as with arm64).
+    (macrolet ((doit (bind dynbind)
+                 (if (gethash 'bind *backend-parsed-vops*) bind dynbind)))
+      (doit
+       (progn
+         ;; Inform later SYMBOL-VALUE calls that they can
+         ;; assume a nonzero tls-index.
+         ;; FIXME: setting INFO is inefficient when not actually
+         ;; changing anything
+         (unless (info :variable :wired-tls name)
+           (setf (info :variable :wired-tls name) :always-has-tls))
+         ;; We force the symbol into the code constants in case BIND
+         ;; does not actually reference it, as with x86.
+         (emit-constant name)
+         (vop bind node block (lvar-tn node block value) name))
+       (vop dynbind node block (lvar-tn node block value)
+            (emit-constant name))))))
 
 (defoptimizer (%special-unbind ir2-convert) ((var) node block)
   (declare (ignore var))
@@ -1703,7 +1683,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                               ;; CLHS says "bound and then made to have no value" -- user
                               ;; should not be able to tell the difference between that and this.
                               (about-to-modify-symbol-value var 'progv)
-                              (%primitive bind unbound-marker var))))
+                              (%primitive dynbind unbound-marker var))))
                         (,bind (vars vals)
                           (declare (optimize (speed 2) (debug 0)
                                              (insert-debug-catch 0)))
@@ -1713,7 +1693,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                                  (let ((val (car vals))
                                        (var (car vars)))
                                    (about-to-modify-symbol-value var 'progv val t)
-                                   (%primitive bind val var))
+                                   (%primitive dynbind val var))
                                  (,bind (cdr vars) (cdr vals))))))
                  (,bind ,vars ,vals))
                nil
@@ -1791,7 +1771,13 @@ not stack-allocated LVAR ~S." source-lvar)))))
   (let* ((2info (nlx-info-info info))
          (kind (cleanup-kind (nlx-info-cleanup info)))
          (block-tn (physenv-live-tn
-                    (make-normal-tn (primitive-type-or-lose 'catch-block))
+                    (make-normal-tn
+                     (primitive-type-or-lose
+                      (ecase kind
+                        (:catch
+                         'catch-block)
+                        ((:unwind-protect :block :tagbody)
+                         'unwind-block))))
                     (node-physenv node)))
          (res (make-stack-pointer-tn))
          (target-label (ir2-nlx-info-target 2info)))
@@ -1909,23 +1895,32 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 (macrolet ((def (name)
              `(defoptimizer (,name ir2-convert) ((&rest args) node block)
-                (let* ((refs (reference-tn-list
-                              (loop for arg in args
-                                    for tn = (make-normal-tn *backend-t-primitive-type*)
-                                    do
-                                    (emit-move node block (lvar-tn node block arg) tn)
-                                    collect tn)
-                              nil))
-                       (lvar (node-lvar node))
-                       (res (lvar-result-tns
-                             lvar
-                             (list (primitive-type (specifier-type 'list))))))
-                  (when (and lvar (lvar-dynamic-extent lvar))
-                    (vop current-stack-pointer node block
-                         (ir2-lvar-stack-pointer (lvar-info lvar))))
-                  (vop* ,name node block (refs) ((first res) nil)
-                        (length args))
-                  (move-lvar-result node block res lvar)))))
+                (cond #!+gencgc
+                      ((>= (length args)
+                           (/ sb!vm:large-object-size
+                              (* sb!vm:n-word-bytes 2)))
+                       ;; The VOPs will try to allocate all space at once
+                       ;; And it'll end up in large objects, and no conses
+                       ;; are welcome there.
+                       (ir2-convert-full-call node block))
+                      (t
+                       (let* ((refs (reference-tn-list
+                                     (loop for arg in args
+                                           for tn = (make-normal-tn *backend-t-primitive-type*)
+                                           do
+                                           (emit-move node block (lvar-tn node block arg) tn)
+                                           collect tn)
+                                     nil))
+                              (lvar (node-lvar node))
+                              (res (lvar-result-tns
+                                    lvar
+                                    (list (primitive-type (specifier-type 'list))))))
+                         (when (and lvar (lvar-dynamic-extent lvar))
+                           (vop current-stack-pointer node block
+                                (ir2-lvar-stack-pointer (lvar-info lvar))))
+                         (vop* ,name node block (refs) ((first res) nil)
+                               (length args))
+                         (move-lvar-result node block res lvar)))))))
   (def list)
   (def list*))
 

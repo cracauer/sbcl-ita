@@ -20,11 +20,6 @@
         name
         class)))
 
-(defun fun-name (x)
-  (if (typep x 'standard-generic-function)
-      (sb-pcl:generic-function-name x)
-      (%fun-name x)))
-
 ;;;; the ANSI interface to function names (and to other stuff too)
 ;;; Note: this function gets called by the compiler (as of 1.0.17.x,
 ;;; in MAYBE-INLINE-SYNTACTIC-CLOSURE), and so although ANSI says
@@ -56,7 +51,7 @@
     (sb-interpreter:interpreted-function
      (sb-interpreter:fun-lambda-expression fun))
     (function
-     (let* ((name (fun-name fun))
+     (let* ((name (%fun-name fun))
             (fun (%simple-fun-self (%fun-fun fun)))
             (code (sb-di::fun-code-header fun))
             (info (sb-kernel:%code-debug-info code))
@@ -251,7 +246,8 @@
 
 (defmethod describe-object ((x array) s)
   (print-standard-describe-header x s)
-  (format s "~%Element-type: ~S" (array-element-type x))
+  (format s "~%Element-type: ~/sb-impl:print-type-specifier/"
+          (array-element-type x))
   (if (vectorp x)
       (if (array-has-fill-pointer-p x)
           (format s "~%Fill-pointer: ~S~%Size: ~S"
@@ -403,7 +399,7 @@
                      (slots (dd-slots dd)))
                 (if slots
                     (format stream "~@:_Slots:~:{~@:_  ~S~
-                                    ~@:_    Type: ~A ~@[~A~]~
+                                    ~@:_    Type: ~/sb-impl:print-type-specifier/ ~@[~A~]~
                                     ~@:_    Initform: ~S~}"
                             (mapcar (lambda (dsd)
                                       (list
@@ -417,7 +413,7 @@
               (let ((slots (sb-mop:class-direct-slots class)))
                 (if slots
                     (format stream "~@:_Direct slots:~:{~@:_  ~S~
-                                    ~@[~@:_    Type: ~S~]~
+                                    ~@[~@:_    Type: ~/sb-impl:print-type-specifier/~]~
                                     ~@[~@:_    Allocation: ~S~]~
                                     ~@[~@:_    Initargs: ~{~S~^, ~}~]~
                                     ~@[~@:_    Initform: ~S~]~
@@ -507,8 +503,8 @@
       (pprint-indent :block 2 stream)
       (describe-deprecation 'variable name stream)
       (when (eq (info :variable :where-from name) :declared)
-        (format stream "~@:_Declared type: ~S"
-                (type-specifier (info :variable :type name))))
+        (format stream "~@:_Declared type: ~/sb-impl:print-type/"
+                (info :variable :type name)))
       (when (info :variable :always-bound name)
         (format stream "~@:_Declared always-bound."))
       (cond
@@ -535,6 +531,12 @@
         (*print-level* 24)
         (*print-length* 24))
     (format stream "~@:_Lambda-list: ~:A" lambda-list)))
+
+(defun describe-argument-precedence-order (argument-list stream)
+  (let ((*print-circle* nil)
+        (*print-level* 24)
+        (*print-length* 24))
+    (format stream "~@:_Argument precedence order: ~:A" argument-list)))
 
 (defun describe-function-source (function stream)
   (if (compiled-function-p (the function function))
@@ -567,7 +569,7 @@
               (format stream "~@:_Source file: ~A" namestring)))))))
 
 (defun describe-function (name function stream)
-  (let ((name (if function (fun-name function) name)))
+  (let ((name (if function (%fun-name function) name)))
     (if (not (or function (and (legal-fun-name-p name) (fboundp name))))
         ;; Not defined, but possibly the type is declared, or we have
         ;; compiled calls to it.
@@ -577,12 +579,11 @@
               (pprint-logical-block (stream nil)
                 (format stream "~%~A names an undefined function" name)
                 (pprint-indent :block 2 stream)
-                (format stream "~@:_~:(~A~) type: ~S"
-                        from
-                        (type-specifier (proclaimed-ftype name)))))))
+                (format stream "~@:_~:(~A~) type: ~/sb-impl:print-type/"
+                        from (proclaimed-ftype name))))))
         ;; Defined.
         (multiple-value-bind (fun what lambda-list derived-type declared-type
-                              inline methods)
+                              inline methods argument-precedence-order)
             (cond ((and (not function) (symbolp name) (special-operator-p name))
                    ;; The function in the symbol is irrelevant.
                    ;; Use the def-ir1-translator function for source location.
@@ -602,10 +603,6 @@
                           (from (and legal-name-p
                                      (info :function :where-from name)))
                           declared-type)
-                     ;; Ensure lazy pickup of information
-                     ;; from methods.
-                     (when legal-name-p
-                       (sb-c::maybe-update-info-for-gf name))
                      (cond ((not type))
                            ((eq from :declared)
                             (setf declared-type type))
@@ -622,7 +619,15 @@
                                  declared-type
                                  nil
                                  (or (sb-mop:generic-function-methods fun)
-                                     :none))
+                                     :none)
+                                 ;; Argument precedence order
+                                 ;; information is only interesting
+                                 ;; for two or more required
+                                 ;; parameters.
+                                 (let ((order (sb-mop:generic-function-argument-precedence-order
+                                               fun)))
+                                   (when (>= (length order) 2)
+                                     order)))
                          (values fun
                                  (if (compiled-function-p fun)
                                      "a compiled function"
@@ -640,11 +645,17 @@
               (pprint-indent :block 2 stream))
             (describe-deprecation 'function name stream)
             (describe-lambda-list lambda-list stream)
+            (when argument-precedence-order
+              (describe-argument-precedence-order argument-precedence-order stream))
             (when declared-type
-              (format stream "~@:_Declared type: ~S" declared-type))
+              (format stream "~@:_Declared type: ~
+                              ~/sb-impl:print-type-specifier/"
+                      declared-type))
             (when (and derived-type
                        (not (equal declared-type derived-type)))
-              (format stream "~@:_Derived type: ~S" derived-type))
+              (format stream "~@:_Derived type: ~
+                              ~/sb-impl:print-type-specifier/"
+                      derived-type))
             (describe-documentation name 'function stream)
             (when (car inline)
               (format stream "~@:_Inline proclamation: ~
@@ -685,12 +696,11 @@
       (terpri stream))
     (when (and (consp name) (eq 'setf (car name)) (not (cddr name)))
       (let* ((name2 (second name))
-             (inverse (info :setf :inverse name2))
              (expander (info :setf :expander name2)))
-        (cond (inverse
+        (cond ((typep expander '(and symbol (not null)))
                (pprint-logical-block (stream nil)
                  (format stream "~&~A has setf-expansion: ~S"
-                         name inverse)
+                         name expander)
                  (pprint-indent :block 2 stream)
                  (describe-documentation name2 'setf stream))
                (terpri stream))

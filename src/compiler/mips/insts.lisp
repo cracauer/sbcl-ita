@@ -9,7 +9,17 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB!MIPS-ASM")
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; Imports from this package into SB-VM
+  (import '(reg-tn-encoding) 'sb!vm)
+  ;; Imports from SB-VM into this package
+  (import '(;; SBs, SCs, and TNs
+            sb!vm::immediate-constant
+            sb!vm::registers sb!vm::float-registers
+            sb!vm::zero
+            sb!vm::lip-tn sb!vm::zero-tn)))
 
 (setf *assem-scheduler-p* t)
 (setf *assem-max-locations* 68)
@@ -19,8 +29,8 @@
 (defun reg-tn-encoding (tn)
   (declare (type tn tn))
   (sc-case tn
-    (zero zero-offset)
-    (null null-offset)
+    (zero sb!vm::zero-offset)
+    (null sb!vm::null-offset)
     (t
      (if (eq (sb-name (sc-sb (tn-sc tn))) 'registers)
          (tn-offset tn)
@@ -65,51 +75,44 @@
        (lambda (name)
          (and name
               (make-symbol (concatenate 'string "$" name))))
-       *register-names*))
+       sb!vm::*register-names*))
 
-(sb!disassem:define-arg-type reg
+(define-arg-type reg
   :printer #'(lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
                (let ((regname (aref *reg-symbols* value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref
-                  value
-                  'registers
-                  regname
-                  dstate))))
+                 (maybe-note-associated-storage-ref
+                  value 'registers regname dstate))))
 
-(sb!disassem:define-arg-type load-store-annotation
+(define-arg-type load-store-annotation
   :printer (lambda (value stream dstate)
              (declare (ignore stream))
              (destructuring-bind (reg offset) value
-               (when (= reg code-offset)
-                 (sb!disassem:note-code-constant offset dstate)))))
+               (when (= reg sb!vm::code-offset)
+                 (note-code-constant offset dstate)))))
 
 (defparameter *float-reg-symbols*
   (coerce
    (loop for n from 0 to 31 collect (make-symbol (format nil "$F~d" n)))
    'vector))
 
-(sb!disassem:define-arg-type fp-reg
+(define-arg-type fp-reg
   :printer #'(lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
                (let ((regname (aref *float-reg-symbols* value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref
-                  value
-                  'float-registers
-                  regname
-                  dstate))))
+                 (maybe-note-associated-storage-ref
+                  value 'float-registers regname dstate))))
 
-(sb!disassem:define-arg-type control-reg
-  :printer "(CR:#x~X)")
+(define-arg-type control-reg :printer "(CR:#x~X)")
 
-(sb!disassem:define-arg-type relative-label
+(define-arg-type relative-label
   :sign-extend t
   :use-label #'(lambda (value dstate)
                  (declare (type (signed-byte 16) value)
-                          (type sb!disassem:disassem-state dstate))
-                 (+ (ash (1+ value) 2) (sb!disassem:dstate-cur-addr dstate))))
+                          (type disassem-state dstate))
+                 (+ (ash (1+ value) 2) (dstate-cur-addr dstate))))
 
 (deftype float-format ()
   '(member :s :single :d :double :w :word))
@@ -120,7 +123,7 @@
     ((:d :double) 1)
     ((:w :word) 4)))
 
-(sb!disassem:define-arg-type float-format
+(define-arg-type float-format
   :printer #'(lambda (value stream dstate)
                (declare (ignore dstate)
                         (stream stream)
@@ -136,8 +139,7 @@
   '(:f :un :eq :ueq :olt :ult :ole :ule :sf :ngle :seq :ngl :lt :nge :le :ngt)
   #'equalp)
 
-(defconstant-eqx compare-kinds-vec
-  (apply #'vector compare-kinds)
+(defconstant-eqx compare-kinds-vec #.(apply #'vector compare-kinds)
   #'equalp)
 
 (deftype compare-kind ()
@@ -149,8 +151,7 @@
              kind
              compare-kinds)))
 
-(sb!disassem:define-arg-type compare-kind
-  :printer compare-kinds-vec)
+(define-arg-type compare-kind :printer compare-kinds-vec)
 
 (defconstant-eqx float-operations '(+ - * /) #'equalp)
 
@@ -168,8 +169,7 @@
              op
              float-operations)))
 
-(sb!disassem:define-arg-type float-operation
-  :printer float-operation-names)
+(define-arg-type float-operation :printer float-operation-names)
 
 
 
@@ -195,8 +195,7 @@
   '(:name :tab rt (:unless (:constant 0) ", " rs) ", " immediate)
   #'equalp)
 
-(sb!disassem:define-instruction-format
-    (immediate 32 :default-printer immed-printer)
+(define-instruction-format (immediate 32 :default-printer immed-printer)
   (op :field (byte 6 26))
   (rs :field (byte 5 21) :type 'reg)
   (rt :field (byte 5 16) :type 'reg)
@@ -209,7 +208,7 @@
       (:unless (:constant 0) "[" immediate "]"))
   #'equalp)
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (load-store 32 :default-printer '(:name :tab
                                       rt ", "
                                       rs
@@ -223,11 +222,10 @@
   (defparameter jump-printer
     #'(lambda (value stream dstate)
         (let ((addr (ash value 2)))
-          (sb!disassem:maybe-note-assembler-routine addr t dstate)
+          (maybe-note-assembler-routine addr t dstate)
           (write addr :base 16 :radix t :stream stream)))))
 
-(sb!disassem:define-instruction-format
-    (jump 32 :default-printer '(:name :tab target))
+(define-instruction-format (jump 32 :default-printer '(:name :tab target))
   (op :field (byte 6 26))
   (target :field (byte 26 0) :printer jump-printer))
 
@@ -235,8 +233,7 @@
   '(:name :tab rd (:unless (:same-as rd) ", " rs) ", " rt)
   #'equalp)
 
-(sb!disassem:define-instruction-format
-    (register 32 :default-printer reg-printer)
+(define-instruction-format (register 32 :default-printer reg-printer)
   (op :field (byte 6 26))
   (rs :field (byte 5 21) :type 'reg)
   (rt :field (byte 5 16) :type 'reg)
@@ -244,7 +241,7 @@
   (shamt :field (byte 5 6) :value 0)
   (funct :field (byte 6 0)))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (break 32 :default-printer
            '(:name :tab code (:unless (:constant 0) ", " subcode)))
   (op :field (byte 6 26) :value special-op)
@@ -252,8 +249,8 @@
   (subcode :field (byte 10 6) :reader break-subcode)
   (funct :field (byte 6 0) :value #b001101))
 
-(sb!disassem:define-instruction-format
-    (coproc-branch 32 :default-printer '(:name :tab offset))
+(define-instruction-format (coproc-branch 32
+                            :default-printer '(:name :tab offset))
   (op :field (byte 6 26))
   (funct :field (byte 10 16))
   (offset :field (byte 16 0)))
@@ -272,8 +269,7 @@
           ", " ft)
   #'equalp)
 
-(sb!disassem:define-instruction-format
-    (float 32 :default-printer float-printer)
+(define-instruction-format (float 32 :default-printer float-printer)
   (op :field (byte 6 26) :value cop1-op)
   (filler :field (byte 1 25) :value 1)
   (format :field (byte 4 21) :type 'float-format)
@@ -282,8 +278,7 @@
   (fd :field (byte 5 6) :type 'fp-reg)
   (funct :field (byte 6 0)))
 
-(sb!disassem:define-instruction-format
-    (float-aux 32 :default-printer float-printer)
+(define-instruction-format (float-aux 32 :default-printer float-printer)
   (op :field (byte 6 26) :value cop1-op)
   (filler-1 :field (byte 1 25) :value 1)
   (format :field (byte 4 21) :type 'float-format)
@@ -293,7 +288,7 @@
   (funct :field (byte 2 4))
   (sub-funct :field (byte 4 0)))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (float-op 32
               :include float
               :default-printer
@@ -1048,33 +1043,6 @@
 (define-instruction-macro entry-point ()
   nil)
 
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
-
 (defmacro break-cases (breaknum &body cases)
   (let ((bn-temp (gensym)))
     (collect ((clauses))
@@ -1085,7 +1053,7 @@
 
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
-  (flet ((nt (x) (if stream (sb!disassem:note x dstate))))
+  (flet ((nt (x) (if stream (note x dstate))))
     (when (= (break-code chunk dstate) 0)
       (case (break-subcode chunk dstate)
         (#.halt-trap
@@ -1094,17 +1062,19 @@
          (nt "Pending interrupt trap"))
         (#.error-trap
          (nt "Error trap")
-         (sb!disassem:handle-break-args #'snarf-error-junk stream dstate))
+         (handle-break-args #'snarf-error-junk stream dstate))
         (#.cerror-trap
          (nt "Cerror trap")
-         (sb!disassem:handle-break-args #'snarf-error-junk stream dstate))
+         (handle-break-args #'snarf-error-junk stream dstate))
         (#.breakpoint-trap
          (nt "Breakpoint trap"))
         (#.fun-end-breakpoint-trap
          (nt "Function end breakpoint trap"))
         (#.after-breakpoint-trap
          (nt "After breakpoint trap"))
-        (#.pseudo-atomic-trap
+        ;; KLUDGE: see comment in compiler/generic/genesis regarding
+        ;; the non-exportation of PSEUDO-ATOMIC-TRAP.
+        (#.sb!vm::pseudo-atomic-trap
          (nt "Pseudo atomic trap"))
         (#.object-not-list-trap
          (nt "Object not list trap"))
@@ -1135,7 +1105,7 @@
    (emit-register-inst segment special-op 0 0 0 0 #b001110)))
 
 (define-instruction nop (segment)
-  (:printer register ((op 0) (rd 0) (rd 0) (rs 0) (funct 0)) '(:name))
+  (:printer register ((op 0) (rd 0) (rs 0) (funct 0)) '(:name))
   (:attributes flushable)
   (:delay 0)
   (:emitter

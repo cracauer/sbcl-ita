@@ -90,13 +90,13 @@
 
 ;;;; list collection macrology
 
-(sb!int:defmacro-mundanely with-loop-list-collection-head
+(sb!xc:defmacro with-loop-list-collection-head
     ((head-var tail-var &optional user-head-var) &body body)
   (let ((l (and user-head-var (list (list user-head-var nil)))))
     `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
        ,@body)))
 
-(sb!int:defmacro-mundanely loop-collect-rplacd
+(sb!xc:defmacro loop-collect-rplacd
     (&environment env (head-var tail-var &optional user-head-var) form)
   (setq form (sb!int:%macroexpand form env))
   (flet ((cdr-wrap (form n)
@@ -142,7 +142,7 @@
                         (setq ,user-head-var (cdr ,head-var)))))
         answer))))
 
-(sb!int:defmacro-mundanely loop-collect-answer (head-var
+(sb!xc:defmacro loop-collect-answer (head-var
                                                    &optional user-head-var)
   (or user-head-var
       `(cdr ,head-var)))
@@ -200,7 +200,7 @@ constructed.
           (gensym "LOOP-MAXMIN-FLAG-")))
   operation)
 
-(sb!int:defmacro-mundanely with-minimax-value (lm &body body)
+(sb!xc:defmacro with-minimax-value (lm &body body)
   (let ((init (loop-typed-init (loop-minimax-type lm)))
         (which (car (loop-minimax-operations lm)))
         (infinity-data (loop-minimax-infinity-data lm))
@@ -219,7 +219,7 @@ constructed.
            (declare (type ,type ,answer-var ,temp-var))
            ,@body))))
 
-(sb!int:defmacro-mundanely loop-accumulate-minimax-value (lm operation form)
+(sb!xc:defmacro loop-accumulate-minimax-value (lm operation form)
   (let* ((answer-var (loop-minimax-answer-variable lm))
          (temp-var (loop-minimax-temp-variable lm))
          (flag-var (loop-minimax-flag-variable lm))
@@ -264,10 +264,11 @@ code to be loaded.
   (and (symbolp loop-token)
        (values (gethash (symbol-name loop-token) table))))
 
-(sb!int:defmacro-mundanely loop-store-table-data (symbol table datum)
+(sb!xc:defmacro loop-store-table-data (symbol table datum)
   `(setf (gethash (symbol-name ,symbol) ,table) ,datum))
 
 (defstruct (loop-universe
+             (:constructor !make-loop-universe)
              (:copier nil)
              (:predicate nil))
   keywords             ; hash table, value = (fn-name . extra-data)
@@ -278,16 +279,16 @@ code to be loaded.
                        ; value = CL type specifier
   type-keywords)       ; hash table of type STRINGS, test EQUAL,
                        ; value = CL type spec
-(sb!int:def!method print-object ((u loop-universe) stream)
+(defmethod print-object ((u loop-universe) stream)
   (print-unreadable-object (u stream :type t :identity t)))
 
 ;;; This is the "current" loop context in use when we are expanding a
 ;;; loop. It gets bound on each invocation of LOOP.
 (defvar *loop-universe*)
 
-(defun make-standard-loop-universe (&key keywords for-keywords
-                                         iteration-keywords path-keywords
-                                         type-keywords type-symbols)
+(defun !make-standard-loop-universe (&key keywords for-keywords
+                                          iteration-keywords path-keywords
+                                          type-keywords type-symbols)
   (flet ((maketable (entries)
            (let* ((size (length entries))
                   (ht (make-hash-table :size (if (< size 10) 10 size)
@@ -295,7 +296,7 @@ code to be loaded.
              (dolist (x entries)
                (setf (gethash (symbol-name (car x)) ht) (cadr x)))
              ht)))
-    (make-loop-universe
+    (!make-loop-universe
       :keywords (maketable keywords)
       :for-keywords (maketable for-keywords)
       :iteration-keywords (maketable iteration-keywords)
@@ -328,7 +329,7 @@ code to be loaded.
 (defvar *loop-desetq-temporary*
         (make-symbol "LOOP-DESETQ-TEMP"))
 
-(sb!int:defmacro-mundanely loop-really-desetq (&environment env
+(sb!xc:defmacro loop-really-desetq (&environment env
                                                &rest var-val-pairs)
   (labels ((find-non-null (var)
              ;; See whether there's any non-null thing here. Recurse
@@ -500,7 +501,7 @@ code to be loaded.
         (setq constantp nil value nil)))
     (values form constantp value)))
 
-(sb!int:defmacro-mundanely loop-body (prologue
+(sb!xc:defmacro loop-body (prologue
                                       before-loop
                                       main-body
                                       after-loop
@@ -534,6 +535,7 @@ code to be loaded.
       ((eq l (cdr *loop-source-code*)) (nreverse new))))
 
 (defun loop-error (format-string &rest format-args)
+  #-sb-xc-host(declare (optimize sb!kernel:allow-non-returning-tail-call))
   (error 'sb!int:simple-program-error
          :format-control "~?~%current LOOP context:~{ ~S~}."
          :format-arguments (list format-string format-args (loop-context))))
@@ -581,7 +583,7 @@ code to be loaded.
                         (push (car cdr) result))))))
       (values (transform tree) ignores))))
 
-(sb!int:defmacro-mundanely loop-destructuring-bind
+(sb!xc:defmacro loop-destructuring-bind
     (lambda-list args &rest body)
   (multiple-value-bind (d-lambda-list ignores)
       (transform-destructuring lambda-list)
@@ -1065,7 +1067,7 @@ code to be loaded.
   dtype
   (data nil)) ;collector-specific data
 
-(sb!int:defmacro-mundanely with-sum-count (lc &body body)
+(sb!xc:defmacro with-sum-count (lc &body body)
   (let* ((type (loop-collector-dtype lc))
          (temp-var (car (loop-collector-tempvars lc))))
     (multiple-value-bind (type init)
@@ -1607,6 +1609,7 @@ code to be loaded.
          (limit-given nil) ; T when prep phrase has specified end
          (limit-constantp nil)
          (limit-value nil))
+     #+ccl (progn start-constantp start-value) ; bogus "Unused" warnings
      (flet ((assert-index-for-arithmetic (index)
               (unless (atom index)
                 (loop-error "Arithmetic index must be an atom."))))
@@ -1845,8 +1848,8 @@ code to be loaded.
 
 ;;;; ANSI LOOP
 
-(defun make-ansi-loop-universe ()
-  (let ((w (make-standard-loop-universe
+(defun !make-ansi-loop-universe ()
+  (let ((w (!make-standard-loop-universe
              :keywords '((named (loop-do-named))
                          (initially (loop-do-initially))
                          (finally (loop-do-finally))
@@ -1900,15 +1903,7 @@ code to be loaded.
                              (being (loop-for-being)))
              :iteration-keywords '((for (loop-do-for))
                                    (as (loop-do-for)))
-             :type-symbols '(array atom bignum bit bit-vector character
-                             compiled-function complex cons double-float
-                             fixnum float function hash-table integer
-                             keyword list long-float nil null number
-                             package pathname random-state ratio rational
-                             readtable sequence short-float simple-array
-                             simple-bit-vector simple-string simple-vector
-                             single-float standard-char stream string
-                             base-char symbol t vector)
+             :type-symbols sb!kernel::*!standard-type-names*
              :type-keywords nil)))
     (add-loop-path '(hash-key hash-keys) 'loop-hash-table-iteration-path w
                    :preposition-groups '((:of :in))
@@ -1938,7 +1933,7 @@ code to be loaded.
     w))
 
 (defparameter *loop-ansi-universe*
-  (make-ansi-loop-universe))
+  (!make-ansi-loop-universe))
 
 (defun loop-standard-expansion (keywords-and-forms environment universe)
   (if (and keywords-and-forms (symbolp (car keywords-and-forms)))
@@ -1946,10 +1941,10 @@ code to be loaded.
       (let ((tag (gensym)))
         `(block nil (tagbody ,tag (progn ,@keywords-and-forms) (go ,tag))))))
 
-(sb!int:defmacro-mundanely loop (&environment env &rest keywords-and-forms)
+(sb!xc:defmacro loop (&environment env &rest keywords-and-forms)
   (loop-standard-expansion keywords-and-forms env *loop-ansi-universe*))
 
-(sb!int:defmacro-mundanely loop-finish ()
+(sb!xc:defmacro loop-finish ()
   #!+sb-doc
   "Cause the iteration to terminate \"normally\", the same as implicit
 termination by an iteration driving clause, or by use of WHILE or

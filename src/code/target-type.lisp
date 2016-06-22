@@ -135,12 +135,12 @@
              (if (typep type '(cons (eql function))) ; sanity test
                  (try-cache type)
                  (classoid-of x)))))
-      (symbol (if x (try-cache x) *null-type*))
+      (symbol (if x (try-cache x) (specifier-type 'null)))
       (number (try-cache x))
       (array (ctype-of-array x))
-      (cons *cons-t-t-type*)
+      (cons (specifier-type 'cons))
       ;; This makes no distinction for BASE/EXTENDED-CHAR. Should it?
-      (character *character-type*)
+      (character (specifier-type 'character))
       #!+sb-simd-pack
       (simd-pack
        (let ((tag (%simd-pack-tag x)))
@@ -252,6 +252,7 @@ Examples:
 
 Experimental."
   (declare (ignore env))
-  (handler-case (prog1 t (values-specifier-type type-specifier))
-    (parse-unknown-type () nil)
-    (error () nil)))
+  ;; We don't even care if the spec is parseable -
+  ;; just deem it invalid.
+  (not (null (ignore-errors
+               (type-or-nil-if-unknown type-specifier t)))))

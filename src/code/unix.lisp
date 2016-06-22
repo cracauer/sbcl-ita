@@ -158,17 +158,18 @@ corresponds to NAME, or NIL if there is none."
 ;;; If the O_CREAT flag is specified, then the file is created with a
 ;;; permission of argument MODE if the file doesn't exist. An integer
 ;;; file descriptor is returned by UNIX-OPEN.
-(defun unix-open (path flags mode)
+(defun unix-open (path flags mode &key #!+win32 overlapped)
   (declare (type unix-pathname path)
            (type fixnum flags)
-           (type unix-file-mode mode))
-  #!+win32 (sb!win32:unixlike-open path flags mode)
+           (type unix-file-mode mode)
+           #!+win32
+           (ignore mode))
+  #!+win32 (sb!win32:unixlike-open path flags :overlapped overlapped)
   #!-win32
   (with-restarted-syscall (value errno)
     (int-syscall ("open" c-string int int)
                  path
-                 (logior #!+win32 o_binary
-                         #!+largefile o_largefile
+                 (logior #!+largefile o_largefile
                          flags)
                  mode)))
 
@@ -717,6 +718,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 ;;; they are ready for reading and writing. See the UNIX Programmer's
 ;;; Manual for more information.
 (defun unix-select (nfds rdfds wrfds xpfds to-secs &optional (to-usecs 0))
+  (declare (muffle-conditions t))
   (declare (type integer nfds)
            (type unsigned-byte rdfds wrfds xpfds)
            (type (or (unsigned-byte 31) null) to-secs)
@@ -940,10 +942,9 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
             (tm-gmtoff long) ;  Seconds east of UTC.
             (tm-zone c-string))) ; Timezone abbreviation.
 
-(define-alien-routine get-timezone sb!alien:void
-  (when time-t :in)
-  (seconds-west sb!alien:int :out)
-  (daylight-savings-p sb!alien:boolean :out))
+(define-alien-routine get-timezone int
+  (when time-t)
+  (daylight-savings-p boolean :out))
 
 #!-win32
 (defun nanosleep (secs nsecs)
@@ -982,11 +983,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
                          t)))
           do (setf (slot req 'tv-sec) (slot rem 'tv-sec)
                    (slot req 'tv-nsec) (slot rem 'tv-nsec)))))
-
-(defun unix-get-seconds-west (secs)
-  (multiple-value-bind (ignore seconds dst) (get-timezone secs)
-    (declare (ignore ignore) (ignore dst))
-    (values seconds)))
 
 ;;;; sys/time.h
 
@@ -1116,6 +1112,7 @@ the UNIX epoch (January 1st 1970.)"
                    system-real-time-values))
 
   (defun system-real-time-values ()
+    #!+win32 (declare (notinline get-time-of-day)) ; forward ref
     (multiple-value-bind (sec usec) (get-time-of-day)
       (declare (type unsigned-byte sec) (type (unsigned-byte 31) usec))
       (values sec (truncate usec micro-seconds-per-internal-time-unit))))
@@ -1142,9 +1139,9 @@ the UNIX epoch (January 1st 1970.)"
         (c-sec 0)
         (c-msec 0)
         (now 0))
-    (declare (type unsigned-byte e-sec c-sec)
-             (type fixnum e-msec c-msec)
-             (type unsigned-byte now))
+    (declare (type sb!kernel:internal-seconds e-sec c-sec)
+             (type sb!kernel:internal-seconds e-msec c-msec)
+             (type sb!kernel:internal-time now))
     (defun reinit-internal-real-time ()
       (setf (values e-sec e-msec) (system-real-time-values)
             c-sec 0
@@ -1200,6 +1197,7 @@ the UNIX epoch (January 1st 1970.)"
 ;;; So we're stuck with it for a while -- maybe delete it towards the end
 ;;; of 2009.
 (defun unix-gettimeofday ()
+  #!+win32 (declare (notinline get-time-of-day)) ; forward ref
   (multiple-value-bind (sec usec) (get-time-of-day)
     (values t sec usec nil nil)))
 
@@ -1222,11 +1220,15 @@ the UNIX epoch (January 1st 1970.)"
   (let ((ent (alien-funcall
               (extern-alien "sb_readdir"
                             (function system-area-pointer system-area-pointer))
-                            dir)))
+              dir))
+        errno)
     (if (zerop (sap-int ent))
-        (when errorp (simple-perror
-                      (format nil "Error reading directory entry~@[ from ~S~]"
-                              namestring)))
+        (when (and errorp
+                   (not (zerop (setf errno (get-errno)))))
+          (simple-perror
+           (format nil "Error reading directory entry~@[ from ~S~]"
+                   namestring)
+           :errno errno))
         ent)))
 
 (declaim (inline unix-closedir))

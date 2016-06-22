@@ -39,9 +39,7 @@
                 ;; COLD-INIT-FORMS will already have been run.
                 (defglobal *ctype-hash-state* ,initform)
                 (defglobal *type-classes* (make-array ,n))
-                (!cold-init-forms
-                 (setq *ctype-hash-state* ,initform
-                       *type-classes* (make-array ,n)))))))
+                (!cold-init-forms (setq *ctype-hash-state* ,initform))))))
   (def))
 
 (defun type-class-or-lose (name)
@@ -71,21 +69,6 @@
 (defun must-supply-this (&rest foo)
   (/show0 "failing in MUST-SUPPLY-THIS")
   (error "missing type method for ~S" foo))
-
-(declaim (ftype (sfunction (ctype ctype) (values t t)) csubtypep))
-;;; Look for nice relationships for types that have nice relationships
-;;; only when one is a hierarchical subtype of the other.
-(defun hierarchical-intersection2 (type1 type2)
-  (multiple-value-bind (subtypep1 win1) (csubtypep type1 type2)
-    (multiple-value-bind (subtypep2 win2) (csubtypep type2 type1)
-      (cond (subtypep1 type1)
-            (subtypep2 type2)
-            ((and win1 win2) *empty-type*)
-            (t nil)))))
-(defun hierarchical-union2 (type1 type2)
-  (cond ((csubtypep type1 type2) type2)
-        ((csubtypep type2 type1) type1)
-        (t nil)))
 
 ;;; A TYPE-CLASS object represents the "kind" of a type. It mainly
 ;;; contains functions which are methods on that kind of type, but is
@@ -167,7 +150,7 @@
   ;; is disjoint from MEMBER-TYPE and so forth. But types which can
   ;; contain other types, like HAIRY-TYPE and INTERSECTION-TYPE, can
   ;; violate this rule.
-  (might-contain-other-types-p nil)
+  (might-contain-other-types-p nil :type boolean :read-only t)
   ;; a function which returns T if the CTYPE could possibly be
   ;; equivalent to a MEMBER type. If not a function, then it's
   ;; a constant T or NIL for all instances of this type class.
@@ -179,7 +162,7 @@
   ;; set enumerable=T for NEGATION and HAIRY and some other things.
   ;; Conceptually the choices are really {yes, no, unknown}, but
   ;; whereas "no" means "definitely not", T means "yes or maybe".
-  (enumerable-p nil :type (or function null t))
+  (enumerable-p nil :type (or function boolean) :read-only t)
   ;; a function which returns T if the CTYPE is inhabited by a single
   ;; object and, as a value, the object.  Otherwise, returns NIL, NIL.
   ;; The default case (NIL) is interpreted as a function that always
@@ -239,7 +222,6 @@
 
 (def!struct (ctype (:conc-name type-)
                    (:constructor nil)
-                   (:make-load-form-fun make-type-load-form)
                    #-sb-xc-host (:pure t))
   ;; the class of this type
   ;;
@@ -282,6 +264,22 @@
                     0
                     +type-admits-type=-optimization+)
                 (type-hash-value obj)))
+  obj)
+
+;; For cold-init: improve the randomness of the hash.
+;; (The host uses at most 21 bits of randomness. See CTYPE-RANDOM)
+#+sb-xc
+(defun !fix-ctype-hash (obj)
+  (let ((saetp-index (!ctype-saetp-index obj)))
+    ;; Preserve the interned-p and type=-optimization bits
+    ;; by flipping only the bits under the hash-mask.
+    (setf (type-hash-value obj)
+          (logxor (logand (sb!impl::quasi-random-address-based-hash
+                           *ctype-hash-state* +ctype-hash-mask+))
+                   (type-hash-value obj)))
+    ;; Except that some of those "non-intelligent" bits contain
+    ;; critical information, if this type is an array specialization.
+    (setf (!ctype-saetp-index obj) saetp-index))
   obj)
 
 (declaim (inline type-might-contain-other-types-p))
@@ -362,15 +360,39 @@
                        append `(,(keywordicate name)
                                 (,(!type-class-fun-slot name) parent))))))))
     #-sb-xc
-    `(progn
-       (eval-when (:compile-toplevel :load-toplevel :execute)
-         (unless (find ',name *type-classes* :key #'type-class-name)
-           (vector-push-extend ,make-it *type-classes*))))
+    `(if (find ',name *type-classes* :key #'type-class-name)
+         ;; Careful: type-classes are very complicated things to redefine.
+         ;; For the sake of parallelized make-host-1 we have to allow it
+         ;; not to be an error to get here, but we can't overwrite anything.
+         (style-warn "Not redefining type-class ~S" ',name)
+         (vector-push-extend ,make-it *type-classes*))
+    ;; The Nth entry in the array of classes contain a list of instances
+    ;; of the type-class created by genesis that need patching.
+    ;; Types are dumped into the cold core without pointing to their class
+    ;; which avoids a bootstrap problem: it's tricky to dump a type-class.
     #+sb-xc
-    `(!cold-init-forms
-      (setf (svref *type-classes*
-                   ,(position name *type-classes* :key #'type-class-name))
-            ,make-it))))
+    (let ((type-class-index
+           (position name *type-classes* :key #'type-class-name))
+          (slot-index
+           ;; KLUDGE: silence bogus warning that FIND "certainly" returns NIL
+           (locally (declare (notinline find))
+             (dsd-index (find 'class-info
+                              (dd-slots (find-defstruct-description 'ctype))
+                              :key #'dsd-name)))))
+      `(!cold-init-forms
+        (let* ((backpatch-list (svref *type-classes* ,type-class-index))
+               (type-class ,make-it))
+          (setf (svref *type-classes* ,type-class-index) type-class)
+          #+nil
+          (progn
+            (princ ,(format nil "Patching type-class ~A into instances: " name))
+            (princ (length backpatch-list))
+            (terpri))
+          (dolist (instance backpatch-list)
+            ;; Fixup the class first, in case fixing the hash needs the class.
+            ;; (It doesn't currently, but just in case it does)
+            (setf (%instance-ref instance ,slot-index) type-class)
+            (!fix-ctype-hash instance)))))))
 
 ;;; Define the translation from a type-specifier to a type structure for
 ;;; some particular type. Syntax is identical to DEFTYPE.
@@ -391,17 +413,18 @@
          (lexpr (make-macro-lambda nil lambda-list stuff nil nil
                                    :accessor (if allow-atom 'identity 'cdr)
                                    :environment nil))
-         (ll-decl (third lexpr)))
+         (ll-decl (third lexpr))
+         (defun-name (symbolicate "PARSE-<" name ">")))
     (aver (and (eq (car ll-decl) 'declare) (caadr ll-decl) 'sb!c::lambda-list))
-    `(!cold-init-forms
-      (setf (info :type :expander ',name)
-            (list
-             (named-lambda ,(format nil "~A-TYPE-PARSE" name) (,context spec)
-              ,ll-decl
-              ,@(unless context-var-p `((declare (ignore ,context))))
-              ,(if allow-atom
-                   `(,lexpr (and (listp spec) (cdr spec)))
-                   `(if (listp spec) (,lexpr spec)))))))))
+    `(progn
+       (defun ,defun-name (,context spec)
+         ,ll-decl
+         ,@(unless context-var-p `((declare (ignore ,context))))
+         ,(if allow-atom
+              `(,lexpr (and (listp spec) (cdr spec)))
+              `(if (listp spec) (,lexpr spec))))
+       (!cold-init-forms
+        (setf (info :type :expander ',name) (list #',defun-name))))))
 
 ;;; Invoke a type method on TYPE1 and TYPE2. If the two types have the
 ;;; same class, invoke the simple method. Otherwise, invoke any
@@ -504,6 +527,31 @@
 ;;; A few type representations need to be defined slightly earlier than
 ;;; 'early-type' is compiled, so they're defined here.
 
+;;; The NAMED-TYPE is used to represent *, T and NIL, the standard
+;;; special cases, as well as other special cases needed to
+;;; interpolate between regions of the type hierarchy, such as
+;;; INSTANCE (which corresponds to all those classes with slots which
+;;; are not funcallable), FUNCALLABLE-INSTANCE (those classes with
+;;; slots which are funcallable) and EXTENDED-SEQUUENCE (non-LIST
+;;; non-VECTOR classes which are also sequences).  These special cases
+;;; are the ones that aren't really discussed by Baker in his
+;;; "Decision Procedure for SUBTYPEP" paper.
+(defstruct (named-type (:include ctype
+                                 (class-info (type-class-or-lose 'named)))
+                       (:copier nil))
+  (name nil :type symbol :read-only t))
+
+;;; A MEMBER-TYPE represent a use of the MEMBER type specifier. We
+;;; bother with this at this level because MEMBER types are fairly
+;;; important and union and intersection are well defined.
+(defstruct (member-type (:include ctype
+                                  (class-info (type-class-or-lose 'member)))
+                        (:copier nil)
+                        (:constructor %make-member-type (xset fp-zeroes))
+                        #-sb-xc-host (:pure nil))
+  (xset nil :type xset :read-only t)
+  (fp-zeroes nil :type list :read-only t))
+
 ;;; An ARRAY-TYPE is used to represent any array type, including
 ;;; things such as SIMPLE-BASE-STRING.
 (defstruct (array-type (:include ctype
@@ -518,9 +566,9 @@
   ;; Is this not a simple array type? (:MAYBE means that we don't know.)
   (complexp :maybe :type (member t nil :maybe) :read-only t)
   ;; the element type as originally specified
-  (element-type (missing-arg) :type ctype :read-only t)
+  (element-type nil :type ctype :read-only t)
   ;; the element type as it is specialized in this implementation
-  (specialized-element-type *wild-type* :type ctype :read-only t))
+  (specialized-element-type nil :type ctype :read-only t))
 
 (defstruct (character-set-type
             (:include ctype
@@ -597,7 +645,7 @@
                          (:copier nil))
   ;; Formerly defined in every CTYPE, but now just in the ones
   ;; for which enumerability is variable.
-  (enumerable nil :read-only t)
+  (enumerable nil :type boolean :read-only t)
   ;; the kind of numeric type we have, or NIL if not specified (just
   ;; NUMBER or COMPLEX)
   ;;
@@ -642,7 +690,6 @@
 
 (in-package "SB!ALIEN")
 (def!struct (alien-type
-             (:make-load-form-fun sb!kernel:just-dump-it-normally)
              (:constructor make-alien-type
                            (&key class bits alignment
                             &aux (alignment
@@ -650,6 +697,7 @@
   (class 'root :type symbol :read-only t)
   (bits nil :type (or null unsigned-byte))
   (alignment nil :type (or null unsigned-byte)))
+(!set-load-form-method alien-type (:xc :target))
 
 (in-package "SB!KERNEL")
 (defstruct (alien-type-type
@@ -658,3 +706,62 @@
             (:constructor %make-alien-type-type (alien-type))
             (:copier nil))
   (alien-type nil :type alien-type :read-only t))
+
+;;; the description of a &KEY argument
+(defstruct (key-info #-sb-xc-host (:pure t)
+                     (:copier nil))
+  ;; the key (not necessarily a keyword in ANSI Common Lisp)
+  (name (missing-arg) :type symbol :read-only t)
+  ;; the type of the argument value
+  (type (missing-arg) :type ctype :read-only t))
+
+;;; ARGS-TYPE objects are used both to represent VALUES types and
+;;; to represent FUNCTION types.
+(defstruct (args-type (:include ctype)
+                      (:constructor nil)
+                      (:copier nil))
+  ;; Lists of the type for each required and optional argument.
+  (required nil :type list :read-only t)
+  (optional nil :type list :read-only t)
+  ;; The type for the rest arg. NIL if there is no &REST arg.
+  (rest nil :type (or ctype null) :read-only t)
+  ;; true if &KEY arguments are specified
+  (keyp nil :type boolean :read-only t)
+  ;; list of KEY-INFO structures describing the &KEY arguments
+  (keywords nil :type list :read-only t)
+  ;; true if other &KEY arguments are allowed
+  (allowp nil :type boolean :read-only t))
+
+;;; (SPECIFIER-TYPE 'FUNCTION) and its subtypes
+(defstruct (fun-type (:include args-type
+                               (class-info (type-class-or-lose 'function)))
+                     (:constructor
+                      %make-fun-type (required optional rest
+                                      keyp keywords allowp wild-args returns)))
+  ;; true if the arguments are unrestrictive, i.e. *
+  (wild-args nil :type boolean :read-only t)
+  ;; type describing the return values. This is a values type
+  ;; when multiple values were specified for the return.
+  (returns (missing-arg) :type ctype :read-only t))
+
+(declaim (ftype (sfunction (ctype ctype) (values t t)) csubtypep))
+;;; Look for nice relationships for types that have nice relationships
+;;; only when one is a hierarchical subtype of the other.
+(defun hierarchical-intersection2 (type1 type2)
+  ;; *EMPTY-TYPE* is involved in a dependency cycle: It wants to be a constant
+  ;; instance of NAMED-TYPE. To construct an instance of a type, you need a
+  ;; type-class. A type-class needs to refer to this function, which refers
+  ;; to *EMPTY-TYPE*, which .... etc.
+  ;; In the cross-compiler, it is actually a constant.
+  #+sb-xc-host (declare (special *empty-type*))
+  (multiple-value-bind (subtypep1 win1) (csubtypep type1 type2)
+    (multiple-value-bind (subtypep2 win2) (csubtypep type2 type1)
+      (cond (subtypep1 type1)
+            (subtypep2 type2)
+            ((and win1 win2) *empty-type*)
+            (t nil)))))
+
+(defun hierarchical-union2 (type1 type2)
+  (cond ((csubtypep type1 type2) type2)
+        ((csubtypep type2 type1) type1)
+        (t nil)))

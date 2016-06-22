@@ -29,20 +29,10 @@
       (declare (ignore indicator))
       (values value (not (null foundp))))))
 
-(def!macro sb!xc:defconstant (name value &optional (doc nil docp))
-  #!+sb-doc
-  "Define a global constant, saying that the value is constant and may be
-  compiled into code. If the variable already has a value, and this is not
-  EQL to the new value, the code is not portable (undefined behavior). The
-  third argument is an optional documentation string for the variable."
-  `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (sb!c::%defconstant ',name ,value (sb!c:source-location)
-                         ,@(and docp
-                                `(,doc)))))
-
-(declaim (ftype (function (symbol t &optional t t) (values null &optional))
+(declaim (ftype (sfunction (symbol t &optional t t) null)
                 about-to-modify-symbol-value))
 ;;; the guts of DEFCONSTANT
+
 (defun sb!c::%defconstant (name value source-location &optional (doc nil docp))
   #+sb-xc-host (declare (ignore doc docp))
   (unless (symbolp name)
@@ -53,7 +43,7 @@
      (style-warn 'asterisks-around-constant-variable-name
                  :format-control "Defining ~S as a constant"
                  :format-arguments (list name)))
-   (sb!c:with-source-location (source-location)
+   (when source-location
      (setf (info :source-location :constant name) source-location))
    (let ((kind (info :variable :kind name)))
      (case kind
@@ -115,9 +105,9 @@
     ;; the symbols which ANSI requires to be exported from CL. * Make a
     ;; nickname SB!CL which behaves like SB!XC. * Go through the
     ;; loaded-on-the-host code making every target definition be in SB-CL.
-    ;; E.g. DEFMACRO-MUNDANELY DEFCONSTANT becomes DEFMACRO-MUNDANELY
-    ;; SB!CL:DEFCONSTANT. * Make IN-TARGET-COMPILATION-MODE do UNUSE-PACKAGE
-    ;; CL and USE-PACKAGE SB-CL in each of the target packages (then undo it
+    ;; E.g. SB!XC:DEFMACRO DEFCONSTANT becomes SB!XC:DEFMACRO SB!CL:DEFCONSTANT.
+    ;; * Make IN-TARGET-COMPILATION-MODE do UNUSE-PACKAGE CL and
+    ;; USE-PACKAGE SB-CL in each of the target packages (then undo it
     ;; on exit). * Make the cross-compiler's implementation of EVAL-WHEN
     ;; (:COMPILE-TOPLEVEL) do UNCROSS. (This may not require any change.) *
     ;; Hack GENESIS as necessary so that it outputs SB-CL stuff as COMMON-LISP

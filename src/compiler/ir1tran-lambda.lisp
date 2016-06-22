@@ -1088,9 +1088,16 @@
                         (recurse body
                                  (process-decls `((declare ,@bindings)) nil nil)))
                        (:macro
-                        (let ((macros (loop for (name . function) in bindings
-                                            collect (list* name 'macro
-                                                           (eval-in-lexenv function lexenv)))))
+                        (let ((macros
+                               (mapcar (lambda (binding)
+                                         (list* (car binding) 'macro
+                                                #-sb-xc-host
+                                                (eval-in-lexenv (cdr binding) lexenv)
+                                                #+sb-xc-host ; no EVAL-IN-LEXENV
+                                                (if (null-lexenv-p lexenv)
+                                                    (eval (cdr binding))
+                                                    (bug "inline-lexenv?"))))
+                                       bindings)))
                           (recurse body
                                    (make-lexenv :default lexenv
                                                 :funs macros))))
@@ -1136,9 +1143,11 @@
 ;;; Given a lambda-list, return a FUN-TYPE object representing the signature:
 ;;; return type is *, and each individual arguments type is T -- but we get
 ;;; the argument counts and keywords.
+;;; TODO: enhance this to optionally accept an alist of (var . type)
+;;; and use that lieu of SB-INTERPRETER:APPROXIMATE-PROTO-FN-TYPE.
 (defun ftype-from-lambda-list (lambda-list)
   (multiple-value-bind (llks req opt rest key-list)
-      (parse-lambda-list lambda-list)
+      (parse-lambda-list lambda-list :silent t)
     (flet ((list-of-t (list) (mapcar (constantly t) list)))
       (let ((reqs (list-of-t req))
             (opts (when opt (cons '&optional (list-of-t opt))))
@@ -1261,7 +1270,26 @@
       (substitute-leaf fun var))
     fun))
 
+;;; Store INLINE-LAMBDA as the inline expansion of NAME.
 (defun %set-inline-expansion (name defined-fun inline-lambda)
+  (cond ((member inline-lambda '(:accessor :predicate))
+         ;; Special-case that implies a structure-related source-transform.
+         (when (info :function :inline-expansion-designator name)
+           ;; Any inline expansion that existed can't be useful.
+           (warn "structure ~(~A~) ~S clobbers inline function"
+                 inline-lambda name))
+         (setq inline-lambda nil)) ; will be cleared below
+        (t
+         ;; Warn if stomping on a structure predicate or accessor
+         ;; whether or not we are about to install an inline-lambda.
+         (let ((info (info :function :source-transform name)))
+           (when (consp info)
+             (clear-info :function :source-transform name)
+             ;; This is serious enough that you can get two warnings:
+             ;; - one because you redefined a function at all,
+             ;; - and one because the source-transform is erased.
+             (warn "redefinition of ~S clobbers structure ~:[accessor~;predicate~]"
+                   name (eq (cdr info) :predicate))))))
   (cond (inline-lambda
          (setf (info :function :inline-expansion-designator name)
                inline-lambda)
@@ -1273,19 +1301,22 @@
 
 ;;; the even-at-compile-time part of DEFUN
 ;;;
-;;; The INLINE-LAMBDA is a LAMBDA-WITH-LEXENV, or NIL if there is no
-;;; inline expansion.
+;;; The INLINE-LAMBDA is either the symbol :ACCESSOR, meaning that
+;;; the function is a structure accessor, or a LAMBDA-WITH-LEXENV,
+;;; or NIL if there is no inline expansion.
 (defun %compiler-defun (name inline-lambda compile-toplevel)
   (let ((defined-fun nil)) ; will be set below if we're in the compiler
     (when compile-toplevel
       (with-single-package-locked-error
           (:symbol name "defining ~S as a function")
         (setf defined-fun
-              (if inline-lambda
+              (if (consp inline-lambda)
+                  ;; FIFTH as an accessor - how informative!
+                  ;; Obfuscation aside, I doubt this is even right.
                   (get-defined-fun name (fifth inline-lambda))
                   (get-defined-fun name))))
       (when (boundp '*lexenv*)
-        (aver (fasl-output-p *compile-object*))
+        (aver (producing-fasl-file))
         (if (member name *fun-names-in-this-file* :test #'equal)
             (warn 'duplicate-definition :name name)
             (push name *fun-names-in-this-file*)))
@@ -1324,7 +1355,7 @@
   (when compile-toplevel
     (let ((name-key `(,kind ,name)))
       (when (boundp '*lexenv*)
-        (aver (fasl-output-p *compile-object*))
+        (aver (producing-fasl-file))
         (if (member name-key *fun-names-in-this-file* :test #'equal)
             (compiler-style-warn 'same-file-redefinition-warning :name name)
             (push name-key *fun-names-in-this-file*))))))

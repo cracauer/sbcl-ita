@@ -61,7 +61,7 @@
                 character-set-type unknown-type hairy-type
                 alien-type-type #+sb-simd-pack simd-pack-type)
             type)
-           (fun-type #'functionp)
+           (fun-type (specifier-type 'function))
            (compound-type
             (let* ((original (compound-type-types type))
                    (new (mapcar #'simplify original)))

@@ -88,7 +88,7 @@
   #+sb-xc-host (declare (ignore name))
   #-sb-xc-host
   (let ((stem (second name)))
-    (when (or (info :setf :inverse stem) (info :setf :expander stem))
+    (when (info :setf :expander stem)
       (compiler-style-warn
          "defining function ~S when ~S already has a SETF macro"
          name stem)))
@@ -108,8 +108,8 @@
       ;; symbol and its #<fdefn> object, it could lead to creation of
       ;; a non-unique #<fdefn> for a name.
       (frob :info
-            :type
-            :where-from
+            :type ; Hmm. What if it was proclaimed- shouldn't it stay?
+            :where-from ; Ditto.
             :inlinep
             :kind
             :macro-function
@@ -152,7 +152,7 @@ else returns NIL. If ENV is unspecified or NIL, use the global environment
 only."
   ;; local function definitions (ordinary) can shadow a global macro
   (typecase env
-    #!+sb-fasteval
+    #!+(and sb-fasteval (host-feature sb-xc))
     (sb!interpreter:basic-env
      (multiple-value-bind (kind def)
          (sb!interpreter:find-lexical-fun env symbol)
@@ -224,6 +224,7 @@ return NIL. Can be set with SETF when ENV is NIL."
     ;; we don't do it.
     (values (info :function :compiler-macro-function name))))
 
+;;; FIXME: we don't generate redefinition warnings for these.
 (defun (setf sb!xc:compiler-macro-function) (function name &optional env)
   (declare (type (or symbol list) name)
            (type (or function null) function))
@@ -252,7 +253,7 @@ return NIL. Can be set with SETF when ENV is NIL."
 ;;; should add some code to monitor this and make sure that nothing is
 ;;; unintentionally being sent to never never land this way.
 ;;; FIXME: Rename FDOCUMENTATION to BDOCUMENTATION, by analogy with
-;;; DEF!STRUCT and DEF!MACRO and so forth. And consider simply saving
+;;; DEF!STRUCT and so forth. And consider simply saving
 ;;; all the BDOCUMENTATION entries in a *BDOCUMENTATION* hash table
 ;;; and slamming them into PCL once PCL gets going.
 (defun (setf fdocumentation) (string name doc-type)
@@ -291,11 +292,30 @@ return NIL. Can be set with SETF when ENV is NIL."
            ;; CLHS says regarding DEFUN:
            ;; " Documentation is attached as a documentation string to
            ;;   /name/ (as kind function) and to the /function object/."
-           (when (legal-fun-name-p name)
-             (setf (%fun-doc (fdefinition name)) string)))
+           (cond ((not (legal-fun-name-p name)))
+                 ((not (equal (real-function-name name) name))
+                  (setf (random-documentation name 'function) string))
+                 (t
+                  (setf (%fun-doc (fdefinition name)) string))))
           ((typep name '(or symbol cons))
            (setf (random-documentation name doc-type) string))))
   string)
+
+#-sb-xc-host
+(defun real-function-name (name)
+  ;; Resolve the actual name of the function named by NAME
+  ;; e.g. (setf (name-function 'x) #'car)
+  ;; (real-function-name 'x) => CAR
+  (cond ((not (fboundp name))
+         nil)
+        ((and (symbolp name)
+              (macro-function name))
+         (let ((name (%fun-name (macro-function name))))
+           (and (consp name)
+                (eq (car name) 'macro-function)
+                (cadr name))))
+        (t
+         (%fun-name (fdefinition name)))))
 
 #-sb-xc-host
 (defun random-documentation (name type)

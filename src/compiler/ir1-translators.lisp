@@ -592,6 +592,16 @@ be a lambda expression."
                  (values `(global-function ,cname) nil)
                  (values `(%coerce-callable-to-fun ,source) give-up)))))))
 
+(defun source-variable-or-else (lvar fallback)
+  (let ((uses (principal-lvar-use lvar)) leaf name)
+    (or (and (ref-p uses)
+             (leaf-has-source-name-p (setf leaf (ref-leaf uses)))
+             (symbolp (setf name (leaf-source-name leaf)))
+             ;; assume users don't hand-write gensyms
+             (symbol-package name)
+             name)
+        fallback)))
+
 (defun ensure-lvar-fun-form (lvar lvar-name &optional give-up)
   (aver (and lvar-name (symbolp lvar-name)))
   (if (csubtypep (lvar-type lvar) (specifier-type 'function))
@@ -600,21 +610,15 @@ be a lambda expression."
         (cond (cname
                `(global-function ,cname))
               (give-up
-               (give-up-ir1-transform "not known to be a function"))
+               (give-up-ir1-transform
+                ;; No ~S here because if fallback is shown, it wants no quotes.
+                "~A is not known to be a function"
+                ;; LVAR-NAME is not what to show - if only it were that easy.
+                (source-variable-or-else lvar "callable expression")))
               (t
                `(%coerce-callable-to-fun ,lvar-name))))))
 
 ;;;; FUNCALL
-
-;;; FUNCALL is implemented on %FUNCALL, which can only call functions
-;;; (not symbols). %FUNCALL is used directly in some places where the
-;;; call should always be open-coded even if FUNCALL is :NOTINLINE.
-(deftransform funcall ((function &rest args) * *)
-  (let ((arg-names (make-gensym-list (length args))))
-    `(lambda (function ,@arg-names)
-       (declare (ignorable function))
-       `(%funcall ,(ensure-lvar-fun-form function 'function) ,@arg-names))))
-
 (def-ir1-translator %funcall ((function &rest args) start next result)
   ;; MACROEXPAND so that (LAMBDA ...) forms arriving here don't get an
   ;; extra cast inserted for them.
@@ -952,6 +956,31 @@ Consequences are undefined if any result is not of the declared type
 care."
   (the-in-policy value-type form **zero-typecheck-policy** start next result))
 
+(def-ir1-translator bound-cast ((array bound index) start next result)
+  (let ((check-bound-tran (make-ctran))
+        (index-ctran (make-ctran))
+        (index-lvar (make-lvar)))
+    ;; CHECK-BOUND transform ensure that INDEX won't be evaluated twice
+    (ir1-convert start check-bound-tran nil `(%check-bound ,array ,bound ,index))
+    (ir1-convert check-bound-tran index-ctran index-lvar index)
+    (let* ((check-bound-combination (ctran-use check-bound-tran))
+           (array (first (combination-args check-bound-combination)))
+           (bound (second (combination-args check-bound-combination)))
+           (derived (constant-lvar-p bound))
+           (type (specifier-type (if derived
+                                     `(integer 0 (,(lvar-value bound)))
+                                     '(and unsigned-byte fixnum))))
+           (cast (make-bound-cast :value index-lvar
+                                  :asserted-type type
+                                  :type-to-check type
+                                  :derived-type (coerce-to-values type)
+                                  :check check-bound-combination
+                                  :derived derived
+                                  :array array
+                                  :bound bound)))
+      (link-node-to-previous-ctran cast index-ctran)
+      (setf (lvar-dest index-lvar) cast)
+      (use-continuation cast next result))))
 #-sb-xc-host
 (setf (info :function :macro-function 'truly-the)
       (lambda (whole env)

@@ -20,21 +20,21 @@
   (declare (function function))
   ;; It's too bad that TYPECASE isn't able to generate equivalent code.
   (case (fun-subtype function)
-    (#.sb!vm:simple-fun-header-widetag
-     function)
     (#.sb!vm:closure-header-widetag
      (%closure-fun function))
     (#.sb!vm:funcallable-instance-header-widetag
      ;; %FUNCALLABLE-INSTANCE-FUNCTION is not known to return a FUNCTION.
      ;; Is that right? Shouldn't we always initialize to something
      ;; that is a function, such as an error-signaling trampoline?
-     (%fun-fun (%funcallable-instance-function function)))))
+     (%fun-fun (%funcallable-instance-function function)))
+    (t function)))
 
 (defun %fun-lambda-list (function)
   (typecase function
     #!+sb-fasteval
     (sb!interpreter:interpreted-function
-     (sb!interpreter:fun-pretty-arglist function))
+     (sb!interpreter:proto-fn-pretty-arglist
+      (sb!interpreter:fun-proto-fn function)))
     #!+sb-eval
     (sb!eval:interpreted-function
      (sb!eval:interpreted-function-debug-lambda-list function))
@@ -45,7 +45,8 @@
   (typecase function
     #!+sb-fasteval
     (sb!interpreter:interpreted-function
-     (sb!interpreter:set-fun-pretty-arglist function new-value))
+     (setf (sb!interpreter:proto-fn-pretty-arglist
+            (sb!interpreter:fun-proto-fn function)) new-value))
     #!+sb-eval
     (sb!eval:interpreted-function
      (setf (sb!eval:interpreted-function-debug-lambda-list function) new-value))
@@ -127,20 +128,32 @@
 ;;; (i.e., the third value returned from CL:FUNCTION-LAMBDA-EXPRESSION),
 ;;; or NIL if there's none
 (defun %fun-name (function)
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (sb!eval:interpreted-function-debug-name function))
-    #!+sb-fasteval
-    (sb!interpreter:interpreted-function (sb!interpreter:fun-name function))
-    (t
-     (let (name namedp)
-       (if (and (closurep function)
-                (progn
-                  (multiple-value-setq (name namedp) (closure-name function))
-                  namedp))
-           name
-           (%simple-fun-name (%fun-fun function)))))))
+  (case (fun-subtype function)
+    (#.sb!vm:funcallable-instance-header-widetag
+     (let ((layout (%funcallable-instance-layout function)))
+       ;; We know that funcallable-instance-p is true,
+       ;; and so testing via TYPEP would be wasteful.
+       (cond #!+sb-eval
+             ((eq layout #.(find-layout 'sb!eval:interpreted-function))
+              (return-from %fun-name
+                (sb!eval:interpreted-function-debug-name function)))
+             #!+sb-fasteval
+             ((eq layout #.(find-layout 'sb!interpreter:interpreted-function))
+               (return-from %fun-name
+                 (sb!interpreter:proto-fn-name
+                  (sb!interpreter:fun-proto-fn
+                   (truly-the sb!interpreter:interpreted-function function)))))
+             ;; Avoid fetching the layout again since we already have it.
+             ((classoid-cell-typep layout
+                                   #.(find-classoid-cell 'standard-generic-function)
+                                   function)
+              (return-from %fun-name
+                (sb!mop:generic-function-name function))))))
+    (#.sb!vm:closure-header-widetag
+     (multiple-value-bind (name namedp) (closure-name function)
+       (when namedp
+         (return-from %fun-name name)))))
+  (%simple-fun-name (%fun-fun function)))
 
 (defun (setf %fun-name) (new-value function)
   (typecase function
@@ -149,7 +162,8 @@
      (setf (sb!eval:interpreted-function-debug-name function) new-value))
     #!+sb-fasteval
     (sb!interpreter:interpreted-function
-     (sb!interpreter:set-fun-name function new-value))
+     (setf (sb!interpreter:proto-fn-name (sb!interpreter:fun-proto-fn function))
+           new-value))
     (generic-function
      ;; STANDARD-GENERIC-FUNCTION definitely has a NAME,
      ;; but other subtypes of GENERIC-FUNCTION could as well.
@@ -170,7 +184,7 @@
   (typecase function
     #!+sb-fasteval
     (sb!interpreter:interpreted-function
-     (sb!interpreter:fun-docstring function))
+     (sb!interpreter:proto-fn-docstring (sb!interpreter:fun-proto-fn function)))
     #!+sb-eval
     (sb!eval:interpreted-function
      (sb!eval:interpreted-function-documentation function))
@@ -186,7 +200,8 @@
   (typecase function
     #!+sb-fasteval
     (sb!interpreter:interpreted-function
-     (sb!interpreter:set-fun-docstring function new-value))
+     (setf (sb!interpreter:proto-fn-docstring
+            (sb!interpreter:fun-proto-fn function)) new-value))
     #!+sb-eval
     (sb!eval:interpreted-function
      (setf (sb!eval:interpreted-function-documentation function) new-value))
@@ -226,7 +241,7 @@
   #!+sb-doc
   "Return a string giving the name of the local machine."
   #!+win32 (sb!win32::get-computer-name)
-  #!-win32 (sb!unix:unix-gethostname))
+  #!-win32 (truly-the simple-string (sb!unix:unix-gethostname)))
 
 (defvar *machine-version*)
 

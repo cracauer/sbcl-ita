@@ -15,15 +15,28 @@
 ;;; but such nuance isn't hugely important.
 (in-package "SB!C")
 
-(declaim (ftype (function (t t t) (values t t &optional)) info)
-         (ftype (function (t t t) (values t &optional)) clear-info)
-         (ftype (function (t t t t) (values t &optional)) (setf info)))
+;;; Similar to FUNCTION, but the result type is "exactly" specified:
+;;; if it is an object type, then the function returns exactly one
+;;; value, if it is a short form of VALUES, then this short form
+;;; specifies the exact number of values.
+(def!type sfunction (args &optional result)
+  (let ((result (cond ((eq result '*) '*)
+                      ((or (atom result)
+                           (not (eq (car result) 'values)))
+                       `(values ,result &optional))
+                      ((intersection (cdr result) sb!xc:lambda-list-keywords)
+                       result)
+                      (t `(values ,@(cdr result) &optional)))))
+    `(function ,args ,result)))
+
+(declaim (ftype (sfunction (t t t) (values t t)) info)
+         (ftype (sfunction (t t t) t) clear-info)
+         (ftype (sfunction (t t t t) t) (setf info)))
 
 ;;; (:FUNCTION :TYPE) information is extracted through a wrapper.
 ;;; The globaldb representation is not necessarily literally a CTYPE.
 #-sb-xc-host
-(declaim (ftype (function (t) (values ctype boolean &optional))
-                proclaimed-ftype))
+(declaim (ftype (sfunction (t) (values ctype boolean)) proclaimed-ftype))
 
 ;;; At run time, we represent the type of a piece of INFO in the globaldb
 ;;; by a small integer between 1 and 63.  [0 is reserved for internal use.]
@@ -63,7 +76,7 @@
   (validate-function nil :type (or function null) :read-only t)
   ;; If FUNCTIONP, then a function called when there is no information of
   ;; this type. If not FUNCTIONP, then any object serving as a default.
-  (default nil))
+  (default nil :read-only t))
 
 (declaim (freeze-type meta-info))
 
@@ -71,6 +84,21 @@
 
 ;; Refer to info-vector.lisp for the meaning of this constant.
 (defconstant +no-auxilliary-key+ 0)
+
+;; Return the globaldb info for SYMBOL. With respect to the state diagram
+;; presented at the definition of SYMBOL-PLIST, if the object in SYMBOL's
+;; info slot is LISTP, it is in state 1 or 3. Either way, take the CDR.
+;; Otherwise, it is in state 2 so return the value as-is.
+;; In terms of this function being named "-vector", implying always a vector,
+;; it is understood that NIL is a proxy for +NIL-PACKED-INFOS+, a vector.
+;;
+#-sb-xc-host
+(progn
+ #!-symbol-info-vops (declaim (inline symbol-info-vector))
+ (defun symbol-info-vector (symbol)
+  (let ((info-holder (symbol-info symbol)))
+    (truly-the (or null simple-vector)
+               (if (listp info-holder) (cdr info-holder) info-holder)))))
 
 ;;; SYMBOL-INFO is a primitive object accessor defined in 'objdef.lisp'
 ;;; But in the host Lisp, there is no such thing as a symbol-info slot.
@@ -150,7 +178,7 @@
                           ,form
                           (progn
                             #-sb-xc-host
-                            (style-warn "(INFO ~S ~S) will fail at runtime."
+                            (style-warn "(~S ~S) is not a defined info type."
                                         category kind)
                             .whole.)))
                     .whole.))))
@@ -182,6 +210,25 @@
   (def clear-info (category kind name)
     `(clear-info-values ,name '(,(meta-info-number meta-info)))))
 
+;; interface to %ATOMIC-SET-INFO-VALUE
+;; GET-INFO-VALUE-INITIALIZING is a restricted case of this,
+;; and perhaps could be implemented as such.
+;; Atomic update will be important for making the fasloader threadsafe
+;; using a predominantly lock-free design, and other nice things.
+(defmacro atomic-set-info-value (category kind name lambda)
+  (with-unique-names (info-number proc)
+    `(let ((,info-number
+            ,(if (and (keywordp category) (keywordp kind))
+                 (meta-info-number (meta-info category kind))
+                 `(meta-info-number (meta-info ,category ,kind)))))
+       ,(if (and (listp lambda) (eq (car lambda) 'lambda))
+            ;; rewrite as FLET because the compiler is unable to dxify
+            ;;   (DX-LET ((x (LAMBDA <whatever>))) (F x))
+            (destructuring-bind (lambda-list . body) (cdr lambda)
+              `(dx-flet ((,proc ,lambda-list ,@body))
+                 (%atomic-set-info-value ,name ,info-number #',proc)))
+            `(%atomic-set-info-value ,name ,info-number ,lambda)))))
+
 ;; Perform the approximate equivalent operations of retrieving
 ;; (INFO :CATEGORY :KIND NAME), but if no info is found, invoke CREATION-FORM
 ;; to produce an object that becomes the value for that piece of info, storing
@@ -200,3 +247,99 @@
              (meta-info-number (meta-info category kind))
              `(meta-info-number (meta-info ,category ,kind)))
         ,name #',proc))))
+
+;;;; boolean attribute utilities
+;;;;
+;;;; We need to maintain various sets of boolean attributes for known
+;;;; functions and VOPs. To save space and allow for quick set
+;;;; operations, we represent the attributes as bits in a fixnum.
+
+(deftype attributes () 'fixnum)
+
+;;; Given a list of attribute names and an alist that translates them
+;;; to masks, return the OR of the masks.
+(defun encode-attribute-mask (names universe)
+  (loop for name in names
+        for pos = (position name universe)
+        sum (if pos (ash 1 pos) (error "unknown attribute name: ~S" name))))
+
+(defun decode-attribute-mask (bits universe)
+  (loop for name across universe
+        for mask = 1 then (ash mask 1)
+        when (logtest mask bits) collect name))
+
+;;; Define a new class of boolean attributes, with the attributes
+;;; having the specified ATTRIBUTE-NAMES. NAME is the name of the
+;;; class, which is used to generate some macros to manipulate sets of
+;;; the attributes:
+;;;
+;;;    NAME-attributep attributes attribute-name*
+;;;      Return true if one of the named attributes is present, false
+;;;      otherwise. When set with SETF, updates the place Attributes
+;;;      setting or clearing the specified attributes.
+;;;
+;;;    NAME-attributes attribute-name*
+;;;      Return a set of the named attributes.
+(defmacro !def-boolean-attribute (name &rest attribute-names)
+  (let ((vector (coerce attribute-names 'vector))
+        (constructor (symbolicate name "-ATTRIBUTES"))
+        (test-name (symbolicate name "-ATTRIBUTEP")))
+    `(progn
+       (defmacro ,constructor (&rest attribute-names)
+         #!+sb-doc
+         "Automagically generated boolean attribute creation function.
+  See !DEF-BOOLEAN-ATTRIBUTE."
+         (encode-attribute-mask attribute-names ,vector))
+       (defun ,(symbolicate "DECODE-" name "-ATTRIBUTES") (attributes)
+         (decode-attribute-mask attributes ,vector))
+       (defmacro ,test-name (attributes &rest attribute-names)
+         #!+sb-doc
+         "Automagically generated boolean attribute test function.
+  See !DEF-BOOLEAN-ATTRIBUTE."
+         `(logtest (the attributes ,attributes)
+                   (,',constructor ,@attribute-names)))
+       (define-setf-expander ,test-name (place &rest attributes
+                                               &environment env)
+         #!+sb-doc
+         "Automagically generated boolean attribute setter. See
+ !DEF-BOOLEAN-ATTRIBUTE."
+         (multiple-value-bind (temps values stores setter getter)
+             (#+sb-xc-host get-setf-expansion
+              #-sb-xc-host sb!xc:get-setf-expansion place env)
+           (when (cdr stores)
+             (error "multiple store variables for ~S" place))
+           (let ((newval (sb!xc:gensym))
+                 (n-place (sb!xc:gensym))
+                 (mask (encode-attribute-mask attributes ,vector)))
+             (values `(,@temps ,n-place)
+                     `(,@values ,getter)
+                     `(,newval)
+                     `(let ((,(first stores)
+                             (if ,newval
+                                 (logior ,n-place ,mask)
+                                 (logandc2 ,n-place ,mask))))
+                        ,setter
+                        ,newval)
+                     `(,',test-name ,n-place ,@attributes))))))))
+
+;;; And now for some gratuitous pseudo-abstraction...
+;;;
+;;; ATTRIBUTES-UNION
+;;;   Return the union of all the sets of boolean attributes which are its
+;;;   arguments.
+;;; ATTRIBUTES-INTERSECTION
+;;;   Return the intersection of all the sets of boolean attributes which
+;;;   are its arguments.
+;;; ATTRIBUTES=
+;;;   True if the attributes present in ATTR1 are identical to
+;;;   those in ATTR2.
+(defmacro attributes-union (&rest attributes)
+  `(the attributes
+        (logior ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
+(defmacro attributes-intersection (&rest attributes)
+  `(the attributes
+        (logand ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
+(declaim (ftype (function (attributes attributes) boolean) attributes=))
+#!-sb-fluid (declaim (inline attributes=))
+(defun attributes= (attr1 attr2)
+  (eql attr1 attr2))

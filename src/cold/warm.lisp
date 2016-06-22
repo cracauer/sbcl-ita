@@ -23,6 +23,12 @@
 
 ;;;; package hacking
 
+;;; Assert that genesis preserves shadowing symbols.
+(let ((p sb-assem::*backend-instruction-set-package*))
+  (unless (eq p (find-package "SB-VM"))
+    (dolist (expect '("SEGMENT" "MAKE-SEGMENT"))
+      (assert (find expect (package-shadowing-symbols p) :test 'string=)))))
+
 ;;; FIXME: This nickname is a deprecated hack for backwards
 ;;; compatibility with code which assumed the CMU-CL-style
 ;;; SB-ALIEN/SB-C-CALL split. That split went away and was deprecated
@@ -38,6 +44,20 @@
 ;;;; compiling and loading more of the system
 
 (load "src/cold/muffler.lisp")
+
+(unless (member sb-int:+empty-ht-slot+ sb-vm::*static-symbols*)
+  ;; It doesn't "just work" to unintern the marker symbol, because then
+  ;; then compiler thinks that equivalence-as-constant for such symbol permits
+  ;; creation of new uninterned symbol at load-time, never mind that it was
+  ;; accessed by way of a named global constant. Changing +EMPTY-HT-SLOT+
+  ;; into a macro that explicitly calls LOAD-TIME-VALUE makes it work out.
+  ;; I didn't want to think about getting this right in cold-init though.
+  (setf (sb-int:info :variable :macro-expansion 'sb-int:+empty-ht-slot+)
+        '(load-time-value (symbol-global-value 'sb-int:+empty-ht-slot+) t))
+  ;; Sneaky! Now it's both a constant and a macro
+  (setf (sb-int:info :variable :kind 'sb-int:+empty-ht-slot+) :macro))
+
+(unintern sb-int:+empty-ht-slot+ (symbol-package sb-int:+empty-ht-slot+))
 
 ;;; FIXME: CMU CL's pclcom.lisp had extra optional stuff wrapped around
 ;;; COMPILE-PCL, at least some of which we should probably have too:
@@ -69,7 +89,16 @@
 ;;; into build-order.lisp-expr with some new flag (perhaps :WARM) to
 ;;; indicate that the files should be handled not in cold load but
 ;;; afterwards.
-(let ((pcl-srcs
+(let ((interpreter-srcs
+              #+sb-fasteval
+              '("SRC;INTERPRETER;MACROS"
+                "SRC;INTERPRETER;CHECKFUNS"
+                "SRC;INTERPRETER;ENV"
+                "SRC;INTERPRETER;SEXPR"
+                "SRC;INTERPRETER;SPECIAL-FORMS"
+                "SRC;INTERPRETER;EVAL"
+                "SRC;INTERPRETER;DEBUG"))
+       (pcl-srcs
               '(;; CLOS, derived from the PCL reference implementation
                 ;;
                 ;; This PCL build order is based on a particular
@@ -112,8 +141,8 @@
                 "SRC;PCL;PRECOM1"
                 "SRC;PCL;PRECOM2"))
       (other-srcs
-              '(;; miscellaneous functionality which depends on CLOS
-                "SRC;CODE;FORCE-DELAYED-DEFBANGMETHODS"
+              '("SRC;CODE;SETF-FUNS"
+                ;; miscellaneous functionality which depends on CLOS
                 "SRC;CODE;LATE-CONDITION"
 
                 ;; CLOS-level support for the Gray OO streams
@@ -129,14 +158,6 @@
                 ;; to warm init to reduce peak memory requirement in
                 ;; cold init
                 "SRC;CODE;DESCRIBE"
-
-                #+sb-fasteval "SRC;INTERPRETER;MACROS"
-                #+sb-fasteval "SRC;INTERPRETER;CHECKFUNS"
-                #+sb-fasteval "SRC;INTERPRETER;ENV"
-                #+sb-fasteval "SRC;INTERPRETER;SEXPR"
-                #+sb-fasteval "SRC;INTERPRETER;SPECIAL-FORMS"
-                #+sb-fasteval "SRC;INTERPRETER;EVAL"
-                #+sb-fasteval "SRC;INTERPRETER;DEBUG"
 
                 "SRC;CODE;DESCRIBE-POLICY"
                 "SRC;CODE;INSPECT"
@@ -196,64 +217,15 @@
                     (error "LOAD of ~S failed." output-truename))
                   (sb-int:/show "done loading" output-truename))))))))
 
-   (let* ((ppd (copy-pprint-dispatch))
-          (sb-debug:*debug-print-variable-alist*
-           (list (cons '*print-pprint-dispatch* ppd)))
-          (*print-pprint-dispatch* ppd))
-     (set-pprint-dispatch
-      'sb-kernel:layout (lambda (stream obj)
-                          (print-unreadable-object (obj stream :type t)
-                            (write (sb-int:awhen (sb-kernel:layout-classoid obj)
-                                     (sb-kernel:classoid-name sb-int:it))
-                                   :stream stream))))
-     (set-pprint-dispatch
-      'sb-kernel:classoid (lambda (stream obj)
-                            (print-unreadable-object (obj stream :type t)
-                              (write (sb-kernel:classoid-name obj) :stream stream))))
-     (set-pprint-dispatch
-      'sb-kernel:ctype (lambda (stream obj)
-                         (print-unreadable-object (obj stream :type t)
-                           (prin1 (sb-kernel:type-specifier obj) stream))))
-     (set-pprint-dispatch
-      'package (lambda (stream obj)
-                 (print-unreadable-object (obj stream :type t)
-                   (write (package-name obj) :stream stream))))
-     (set-pprint-dispatch
-      'pathname (lambda (stream obj)
-                  (write-string "#P" stream)
-                  (write (namestring obj) :stream stream)))
-     (set-pprint-dispatch
-      'sb-thread:thread (lambda (stream obj)
-                          (declare (ignore obj))
-                          (write-string "#<main-thread>" stream)))
-     (set-pprint-dispatch
-      'restart (lambda (stream obj)
-                 (print-unreadable-object (obj stream :type t :identity t)
-                   (write (restart-name obj) :stream stream))))
-     ;; These next two are coded in a totally brittle way, but no more wrong
-     ;; than typing the decoding expressions into the debugger to decipher
-     ;; a backtrace. Anyway, if it ceases to print right, just fix it again!
-     (set-pprint-dispatch
-      ;; Circumlocution avoids use of unknown type.
-      '(and function (satisfies sb-pcl::generic-function-p))
-      (lambda (stream obj)
-        (format stream "<~S ~S>" (type-of obj)
-                (svref (sb-kernel:%funcallable-instance-info obj 1) 5))))
-     ;; dangerous: this type doesn't exist, and the testable-type-p thing
-     ;; isn't working the way it should. It's supposed to enable the ppd entry
-     ;; as soon as CLASS becomes defined, but instead it goes bonkers.
-     #+nil
-     (set-pprint-dispatch
-      'class
-      (lambda (stream obj)
-        (format stream "<~S ~S>" (type-of obj)
-                (svref (sb-kernel:%instance-ref obj 1) 3))))
-     (with-compilation-unit ()
-       (let ((*compile-print* nil))
-         (do-srcs pcl-srcs)))
-     (when *compile-files-p*
-       (format t "~&; Done with PCL compilation~2%"))
-     (do-srcs other-srcs))))
+  (with-compilation-unit ()
+    (let ((*compile-print* nil))
+      (do-srcs interpreter-srcs)))
+  (with-compilation-unit ()
+    (let ((*compile-print* nil))
+      (do-srcs pcl-srcs)))
+  (when *compile-files-p*
+    (format t "~&; Done with PCL compilation~2%"))
+  (do-srcs other-srcs)))
 
 ;;;; setting package documentation
 

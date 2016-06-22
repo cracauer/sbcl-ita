@@ -88,14 +88,23 @@
 ;;; Run the cross-compiler to produce cold fasl files.
 ;; ... and since the cross-compiler hasn't seen a DEFMACRO for QUASIQUOTE,
 ;; make it think it has, otherwise it fails more-or-less immediately.
-(setf (sb!int:info :function :kind 'sb!int:quasiquote) :macro
-      (sb!int:info :function :macro-function 'sb!int:quasiquote)
-      (cl:macro-function 'sb!int:quasiquote))
+(setf (sb-xc:macro-function 'sb!int:quasiquote)
+      (lambda (form env)
+        (the sb!kernel:lexenv-designator env)
+        (sb!impl::expand-quasiquote (second form) t)))
 (setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
-(progn ; Should be: sb-xc:with-compilation-unit () ... but
-  ;; leaving aside the question of building in any host - which shouldn't
-  ;; matter - building SBCL in SBCL can hang in a way I haven't tracked down.
-  (load "src/cold/compile-cold-sbcl.lisp"))
+(let (fail)
+  (sb-xc:with-compilation-unit ()
+    (load "src/cold/compile-cold-sbcl.lisp")
+    ;; Enforce absence of unexpected forward-references to warm loaded code.
+    ;; Looking into a hidden detail of this compiler seems fair game.
+    #!+(or x86 x86-64) ; until all the rest are clean
+    (when sb!c::*undefined-warnings* (setq fail t)))
+  ;; Exit the compilation unit so that the summary is printed. Then complain.
+  (when fail
+    #!-win32 ; build is known to be unclean
+    (cerror "Proceed anyway"
+            "SB-COLD::*UNDEFINED-FUN-WHITELIST* is incomplete")))
 
 (when sb!c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
@@ -116,14 +125,22 @@
                  (push (cons name cell) likely-suspicious)
                  (push (cons name cell) possibly-suspicious))))))
     (flet ((show (label list)
-             (format t "~%~A suspicious calls:~:{~%~*~4d ~0@*~S~*~@{~%     ~S~}~}~%"
-                     label (sort list #'> :key #'cadr))))
+             (when list
+               (format t "~%~A suspicious calls:~:{~%~4d ~S~@{~%     ~S~}~}~%"
+                       label
+                       (mapcar (lambda (x) (list* (ash (cadr x) -2) (car x) (cddr x)))
+                               (sort list #'> :key #'cadr))))))
       ;; Called inlines not in the presence of a declaration to the contrary
       ;; indicate that perhaps the function definition appeared too late.
       (show "Likely" likely-suspicious)
       ;; Failed transforms are considered not quite as suspicious
       ;; because it could either be too late, or that the transform failed.
-      (show "Possibly" possibly-suspicious))))
+      (show "Possibly" possibly-suspicious))
+    ;; As each platform's build becomes warning-free,
+    ;; it should be added to the list here to prevent regresssions.
+    #!+(and (or x86 x86-64) (or linux darwin))
+    (when likely-suspicious
+      (warn "Expected zero inlinining failures"))))
 
 ;; After cross-compiling, show me a list of types that checkgen
 ;; would have liked to use primitive traps for but couldn't.

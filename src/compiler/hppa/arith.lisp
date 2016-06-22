@@ -200,22 +200,30 @@
         (:note "inline ASH")
         (:policy :fast-safe)
         (:args (number :scs (,reg) :to :save)
-               (count  :scs (signed-reg)
-                       ,@(if save
-                           '(:to :save))))
+               (count  :scs (signed-reg)))
         (:arg-types ,num ,tag)
         (:results (result :scs (,reg)))
         (:result-types ,num)
-        (:temporary (:scs (unsigned-reg) :to (:result 0)) temp)
+        (:temporary (:scs (unsigned-reg)
+                          ,@(unless save
+                              '(:to (:result 0)))) temp)
         (:generator 8
           (inst comb :>= count zero-tn positive :nullify t)
           (inst sub zero-tn count temp)
-          (inst comiclr 31 temp zero-tn :>=)
-          (inst li 31 temp)
-          (inst mtctl temp :sar)
-          (inst extrs number 0 1 temp)
-          (inst b done)
-          (inst shd temp number :variable result)
+          ,@(if save
+                '(;; Unsigned case
+                  (inst comiclr 31 temp result :>=)
+                  (inst b done :nullify t)
+                  (inst mtctl temp :sar)
+                  (inst b done)
+                  (inst shd zero-tn number :variable result))
+                '(;; Signed case
+                  (inst comiclr 31 temp zero-tn :>=)
+                  (inst li 31 temp)
+                  (inst mtctl temp :sar)
+                  (inst extrs number 0 1 temp)
+                  (inst b done)
+                  (inst shd temp number :variable result)))
           POSITIVE
           (inst subi 31 count temp)
           (inst mtctl temp :sar)
@@ -435,7 +443,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 30
-    (let ((zero (generate-error-code vop division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
       (inst bc := nil y zero-tn zero))
     (move x x-pass)
     (move y y-pass)
@@ -447,6 +455,9 @@
     ;(move q-pass q)
     (move r-pass r)))
 
+#+(or) ;; This contains two largely-inexplicable hacks, and there's no
+       ;; equivalent VOP for either Alpha or ARM.  Why is this even
+       ;; here?  -- AB, 2015-11-19
 (define-vop (fast-truncate/unsigned fast-unsigned-binop)
   (:translate truncate)
   (:args (x :scs (unsigned-reg) :target x-pass)
@@ -465,7 +476,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 35
-    (let ((zero (generate-error-code vop division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
       (inst bc := nil y zero-tn zero))
     (move x x-pass)
     (move y y-pass)
@@ -509,7 +520,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 35
-    (let ((zero (generate-error-code vop division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
       (inst bc := nil y zero-tn zero))
     (move x x-pass)
     (move y y-pass)

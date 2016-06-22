@@ -56,8 +56,17 @@
 (sb!xc:deftype pathname-version ()
   '(or integer (member nil :newest :wild :unspecific)))
 
-;;; internal time format. (Note: not a FIXNUM, ouch..)
-(sb!xc:deftype internal-time () 'unsigned-byte)
+;;; Internal time format.
+;;; 62 bits should give
+;;; one hundred forty-six million one hundred thirty-five thousand five hundred twenty years of runtime
+;;; It's dangerous to run SBCL for that long without updating.
+;;; And it'll be a fixnum on 64-bit targets.
+;;; The result from querying get-internal-run-time with multiple cores
+;;; running full tilt will exhaust this faster, but it's still plenty enough.
+(sb!xc:deftype internal-time () '(unsigned-byte 62))
+(sb!xc:deftype internal-seconds ()
+  '(unsigned-byte
+    #.(- 62 (floor (log sb!xc:internal-time-units-per-second 2)))))
 
 (sb!xc:deftype bignum-element-type () `(unsigned-byte ,sb!vm:n-word-bits))
 (sb!xc:deftype bignum-type () 'bignum)
@@ -110,17 +119,11 @@
           ;; DERIVE-TYPE optimizer works.  -- CSR, 2002-08-19
           (contains-unknown-type-p eltype))
       *wild-type*
-      (dolist (stype-name *specialized-array-element-types*
-                          *universal-type*)
-        ;; FIXME: Mightn't it be better to have
-        ;; *SPECIALIZED-ARRAY-ELEMENT-TYPES* be stored as precalculated
-        ;; SPECIFIER-TYPE results, instead of having to calculate
-        ;; them on the fly this way? (Call the new array
-        ;; *SPECIALIZED-ARRAY-ELEMENT-SPECIFIER-TYPES* or something..)
-        (let ((stype (specifier-type stype-name)))
-          (aver (not (unknown-type-p stype)))
-          (when (csubtypep eltype stype)
-            (return stype))))))
+      (dovector (stype
+                 (literal-ctype-vector *parsed-specialized-array-element-types*)
+                 *universal-type*)
+       (when (csubtypep eltype stype)
+         (return stype)))))
 
 (defun sb!xc:upgraded-array-element-type (spec &optional environment)
   #!+sb-doc
@@ -128,17 +131,13 @@
    with the specifier :ELEMENT-TYPE Spec."
   (declare (type lexenv-designator environment) (ignore environment))
   (declare (explicit-check))
-  (handler-case
-      ;; Can't rely on SPECIFIER-TYPE to signal PARSE-UNKNOWN-TYPE in
-      ;; the case of (AND KNOWN UNKNOWN), since the result of the
-      ;; outter call to SPECIFIER-TYPE can be cached by the code that
-      ;; doesn't catch PARSE-UNKNOWN-TYPE signal.
-      (let ((type (specifier-type spec)))
-        (if (contains-unknown-type-p type)
-            (error "Undefined type: ~S" spec)
-            (type-specifier (%upgraded-array-element-type type))))
-    (parse-unknown-type (c)
-      (error "Undefined type: ~S" (parse-unknown-type-specifier c)))))
+  (let ((type (type-or-nil-if-unknown spec)))
+    (cond ((not type)
+           ;; What about a FUNCTION-TYPE - would (FUNCTION (UNKNOWN) UNKNOWN)
+           ;; upgrade to T? Well, it's still ok to say it's an error.
+           (error "Undefined type: ~S" spec))
+          (t
+           (type-specifier (%upgraded-array-element-type type))))))
 
 (defun sb!xc:upgraded-complex-part-type (spec &optional environment)
   #!+sb-doc
@@ -146,10 +145,10 @@
    can hold parts of type SPEC."
   (declare (type lexenv-designator environment) (ignore environment))
   (declare (explicit-check))
-  (let ((type (specifier-type spec)))
+  (let ((type (type-or-nil-if-unknown spec)))
     (cond
       ((eq type *empty-type*) nil)
-      ((unknown-type-p type) (error "undefined type: ~S" spec))
+      ((not type) (error "Undefined type: ~S" spec))
       (t
        (let ((ctype (specifier-type `(complex ,spec))))
          (cond
@@ -175,40 +174,6 @@
                 (error "~S isn't an integer type?" subtype))
     (when (csubtypep subtype (specifier-type type))
       (return type))))
-
-;;; If TYPE has a CHECK-xxx template, but doesn't have a corresponding
-;;; PRIMITIVE-TYPE, then return the template's name. Otherwise, return NIL.
-(defun hairy-type-check-template-name (type)
-  (declare (type ctype type))
-  (typecase type
-    (cons-type
-     (if (type= type (specifier-type 'cons))
-         'sb!c:check-cons
-         nil))
-    (built-in-classoid
-     (if (type= type (specifier-type 'symbol))
-         'sb!c:check-symbol
-         nil))
-    (numeric-type
-     (cond ((type= type (specifier-type 'fixnum))
-            'sb!c:check-fixnum)
-           #!-64-bit
-           ((type= type (specifier-type '(signed-byte 32)))
-            'sb!c:check-signed-byte-32)
-           #!-64-bit
-           ((type= type (specifier-type '(unsigned-byte 32)))
-            'sb!c:check-unsigned-byte-32)
-           #!+64-bit
-           ((type= type (specifier-type '(signed-byte 64)))
-            'sb!c:check-signed-byte-64)
-           #!+64-bit
-           ((type= type (specifier-type '(unsigned-byte 64)))
-            'sb!c:check-unsigned-byte-64)
-           (t nil)))
-    (fun-type
-     'sb!c:check-fun)
-    (t
-     nil)))
 
 ;; Given a union type INPUT, see if it fully covers an ARRAY-* type,
 ;; and unite into that when possible, taking care to handle more

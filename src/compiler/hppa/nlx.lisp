@@ -1,11 +1,5 @@
 (in-package "SB!VM")
 
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* immediate-arg-scn)
-   env))
-
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 (defun make-nlx-entry-arg-start-location ()
@@ -67,11 +61,11 @@
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 22
-    (inst addi (* (tn-offset tn) n-word-bytes) cfp-tn block)
+    (inst ldo (* (tn-offset tn) n-word-bytes) cfp-tn block)
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew cfp-tn block unwind-block-current-cont-slot)
-    (storew code-tn block unwind-block-current-code-slot)
+    (storew temp block unwind-block-uwp-slot)
+    (storew cfp-tn block unwind-block-cfp-slot)
+    (storew code-tn block unwind-block-code-slot)
     (inst compute-lra-from-code code-tn entry-label ndescr temp)
     (storew temp block catch-block-entry-pc-slot)))
 
@@ -87,11 +81,11 @@
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 44
-    (inst addi (* (tn-offset tn) n-word-bytes) cfp-tn result)
+    (inst ldo (* (tn-offset tn) n-word-bytes) cfp-tn result)
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp result catch-block-current-uwp-slot)
-    (storew cfp-tn result catch-block-current-cont-slot)
-    (storew code-tn result catch-block-current-code-slot)
+    (storew temp result catch-block-uwp-slot)
+    (storew cfp-tn result catch-block-cfp-slot)
+    (storew code-tn result catch-block-code-slot)
     (inst compute-lra-from-code code-tn entry-label ndescr temp)
     (storew temp result catch-block-entry-pc-slot)
 
@@ -108,7 +102,7 @@
   (:args (tn))
   (:temporary (:scs (descriptor-reg)) new-uwp)
   (:generator 7
-    (inst addi (* (tn-offset tn) n-word-bytes) cfp-tn new-uwp)
+    (inst ldo (* (tn-offset tn) n-word-bytes) cfp-tn new-uwp)
     (store-symbol-value new-uwp *current-unwind-protect-block*)))
 
 
@@ -127,7 +121,7 @@
   (:translate %unwind-protect-breakup)
   (:generator 17
     (load-symbol-value block *current-unwind-protect-block*)
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-symbol-value block *current-unwind-protect-block*)))
 
 

@@ -33,18 +33,18 @@
 #!+sb-show (defvar */show* t)
 
 #!+sb-show
-(defun cannot-/show (string)
+(defmacro cannot-/show (string)
   (declare (type simple-string string))
-  #+sb-xc-host (error "can't /SHOW: ~A" string)
+  (declare (notinline concatenate))
+  #+sb-xc-host `(error "can't /SHOW: ~A" ,string)
   ;; We end up in this situation when we execute /SHOW too early in
   ;; cold init. That happens to me often enough that it's really
   ;; annoying for it to cause a hard failure -- which at that point is
   ;; hard to recover from -- instead of just diagnostic output.
   #-sb-xc-host
-  (progn (%primitive print
-          (concatenate 'simple-base-string
-                       "/can't /SHOW:" (the simple-base-string string)))
-         t))
+  `(progn (%primitive print
+           ,(concatenate 'simple-base-string "/can't /SHOW:" string))
+          t))
 
 ;;; Should /SHOW output be suppressed at this point?
 ;;;
@@ -61,6 +61,10 @@
          ;; ordinary, healthy reason to suppress /SHOW, no error
          ;; output needed. Assume by default _not_ to suppress.
       (and (boundp '*/show*) (not */show*))))
+
+
+#!+(and sb-show (host-feature sb-xc))
+(declaim (special *print-pretty*))
 
 ;;; shorthand for a common idiom in output statements used in
 ;;; debugging: (/SHOW "Case 2:" X Y) becomes a pretty-printed version
@@ -122,12 +126,10 @@
 ;;; */SHOW* at runtime, because messing with special variables early
 ;;; in cold load is too much trouble to be worth it.
 (defmacro /show0 (&rest string-designators)
-  ;; We can't use inline MAPCAR here because, at least in 0.6.11.x,
-  ;; this code gets compiled before DO-ANONYMOUS is defined.
-  ;; Similarly, we don't use inline CONCATENATE, because some of the
+  ;; We don't inline CONCATENATE, because some of the
   ;; machinery behind its optimizations isn't available in the
   ;; cross-compiler.
-  (declare (notinline mapcar concatenate))
+  (declare (notinline concatenate))
   (let ((s (apply #'concatenate
                   'simple-string
                   (mapcar #'string string-designators))))

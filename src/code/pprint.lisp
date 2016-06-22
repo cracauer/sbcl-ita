@@ -23,7 +23,7 @@
 (defun posn-column (posn stream)
   (declare (type posn posn) (type pretty-stream stream)
            (values posn))
-  (index-column (posn-index posn stream) stream))
+  (truly-the posn (index-column (posn-index posn stream) stream)))
 
 ;;; Is it OK to do pretty printing on this stream at this time?
 (defun print-pretty-on-stream-p (stream)
@@ -709,6 +709,7 @@ line break."
 
 ;;;; pprint-dispatch tables
 
+(defglobal *standard-pprint-dispatch-table* nil)
 (defglobal *initial-pprint-dispatch-table* nil)
 
 (defstruct (pprint-dispatch-entry
@@ -727,7 +728,10 @@ line break."
   (initial-p (null *initial-pprint-dispatch-table*) :type boolean :read-only t)
   ;; and the associated function
   (fun nil :type callable :read-only t))
-(def!method print-object ((entry pprint-dispatch-entry) stream)
+
+(declaim (freeze-type pprint-dispatch-entry))
+
+(defmethod print-object ((entry pprint-dispatch-entry) stream)
   (print-unreadable-object (entry stream :type t)
     (format stream "type=~S, priority=~S~@[ [initial]~]"
             (pprint-dispatch-entry-type entry)
@@ -804,9 +808,7 @@ line break."
               (return entry)))))
     (if entry
         (values (pprint-dispatch-entry-fun entry) t)
-        (values (lambda (stream object)
-                  (output-ugly-object object stream))
-                nil))))
+        (values #'output-ugly-object nil))))
 
 (defun assert-not-standard-pprint-dispatch-table (pprint-dispatch operation)
   (when (eq pprint-dispatch *standard-pprint-dispatch-table*)
@@ -889,7 +891,7 @@ line break."
 
 (defun pprint-array (stream array)
   (cond ((and (null *print-array*) (null *print-readably*))
-         (output-ugly-object array stream))
+         (output-ugly-object stream array))
         ((and *print-readably*
               (not (array-readably-printable-p array)))
          (if *read-eval*
@@ -1236,7 +1238,7 @@ line break."
 ;;;        puts a newline in between INTO and COUNT.
 ;;;        It would be awesome to have code in common with the macro
 ;;;        the properly represents each clauses.
-(defvar *loop-seperating-clauses*
+(defglobal *loop-separating-clauses*
   '(:and
     :with :for
     :initially :finally
@@ -1263,7 +1265,7 @@ line break."
     (write-char #\space stream)
     (loop for thing = (pprint-pop)
           when (and (symbolp thing)
-                    (member thing  *loop-seperating-clauses* :test #'string=))
+                    (member thing  *loop-separating-clauses* :test #'string=))
           do (pprint-newline :mandatory stream)
           do (output-object thing stream)
           do (pprint-exit-if-list-exhausted)
@@ -1364,17 +1366,6 @@ line break."
                  (,flet-name stream)
                  (force-pretty-output stream)))))
        nil))))
-
-;;; OUTPUT-PRETTY-OBJECT is called by OUTPUT-OBJECT when
-;;; *PRINT-PRETTY* is true.
-(defun output-pretty-object (object stream)
-  (multiple-value-bind (fun pretty) (pprint-dispatch object)
-    (if pretty
-        (with-pretty-stream (stream)
-          (funcall fun stream object))
-        ;; No point in consing up a pretty stream if we are not using pretty
-        ;; printing the object after all.
-        (output-ugly-object object stream))))
 
 (defun call-logical-block-printer (proc stream prefix per-line-p suffix
                                    &optional (object nil obj-supplied-p))

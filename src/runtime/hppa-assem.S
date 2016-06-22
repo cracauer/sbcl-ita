@@ -115,8 +115,8 @@ call_into_lisp:
   addil   L%return_from_lisp_stub-$global$,%dp
   ldw     R%return_from_lisp_stub-$global$(0,%r1),reg_NL0
   be,n  0(%sr5,reg_NL0)
-#else                 
-  be,n  0(%sr5,reg_NL0)
+#else
+  be,n  0(%sr5,reg_LIP)
 #endif
 
 	break	0,0
@@ -278,12 +278,7 @@ call_into_c_return:
 
 /*
  * Stuff to sanctify a block of memory for execution.
- * FIX why does this code work: parisc2.0 guide tells
- * us that we should add an sync after fdc and fic and
- * then let seven nops be executed before executing the
- * sanctified code.
  */
-
 
 	.EXPORT sanctify_for_execution
 sanctify_for_execution:
@@ -292,16 +287,24 @@ sanctify_for_execution:
 	.entry
 	/* %arg0=start addr, %arg1=length in bytes */
 	add	%arg0,%arg1,%arg1
+        copy	%arg0,%arg2
 	ldo	-1(%arg1),%arg1
 	depi	0,31,5,%arg0
 	depi	0,31,5,%arg1
 	ldsid	(%arg0),%r1
 	mtsp	%r1,%sr1
 	ldi	32,%r1			; bytes per cache line
+        /* parisc 1.1 and 2.0 manuals say to flush the dcache, SYNC,
+	 * flush the icache, SYNC again, and burn seven instructions
+	 * before executing modified code. */
 sanctify_loop:
-	fdc	0(%sr1,%arg0)
 	comb,<	%arg0,%arg1,sanctify_loop
-	fic,m	%r1(%sr1,%arg0)
+	fdc,m	%r1(%sr1,%arg0)
+        sync
+sanctify_loop_2:
+	comb,<	%arg2,%arg1,sanctify_loop_2
+	fic,m	%r1(%sr1,%arg2)
+        sync
 
 	bv	%r0(%rp)
 	nop
@@ -487,7 +490,7 @@ undefined_tramp:
         .byte   4
         .byte   UNDEFINED_FUN_ERROR
         .byte   254
-        .byte   (0x20 + sc_DescriptorReg)
-        .byte   1
+        .byte   (0x40 + sc_DescriptorReg)
+        .byte   2
         .align  4
 

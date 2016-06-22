@@ -10,26 +10,6 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-
-;;;; interfaces to IR2 conversion
-
-;;; Return a wired TN describing the N'th full call argument passing
-;;; location.
-(defun standard-arg-location (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-wired-tn *backend-t-primitive-type*
-                     register-arg-scn
-                     (elt *register-arg-offsets* n))
-      (make-wired-tn *backend-t-primitive-type*
-                     control-stack-arg-scn n)))
-
-(defun standard-arg-location-sc (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-sc-offset register-arg-scn
-                      (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-arg-scn n)))
 
 (defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
@@ -40,8 +20,8 @@
 ;;; restricted by a desire to use a subroutine call instruction.
 (defun make-return-pc-passing-location (standard)
   (if standard
-      (make-wired-tn *backend-t-primitive-type* register-arg-scn lra-offset)
-      (make-restricted-tn *backend-t-primitive-type* register-arg-scn)))
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number lra-offset)
+      (make-restricted-tn *backend-t-primitive-type* descriptor-reg-sc-number)))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
@@ -73,46 +53,14 @@
 ;;; passed when we are using non-standard conventions.
 (defun make-arg-count-location ()
   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
-
-
-;;; Make a TN to hold the number-stack frame pointer. This is
-;;; allocated once per component, and is component-live.
-(defun make-nfp-tn ()
-  (component-live-tn
-   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nfp-offset)))
-
-(defun make-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-(defun make-number-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-;;; Return a list of TNs that can be used to represent an
-;;; unknown-values continuation within a function.
-(defun make-unknown-values-locations ()
-  (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
-
-
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure. We
-;;; push placeholder entries in the CONSTANTS to leave room for
-;;; additional noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (dotimes (i code-constants-offset)
-    (vector-push-extend nil
-                        (ir2-component-constants (component-info component))))
-  (values))
-
 
 ;;;; frame hackery
 
 ;;; Return the number of bytes needed for the current non-descriptor
-;;; stack frame. Non-descriptor stack frames must be multiples of 8
-;;; bytes on the PMAX.
+;;; stack frame. Non-descriptor stack frames must be multiples of 16
+;;; bytes to preserve alien stack alignment.
 (defun bytes-needed-for-non-descriptor-stack-frame ()
-  (* (logandc2 (1+ (sb-allocated-size 'non-descriptor-stack)) 1)
+  (* (logandc2 (+ 3 (sb-allocated-size 'non-descriptor-stack)) 3)
      n-word-bytes))
 
 ;;; This is used for setting up the Old-FP in local call.
@@ -130,7 +78,7 @@
   (:generator 1
     (let ((nfp (current-nfp-tn vop)))
       (when nfp
-        (inst addq nfp (bytes-needed-for-non-descriptor-stack-frame) val)))))
+        (inst lda val (bytes-needed-for-non-descriptor-stack-frame) nfp)))))
 
 ;;; Accessing a slot from an earlier stack frame is definite hackery.
 (define-vop (ancestor-frame-ref)
@@ -180,8 +128,7 @@
           cfp-tn)
     (let ((nfp (current-nfp-tn vop)))
       (when nfp
-        (inst subq nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
-              nsp-tn)
+        (inst lda nsp-tn (- (bytes-needed-for-non-descriptor-stack-frame)) nsp-tn)
         (move nsp-tn nfp)))))
 
 (define-vop (allocate-frame)
@@ -195,8 +142,7 @@
           (* n-word-bytes (sb-allocated-size 'control-stack))
           csp-tn)
     (when (ir2-physenv-number-stack-p callee)
-      (inst subq nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
-            nsp-tn)
+      (inst lda nsp-tn (- (bytes-needed-for-non-descriptor-stack-frame)) nsp-tn)
       (move nsp-tn nfp))))
 
 ;;; Allocate a partial frame for passing stack arguments in a full
@@ -573,8 +519,8 @@ default-value-8
     (move cfp-tn csp-tn)
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst addq cur-nfp (bytes-needed-for-non-descriptor-stack-frame)
-              nsp-tn)))
+        (inst lda nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
+              cur-nfp)))
     (inst subq return-pc-temp (- other-pointer-lowtag n-word-bytes) lip)
     (move ocfp-temp cfp-tn)
     (inst ret zero-tn lip 1)))
@@ -765,9 +711,9 @@ default-value-8
                                              word-shift)
                                          cfp-tn))))
                               (:frob-nfp
-                               (inst addq cur-nfp
+                               (inst lda nsp-tn
                                      (bytes-needed-for-non-descriptor-stack-frame)
-                                     nsp-tn)))
+                                     cur-nfp)))
                             `(#!-gengc
                               (:comp-lra
                                (inst compute-lra-from-code
@@ -889,8 +835,8 @@ default-value-8
     ;; Clear the number stack if anything is there.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst addq cur-nfp (bytes-needed-for-non-descriptor-stack-frame)
-              nsp-tn)))
+        (inst lda nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
+              cur-nfp)))
 
     ;; And jump to the assembly-routine that does the bliting.
     (inst li (make-fixup 'tail-call-variable :assembly-routine) temp)
@@ -913,8 +859,8 @@ default-value-8
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst addq cur-nfp (bytes-needed-for-non-descriptor-stack-frame)
-              nsp-tn)))
+        (inst lda nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
+              cur-nfp)))
     ;; Clear the control stack, and restore the frame pointer.
     (move cfp-tn csp-tn)
     (move ocfp cfp-tn)
@@ -962,8 +908,8 @@ default-value-8
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst addq cur-nfp (bytes-needed-for-non-descriptor-stack-frame)
-              nsp-tn)))
+        (inst lda nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
+              cur-nfp)))
     ;; Establish the values pointer and values count.
     (move cfp-tn val-ptr)
     (inst li (fixnumize nvals) nargs)
@@ -1014,8 +960,8 @@ default-value-8
       ;; Clear the number stack.
       (let ((cur-nfp (current-nfp-tn vop)))
         (when cur-nfp
-          (inst addq cur-nfp (bytes-needed-for-non-descriptor-stack-frame)
-                nsp-tn)))
+          (inst lda nsp-tn (bytes-needed-for-non-descriptor-stack-frame)
+                cur-nfp)))
 
       ;; Check for the single case.
       (inst li (fixnumize 1) a0)
@@ -1211,7 +1157,7 @@ default-value-8
   (:save-p :compute-only)
   (:generator 3
     (let ((err-lab
-           (generate-error-code vop invalid-arg-count-error nargs)))
+           (generate-error-code vop 'invalid-arg-count-error nargs)))
       (cond ((zerop count)
              (inst bne nargs err-lab))
             (t
@@ -1229,7 +1175,7 @@ default-value-8
   (:save-p :compute-only)
   (:generator 3
     (let ((err-lab
-            (generate-error-code vop invalid-arg-count-error nargs)))
+            (generate-error-code vop 'invalid-arg-count-error nargs)))
       (cond ((not min)
              (cond ((zerop max)
                     (inst bne nargs err-lab))
@@ -1249,33 +1195,7 @@ default-value-8
              (inst cmpult nargs temp temp)
              (inst bne temp err-lab))))))
 
-;;; various other error signalers
-(macrolet ((frob (name error translate &rest args)
-             `(define-vop (,name)
-                ,@(when translate
-                    `((:policy :fast-safe)
-                      (:translate ,translate)))
-                (:args ,@(mapcar (lambda (arg)
-                                   `(,arg :scs (any-reg descriptor-reg)))
-                                 args))
-                (:vop-var vop)
-                (:save-p :compute-only)
-                (:generator 1000
-                  (error-call vop ,error ,@args)))))
-  (frob arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nargs fname)
-  (frob type-check-error object-not-type-error sb!c::%type-check-error
-    object type)
-  (frob layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
-    object layout)
-  (frob odd-key-args-error odd-key-args-error
-    sb!c::%odd-key-args-error)
-  (frob unknown-key-arg-error unknown-key-arg-error
-    sb!c::%unknown-key-arg-error key)
-  (frob nil-fun-returned-error nil-fun-returned-error nil fun))
-
 ;;; Single-stepping
-
 (define-vop (step-instrument-before-vop)
   (:policy :fast-safe)
   (:vop-var vop)

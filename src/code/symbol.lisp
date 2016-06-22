@@ -15,7 +15,7 @@
 
 (in-package "SB!IMPL")
 
-(declaim (maybe-inline get get3 %put getf remprop %putf get-properties keywordp))
+(declaim (maybe-inline get3 %put getf remprop %putf get-properties keywordp))
 
 ;;; Used by [GLOBAL-]SYMBOL-VALUE compiler-macros:
 ;;;
@@ -96,6 +96,8 @@ distinct from the global value. Can also be SETF."
     (when (eq (info :variable :always-bound symbol) :always-bound)
       (error "Can't make ~A variable unbound: ~S" 'always-bound symbol))
     (about-to-modify-symbol-value symbol 'makunbound)
+    (when (eq (info :variable :kind symbol) :constant)
+      (clear-info :variable :kind symbol))
     (%makunbound symbol)
     symbol))
 
@@ -117,9 +119,7 @@ distinct from the global value. Can also be SETF."
               (and (char= (schar string 0) #\N)
                    (char= (schar string 1) #\I)
                    (char= (schar string 2) #\L)))))
-      ;; FIXME: hardwire this. See similar comment at
-      ;;   (deftransform sxhash ((x) (symbol))
-      (return-from compute-symbol-hash (symbol-hash nil)))
+      (return-from compute-symbol-hash (sxhash nil)))
   ;; And make a symbol's hash not the same as (sxhash name) in general.
   (let ((sxhash (logand (lognot (%sxhash-simple-substring string length))
                         sb!xc:most-positive-fixnum)))
@@ -479,6 +479,7 @@ distinct from the global value. Can also be SETF."
                      (if (plusp q)
                          (recurse (1+ depth) q)
                          (let ((et (if (or (base-string-p prefix)
+                                           #!+sb-unicode ; no #'base-char-p
                                            (every #'base-char-p prefix))
                                        'base-char 'character)))
                            (setq s (make-string (+ (length prefix) depth)
@@ -564,10 +565,10 @@ distinct from the global value. Can also be SETF."
               (cerror "Modify the constant." what (describe-action) symbol)
               (error what (describe-action) symbol)))
         (when valuep
-          ;; :VARIABLE :TYPE is in the db only if it is declared, so no need to
-          ;; check.
-          (let ((type (info :variable :type symbol)))
-            (unless (%%typep new-value type nil)
+          (multiple-value-bind (type declaredp) (info :variable :type symbol)
+            ;; If globaldb returned the default of *UNIVERSAL-TYPE*,
+            ;; don't bother with a type test.
+            (when (and declaredp (not (%%typep new-value type nil)))
               (let ((spec (type-specifier type)))
                 (error 'simple-type-error
                        :format-control "~@<Cannot ~@? to ~S, not of type ~S.~:@>"

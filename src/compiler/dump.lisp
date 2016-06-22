@@ -297,6 +297,8 @@
       ;; Before the actual FASL header, write a shebang line using the current
       ;; runtime path, so our fasls can be executed directly from the shell.
       (when *runtime-pathname*
+        #+sb-xc-host (bug "Can't write shebang line") ; no #'NATIVE-PATHNAME
+        #-sb-xc-host
         (fasl-write-string
          (format nil "#!~A --script~%"
                  (native-namestring *runtime-pathname* :as-file t))
@@ -761,7 +763,8 @@
 (defun dump-array (x file)
   (if (vectorp x)
       (dump-vector x file)
-      (dump-multi-dim-array x file)))
+      #-sb-xc-host (dump-multi-dim-array x file)
+      #+sb-xc-host (bug "Can't dump multi-dim array")))
 
 ;;; Dump the vector object. If it's not simple, then actually dump a
 ;;; simple version of it. But we enter the original in the EQ or EQUAL
@@ -1144,6 +1147,8 @@
                          (fasl-output-patch-table fasl-output))))
         handle))))
 
+;;; This is only called from assemfile, which doesn't exist in the target.
+#+sb-xc-host
 (defun dump-assembler-routines (code-segment length fixups routines file)
   (dump-fop 'fop-assembler-code file)
   (dump-word length file)
@@ -1151,7 +1156,9 @@
   (dolist (routine routines)
     (dump-object (car routine) file)
     (dump-fop 'fop-assembler-routine file)
-    (dump-word (label-position (cdr routine)) file))
+    (dump-word (+ (label-position (cadr routine))
+                  (caddr routine))
+               file))
   (dump-fixups fixups file)
   #!-(or x86 x86-64)
   (dump-fop 'fop-sanctify-for-execution file)
@@ -1246,6 +1253,7 @@
   (declare (type sb!c::source-info info))
   (let ((res (sb!c::debug-source-for-info info))
         (*dump-only-valid-structures* nil))
+    ;; Zero out the timestamps to get reproducible fasls.
     #+sb-xc-host (setf (sb!c::debug-source-created res) 0
                        (sb!c::debug-source-compiled res) 0)
     (dump-object res fasl-output)
@@ -1254,7 +1262,11 @@
         (dump-push res-handle fasl-output)
         (dump-fop 'fop-structset fasl-output)
         (dump-word info-handle fasl-output)
-        (dump-word sb!c::+debug-info-source-index+ fasl-output))
+        (macrolet ((debug-info-source-index ()
+                     (let ((dd (find-defstruct-description 'sb!c::debug-info)))
+                       (dsd-index (find 'source (dd-slots dd)
+                                        :key #'dsd-name :test 'string=)))))
+          (dump-word (debug-info-source-index) fasl-output)))
       #+sb-xc-host
       (progn
         (dump-push res-handle fasl-output)
@@ -1270,30 +1282,19 @@
 ;; But if it learns a layout by cross-compiling a DEFSTRUCT, that's ok too.
 (defun dump-structure (struct file)
   (when (and *dump-only-valid-structures*
-             (not (gethash struct (fasl-output-valid-structures file)))
-             #+sb-xc-host
-             (not (sb!kernel::xc-dumpable-structure-instance-p struct)))
+             (not (gethash struct (fasl-output-valid-structures file))))
     (error "attempt to dump invalid structure:~%  ~S~%How did this happen?"
            struct))
   (note-potential-circularity struct file)
   (do* ((length (%instance-length struct))
         (layout (%instance-layout struct))
-        #!-interleaved-raw-slots
-        (ntagged (- length (layout-n-untagged-slots layout)))
-        #!+interleaved-raw-slots
-        (bitmap (layout-untagged-bitmap layout))
+        (bitmap (layout-bitmap layout))
         (circ (fasl-output-circularity-table file))
-        ;; last slot first on the stack, so that the layout is on top:
-        (index (1- length) (1- index)))
-      ((< index sb!vm:instance-data-start)
+        (index sb!vm:instance-data-start (1+ index)))
+      ((>= index length)
        (dump-non-immediate-object layout file)
        (dump-fop 'fop-struct file length))
-    (let* ((obj #!-interleaved-raw-slots
-                (if (>= index ntagged)
-                    (%raw-instance-ref/word struct (- length index 1))
-                    (%instance-ref struct index))
-                #!+interleaved-raw-slots
-                (if (logbitp index bitmap)
+    (let* ((obj (if (logbitp index bitmap)
                     (%raw-instance-ref/word struct index)
                     (%instance-ref struct index)))
            (ref (gethash obj circ)))
@@ -1327,5 +1328,5 @@
   (sub-dump-object (layout-inherits obj) file)
   (sub-dump-object (layout-depthoid obj) file)
   (sub-dump-object (layout-length obj) file)
-  (sub-dump-object (layout-raw-slot-metadata obj) file)
+  (sub-dump-object (layout-bitmap obj) file)
   (dump-fop 'fop-layout file))

@@ -14,8 +14,7 @@
 ;;; We compile some trivial character operations via inline expansion.
 #!-sb-fluid
 (declaim (inline standard-char-p graphic-char-p alpha-char-p
-                 upper-case-p lower-case-p both-case-p
-                 char-int))
+                 upper-case-p lower-case-p both-case-p alphanumericp))
 (declaim (maybe-inline digit-char-p))
 
 (deftype char-code ()
@@ -27,6 +26,13 @@
 (defun pack-3-codepoints (first &optional (second 0) (third 0))
   (declare (type (unsigned-byte 21) first second third))
   (sb!c::mask-signed-field 63 (logior first (ash second 21) (ash third 42))))
+
+(define-load-time-global **character-misc-database** nil)
+(declaim (type (simple-array (unsigned-byte 8) (*)) **character-misc-database**))
+(declaim (inline both-case-index-p))
+(defun both-case-index-p (misc-index)
+  (declare (type (unsigned-byte 16) misc-index))
+  (logbitp 7 (aref **character-misc-database** (+ 5 misc-index))))
 
 (macrolet ((frob ()
              (flet ((coerce-it (array)
@@ -456,6 +462,7 @@ there are no character bits or fonts.)"
   "Coerce OBJECT into a CHARACTER if possible. Legal inputs are characters,
 strings and symbols of length 1."
   (flet ((do-error (control args)
+           (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
                   :datum object
                   ;;?? how to express "symbol with name of length 1"?
@@ -551,11 +558,6 @@ NIL."
 argument is an alphabetic character, A-Z or a-z; otherwise NIL."
   (< (ucd-general-category char) 5))
 
-(declaim (inline both-case-index-p))
-(defun both-case-index-p (misc-index)
-  (declare (type (unsigned-byte 16) misc-index))
-  (logbitp 7 (aref **character-misc-database** (+ 5 misc-index))))
-
 (defun both-case-p (char)
   #!+sb-doc
   "The argument must be a character object. BOTH-CASE-P returns T if the
@@ -600,6 +602,14 @@ that digit stands, else returns NIL."
       (let ((number (ucd-decimal-digit char)))
         (when (and number (< (truly-the fixnum number) radix))
           number))))
+
+(defun alphanumericp (char)
+  #!+sb-doc
+  "Given a character-object argument, ALPHANUMERICP returns T if the argument
+is either numeric or alphabetic."
+  (let ((gc (ucd-general-category char)))
+    (or (< gc 5)
+        (= gc 13))))
 
 ;;; EQUAL-CHAR-CODE is used by the following functions as a version of CHAR-INT
 ;;;  which loses font, bits, and case info.
@@ -787,3 +797,32 @@ character exists."
   (and (typep weight 'fixnum)
        (>= weight 0) (< weight radix) (< weight 36)
        (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight)))))
+
+;;; Moved from 'string' because ALPHANUMERICP wants to be inlined,
+;;; and moving ALPHANUMERICP earlier causes a snowball effect of
+;;; other inlining failures.
+(flet ((%capitalize (string start end)
+         (declare (string string) (index start) (type sequence-end end))
+         (let ((saved-header string))
+           (with-one-string (string start end)
+             (do ((index start (1+ index))
+                  (new-word? t)
+                  (char nil))
+                 ((= index (the fixnum end)))
+               (declare (fixnum index))
+               (setq char (schar string index))
+               (cond ((not (alphanumericp char))
+                      (setq new-word? t))
+                     (new-word?
+                      ;; CHAR is the first case-modifiable character after
+                      ;; a sequence of non-case-modifiable characters.
+                      (setf (schar string index) (char-upcase char))
+                      (setq new-word? nil))
+                     (t
+                      (setf (schar string index) (char-downcase char))))))
+           saved-header)))
+(defun string-capitalize (string &key (start 0) end)
+  (%capitalize (copy-seq (string string)) start end))
+(defun nstring-capitalize (string &key (start 0) end)
+  (%capitalize string start end))
+) ; FLET

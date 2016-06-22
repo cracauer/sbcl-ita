@@ -37,10 +37,10 @@
 
 (deftype random-state-state () `(simple-array (unsigned-byte 32) (,(+ 3 mt19937-n))))
 
-(def!method make-load-form ((random-state random-state) &optional environment)
+(defmethod make-load-form ((random-state random-state) &optional environment)
   (make-load-form-saving-slots random-state :environment environment))
 
-(def!method print-object ((state random-state) stream)
+(defmethod print-object ((state random-state) stream)
   (if (and *print-readably* (not *read-eval*))
       (print-not-readable-error state stream)
       (format stream "#S(~S ~S #.~S)"
@@ -405,8 +405,9 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
               (accept-reject-loop big-random-chunk))))))
 
 (defun random (arg &optional (state *random-state*))
-  (declare (inline %random-fixnum %random-single-float %random-double-float
-                   #!+long-float %random-long-float))
+  #!-sb-fluid (declare (inline %random-fixnum
+                               %random-single-float %random-double-float
+                               #!+long-float %random-long-float))
   (declare (explicit-check))
   (cond
     ((and (fixnump arg) (> arg 0))

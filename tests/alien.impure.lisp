@@ -76,7 +76,7 @@
 (let ((fname "alien-bug-2004-10-11.tmp.lisp"))
   (unwind-protect
        (progn
-         (with-open-file (f fname :direction :output)
+         (with-open-file (f fname :direction :output :if-exists :supersede)
            (mapc (lambda (form) (print form f))
                  '((defpackage :alien-bug
                      (:use :cl :sb-alien))
@@ -252,11 +252,17 @@
 
 ;;; void conflicted with derived type
 (declaim (inline bug-316075))
-#-win32 ;kludge: This reader conditional masks a bug, but allows the test
-        ;to fail cleanly.
+;; KLUDGE: This win32 reader conditional masks a bug, but allows the
+;; test to fail cleanly.  The linkage-table reader conditional
+;; accomodates the little fact that the function doesn't exist, and
+;; non-linkage-table systems resolve such things immediately and
+;; signal errors.
+#-(or win32 (not linkage-table))
 (sb-alien:define-alien-routine bug-316075 void (result char :out))
-(with-test (:name :bug-316075 :fails-on :win32)
+(with-test (:name :bug-316075 :fails-on :win32
+                  :broken-on '(not :linkage-table))
   #+win32 (error "fail")
+  #-linkage-table (error "unable to set up test precondition")
   ;; The interpreter gives you a style-warning because the "undefined alien"
   ;; first occurs here during compilation of the test case. But if compiling
   ;; by default, then the warning already happened above at DEFINE-ALIEN-ROUTINE
@@ -338,7 +344,8 @@
     (assert (equal "This comes from lisp!" (cast alien c-string)))
     (free-alien alien)))
 
-(with-test (:name :malloc-failure)
+(with-test (:name :malloc-failure
+                  :fails-on :alpha) ;; Alpha has address space to burn
   (assert (eq :enomem
               (handler-case
                   (loop repeat 128
@@ -459,3 +466,10 @@
                           (apply #'values (list 1))
                         (foo)))
                      '(1))))))
+
+;; Parse (ENUM COLOR)
+(sb-alien-internals:parse-alien-type '(enum color red blue black green) nil)
+;; Now reparse it as a different type
+(with-test (:name :change-enum-type)
+  (handler-bind ((error #'continue))
+    (sb-alien-internals:parse-alien-type '(enum color yellow ochre) nil)))

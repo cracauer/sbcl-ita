@@ -19,15 +19,13 @@
   (:translate data-nil-vector-ref)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg descriptor-reg) :load-if (not t)))
+         (index :scs (any-reg descriptor-reg) :load-if nil))
+  (:ignore index)
   (:arg-types simple-array-nil *)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
-    (error-call vop
-                #!-(or alpha hppa) 'nil-array-accessed-error
-                #!+(or alpha hppa) nil-array-accessed-error
-                object)))
+    (error-call vop 'nil-array-accessed-error object)))
 
 ;;; It shouldn't be possible to fall through to here in normal user
 ;;; code, as the system is smart enough to deduce that there must be
@@ -52,10 +50,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
-    (error-call vop
-                #!-(or alpha hppa) 'nil-array-accessed-error
-                #!+(or alpha hppa) nil-array-accessed-error
-                object)))
+    (error-call vop 'nil-array-accessed-error object)))
 
 (define-vop (data-vector-set/simple-array-nil)
   (:translate data-vector-set)
@@ -72,18 +67,15 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
-    (error-call vop
-                #!-(or alpha hppa) 'nil-array-accessed-error
-                #!+(or alpha hppa) nil-array-accessed-error
-                object)))
+    (error-call vop 'nil-array-accessed-error object)))
 
-;; The only way to define this VOP on Alpha/HPPA would be with
-;; a big CASE statement since the ERRCODE is not eval'ed by ERROR-CALL.
-#!-(or alpha hppa)
 (define-vop (type-check-error/c)
   (:policy :fast-safe)
   (:translate sb!c::%type-check-error/c)
-  (:args (object :scs (any-reg descriptor-reg)))
+  (:args (object :scs (descriptor-reg any-reg unsigned-reg signed-reg)
+                 :load-if (not (sc-is object
+                                      descriptor-reg any-reg
+                                      unsigned-reg signed-reg constant))))
   (:arg-types * (:constant symbol))
   (:info errcode)
   (:vop-var vop)
@@ -95,6 +87,29 @@
     ;; instruction pipe with undecodable junk (the sc-numbers).
     (error-call vop errcode object)))
 
-;;; FIXME: There is probably plenty of other array stuff that looks
-;;; the same or similar enough to be genericized.  Do so, and move it
-;;; here so that a new port doesn't need to do as much work.
+(macrolet ((def (name error translate &rest args)
+             `(define-vop (,name)
+                ,@(when translate
+                    `((:policy :fast-safe)
+                      (:translate ,translate)))
+                (:args ,@(mapcar (lambda (arg)
+                                   `(,arg :scs (descriptor-reg any-reg
+                                                unsigned-reg signed-reg)
+                                          :load-if (not (sc-is ,arg descriptor-reg any-reg
+                                                               unsigned-reg signed-reg constant))))
+                                 args))
+                (:vop-var vop)
+                (:save-p :compute-only)
+                (:generator 1000
+                  (error-call vop ',error ,@args)))))
+  (def arg-count-error invalid-arg-count-error
+    sb!c::%arg-count-error nargs fname)
+  (def type-check-error object-not-type-error sb!c::%type-check-error
+    object type)
+  (def layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
+    object layout)
+  (def odd-key-args-error odd-key-args-error
+    sb!c::%odd-key-args-error)
+  (def unknown-key-arg-error unknown-key-arg-error
+    sb!c::%unknown-key-arg-error key)
+  (def nil-fun-returned-error nil-fun-returned-error nil fun))

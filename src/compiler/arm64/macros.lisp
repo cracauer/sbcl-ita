@@ -39,8 +39,8 @@
          (load-immediate-word tmp-tn x)
          tmp-tn)))
 
-(defun load-store-offset (offset &optional (temp tmp-tn))
-  (cond ((ldr-str-offset-encodable offset)
+(defun load-store-offset (offset &optional (temp tmp-tn) (size 64))
+  (cond ((ldr-str-offset-encodable offset size)
          offset)
         (t
          (load-immediate-word temp offset)
@@ -76,9 +76,8 @@
   (once-only ((n-target target)
               (n-source source)
               (n-offset offset))
-    (let ((target-offset (ecase *backend-byte-order*
-                           (:little-endian n-offset)
-                           (:big-endian `(+ ,n-offset (1- n-word-bytes))))))
+    (let ((target-offset #!+little-endian n-offset
+                         #!+big-endian `(+ ,n-offset (1- n-word-bytes))))
       `(inst ldrb ,n-target (@ ,n-source ,target-offset)))))
 
 ;;; Macros to handle the fact that our stack pointer isn't actually in
@@ -350,8 +349,6 @@
          (inst ldr (32-bit-reg ,flag-tn)
                (@ thread-tn
                   (+ (* n-word-bytes thread-pseudo-atomic-bits-slot) 4))))
-       ;; When *pseudo-atomic-interrupted* is not 0 it contains the address of
-       ;; do_pending_interrupt
        (let ((not-interrputed (gen-label)))
          (inst cbz ,flag-tn not-interrputed)
          (inst brk pending-interrupt-trap)
@@ -446,7 +443,7 @@
                    (inst str (32-bit-reg value) (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))
        (move result value))))
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
 Useful for e.g. foreign calls where another thread may trigger

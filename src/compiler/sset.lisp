@@ -94,18 +94,16 @@
                (sset-adjoin element set)))))
 
 ;;; Rehash the sset when the proportion of free cells in the set is
-;;; lower than this.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +sset-rehash-threshold+ 1/4))
+;;; lower than this, the value is a reciprocal.
+(defconstant +sset-rehash-threshold+ 4)
 
 ;;; Destructively add ELEMENT to SET. If ELEMENT was not in the set,
 ;;; then we return true, otherwise we return false.
 (declaim (ftype (sfunction (sset-element sset) boolean) sset-adjoin))
 (defun sset-adjoin (element set)
-  (declare (optimize (speed 2)))
   (when (<= (sset-free set)
             (max 1 (truncate (length (sset-vector set))
-                             #.(round (/ +sset-rehash-threshold+)))))
+                       +sset-rehash-threshold+)))
     (sset-grow set))
   (loop with vector = (sset-vector set)
         with mask of-type fixnum = (1- (length vector))
@@ -113,18 +111,15 @@
         for hash of-type index = (logand mask (sset-hash1 element)) then
           (logand mask (+ hash secondary-hash))
         for current = (aref vector hash)
-        for deleted-index = nil
         do (cond ((eql current 0)
                   (incf (sset-count set))
-                  (cond (deleted-index
-                         (setf (aref vector deleted-index) element))
-                        (t
-                         (decf (sset-free set))
-                         (setf (aref vector hash) element)))
+                  (decf (sset-free set))
+                  (setf (aref vector hash) element)
                   (return t))
-                 ((and (eql current '+deleted+)
-                       (not deleted-index))
-                  (setf deleted-index hash))
+                 ((eql current '+deleted+)
+                  (incf (sset-count set))
+                  (setf (aref vector hash) element)
+                  (return t))
                  ((eq current element)
                   (return nil)))))
 

@@ -10,26 +10,6 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-
-;;;; Interfaces to IR2 conversion:
-
-;;; Return a wired TN describing the N'th full call argument passing
-;;; location.
-(defun standard-arg-location (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-wired-tn *backend-t-primitive-type*
-                     register-arg-scn
-                     (elt *register-arg-offsets* n))
-      (make-wired-tn *backend-t-primitive-type*
-                     control-stack-arg-scn n)))
-
-(defun standard-arg-location-sc (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-sc-offset register-arg-scn
-                      (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-arg-scn n)))
 
 (defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
@@ -40,8 +20,8 @@
 ;;; desire to use a subroutine call instruction.
 (defun make-return-pc-passing-location (standard)
   (if standard
-      (make-wired-tn *backend-t-primitive-type* register-arg-scn lra-offset)
-      (make-restricted-tn *backend-t-primitive-type* register-arg-scn)))
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number lra-offset)
+      (make-restricted-tn *backend-t-primitive-type* descriptor-reg-sc-number)))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
@@ -74,38 +54,6 @@
 ;;; are using non-standard conventions.
 (defun make-arg-count-location ()
   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
-
-
-;;; Make a TN to hold the number-stack frame pointer.  This is allocated
-;;; once per component, and is component-live.
-(defun make-nfp-tn ()
-  (component-live-tn
-   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nfp-offset)))
-
-(defun make-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-(defun make-number-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-;;; Return a list of TNs that can be used to represent an unknown-values
-;;; continuation within a function.
-(defun make-unknown-values-locations ()
-  (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
-
-
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure.  We push
-;;; placeholder entries in the Constants to leave room for additional
-;;; noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (dotimes (i code-constants-offset)
-    (vector-push-extend nil
-                        (ir2-component-constants (component-info component))))
-  (values))
-
 
 ;;; bytes-needed-for-non-descriptor-stack-frame is the amount
 ;;; we grow or shrink the NSP/NFP stack. This stack is used
@@ -133,7 +81,7 @@
   (:generator 1
     (let ((nfp (current-nfp-tn vop)))
       (when nfp
-        (inst addi (- (bytes-needed-for-non-descriptor-stack-frame))
+        (inst ldo (- (bytes-needed-for-non-descriptor-stack-frame))
               nfp val)))))
 
 ;;; Accessing a slot from an earlier stack frame is definite hackery.
@@ -156,7 +104,12 @@
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
-  (:temporary (:scs (non-descriptor-reg)) temp)
+  ;; KLUDGE: Specify an explicit offset for TEMP because NARGS is a
+  ;; non-descriptor-reg, but is also live, yet the register allocator
+  ;; does not know that it is, and if TEMP collides NARGS and
+  ;; COMPUTE-CODE-FROM-LIP needs TEMP then we run into trouble very
+  ;; quickly.
+  (:temporary (:sc non-descriptor-reg :offset nl5-offset) temp)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
     ;; function header.
@@ -178,12 +131,12 @@
 (define-vop (xep-setup-sp)
   (:vop-var vop)
   (:generator 1
-    (inst addi (* n-word-bytes (sb-allocated-size 'control-stack))
+    (inst ldo (* n-word-bytes (sb-allocated-size 'control-stack))
           cfp-tn csp-tn)
     (let ((nfp (current-nfp-tn vop)))
       (when nfp
         (move nsp-tn nfp)
-        (inst addi (bytes-needed-for-non-descriptor-stack-frame)
+        (inst ldo (bytes-needed-for-non-descriptor-stack-frame)
                    nsp-tn nsp-tn)))))
 
 (define-vop (allocate-frame)
@@ -192,11 +145,11 @@
   (:info callee)
   (:generator 2
     (move csp-tn res)
-    (inst addi (* n-word-bytes (sb-allocated-size 'control-stack))
+    (inst ldo (* n-word-bytes (sb-allocated-size 'control-stack))
           csp-tn csp-tn)
     (when (ir2-physenv-number-stack-p callee)
       (move nsp-tn nfp)
-      (inst addi (bytes-needed-for-non-descriptor-stack-frame)
+      (inst ldo (bytes-needed-for-non-descriptor-stack-frame)
                  nsp-tn nsp-tn))))
 
 ;;; Allocate a partial frame for passing stack arguments in a full call.  Nargs
@@ -209,7 +162,7 @@
   (:generator 2
     (when (> nargs register-arg-count)
       (move csp-tn res)
-      (inst addi (* nargs n-word-bytes) csp-tn csp-tn))))
+      (inst ldo (* nargs n-word-bytes) csp-tn csp-tn))))
 
 
 ;;; Fix: boil down below notes into something nicer
@@ -774,7 +727,7 @@ default-value-8
                                                  word-shift)
                                             cfp-tn return-pc-pass))))
                               (:frob-nfp
-                               (inst addi (- (bytes-needed-for-non-descriptor-stack-frame))
+                               (inst ldo (- (bytes-needed-for-non-descriptor-stack-frame))
                                           nsp-tn nsp-tn)))
                             `((:comp-lra
                                (inst compute-lra-from-code code-tn lra-label
@@ -990,7 +943,7 @@ default-value-8
         ;; restore the frame pointer and clear as much of the control
         ;; stack as possible.
         (move ocfp cfp-tn)
-        (inst addi (* nvals n-word-bytes) val-ptr csp-tn)
+        (inst ldo (* nvals n-word-bytes) val-ptr csp-tn)
         (aver (= (* nvals n-word-bytes) (fixnumize nvals)))
         ;; pre-default any argument register that need it.
         (when (< nvals register-arg-count)
@@ -1213,7 +1166,7 @@ default-value-8
   (:save-p :compute-only)
   (:generator 3
     (let ((err-lab
-           (generate-error-code vop invalid-arg-count-error nargs)))
+           (generate-error-code vop 'invalid-arg-count-error nargs)))
       (cond ((zerop count)
              (inst bc :<> nil nargs zero-tn err-lab))
             (t
@@ -1229,7 +1182,7 @@ default-value-8
   (:save-p :compute-only)
   (:generator 3
     (let ((err-lab
-           (generate-error-code vop invalid-arg-count-error nargs)))
+           (generate-error-code vop 'invalid-arg-count-error nargs)))
       (cond ((not min)
              (if (zerop max)
                  (inst bc :<> nil nargs zero-tn err-lab)
@@ -1240,32 +1193,6 @@ default-value-8
              (inst bci :< nil (fixnumize max) nargs err-lab))
             ((plusp min)
              (inst bci :> nil (fixnumize min) nargs err-lab))))))
-
-;;; Signal argument errors.
-;;;
-(macrolet ((frob (name error translate &rest args)
-             `(define-vop (,name)
-                ,@(when translate
-                    `((:policy :fast-safe)
-                      (:translate ,translate)))
-                (:args ,@(mapcar #'(lambda (arg)
-                                     `(,arg :scs (any-reg descriptor-reg)))
-                                 args))
-                (:vop-var vop)
-                (:save-p :compute-only)
-                (:generator 1000
-                  (error-call vop ,error ,@args)))))
-  (frob arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nargs fname)
-  (frob type-check-error object-not-type-error sb!c::%type-check-error
-    object type)
-  (frob layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
-    object layout)
-  (frob odd-key-args-error odd-key-args-error
-    sb!c::%odd-key-args-error)
-  (frob unknown-key-arg-error unknown-key-arg-error
-    sb!c::%unknown-key-arg-error key)
-  (frob nil-fun-returned-error nil-fun-returned-error nil fun))
 
 ;;; Single-stepping
 

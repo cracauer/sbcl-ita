@@ -20,6 +20,22 @@
 (setq sb-c::*check-consistency* t
       sb-ext:*stack-allocate-dynamic-extent* t)
 
+(defun crashme (a)
+  (declare (optimize (speed 3) (safety 0) (space 0)))
+  (declare (muffle-conditions style-warning)) ; re F1 and F2
+  (restart-case
+      (progn (ignore-errors (error "Foo")) (write-char #\.))
+    (retry () (f1 a))
+    (use-value (new) (f2 new))))
+
+;; lp#1530390
+(with-test (:name :do-not-dxify-restarts)
+  (let ((a (make-array 100))) (unwind-protect (crashme 'bork) (fill a 0)))
+  (let ((a (make-array 100))) (unwind-protect (crashme 'bork) (fill a 0)))
+  (let ((a (make-array 100))) (unwind-protect (crashme 'bork) (fill a 0)))
+  (let ((a (make-array 100))) (unwind-protect (crashme 'bork) (fill a 0)))
+  )
+
 (defmacro defun-with-dx (name arglist &body body)
   (let ((debug-name (sb-int:symbolicate name "-HIGH-DEBUG"))
         (default-name (sb-int:symbolicate name "-DEFAULT")))
@@ -274,6 +290,19 @@
     (true v)
     nil))
 
+;;; MAKE-LIST
+
+(declaim (inline make-list-container))
+(defstruct list-container listy-slot)
+(defun make-var-length-dx-list (n thunk)
+  (sb-int:dx-let ((s (make-list-container :listy-slot (make-list n))))
+    (funcall thunk s)))
+;; :stack-allocatable-lists is necessary but not sufficient
+(with-test (:name (:dx-list :make-list) :skipped-on '(not :x86-64))
+  (assert (null (ctu:find-named-callees #'make-var-length-dx-list)))
+  (assert-no-consing (make-var-length-dx-list
+                      50 (lambda (x) (declare (ignore x))))))
+
 ;;; MAKE-STRUCTURE
 
 (declaim (inline make-fp-struct-1))
@@ -282,12 +311,14 @@
   (d 0.0d0 :type double-float))
 
 (defun-with-dx test-fp-struct-1.1 (s d)
+  d
   (let ((fp (make-fp-struct-1 :s s)))
     (declare (dynamic-extent fp))
     (assert (eql s (fp-struct-1-s fp)))
     (assert (eql 0.0d0 (fp-struct-1-d fp)))))
 
 (defun-with-dx test-fp-struct-1.2 (s d)
+  s
   (let ((fp (make-fp-struct-1 :d d)))
     (declare (dynamic-extent fp))
     (assert (eql 0.0 (fp-struct-1-s fp)))
@@ -320,12 +351,14 @@
   (s 0.0 :type single-float))
 
 (defun-with-dx test-fp-struct-2.1 (s d)
+  d
   (let ((fp (make-fp-struct-2 :s s)))
     (declare (dynamic-extent fp))
     (assert (eql s (fp-struct-2-s fp)))
     (assert (eql 0.0d0 (fp-struct-2-d fp)))))
 
 (defun-with-dx test-fp-struct-2.2 (s d)
+  s
   (let ((fp (make-fp-struct-2 :d d)))
     (declare (dynamic-extent fp))
     (assert (eql 0.0 (fp-struct-2-s fp)))
@@ -358,12 +391,14 @@
   (d (complex 0.0d0) :type (complex double-float)))
 
 (defun-with-dx test-cfp-struct-1.1 (s d)
+  d
   (let ((cfp (make-cfp-struct-1 :s s)))
     (declare (dynamic-extent cfp))
     (assert (eql s (cfp-struct-1-s cfp)))
     (assert (eql (complex 0.0d0) (cfp-struct-1-d cfp)))))
 
 (defun-with-dx test-cfp-struct-1.2 (s d)
+  s
   (let ((cfp (make-cfp-struct-1 :d d)))
     (declare (dynamic-extent cfp))
     (assert (eql (complex 0.0) (cfp-struct-1-s cfp)))
@@ -396,12 +431,14 @@
   (s (complex 0.0) :type (complex single-float)))
 
 (defun-with-dx test-cfp-struct-2.1 (s d)
+  d
   (let ((cfp (make-cfp-struct-2 :s s)))
     (declare (dynamic-extent cfp))
     (assert (eql s (cfp-struct-2-s cfp)))
     (assert (eql (complex 0.0d0) (cfp-struct-2-d cfp)))))
 
 (defun-with-dx test-cfp-struct-2.2 (s d)
+  s
   (let ((cfp (make-cfp-struct-2 :d d)))
     (declare (dynamic-extent cfp))
     (assert (eql (complex 0.0) (cfp-struct-2-s cfp)))
@@ -428,10 +465,24 @@
 (with-test (:name (:test-cfp-struct-2.4))
   (test-cfp-struct-2.4 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
 
-(declaim (inline make-foo1 make-foo2 make-foo3))
+;; It works to declare a structure constructor INLINE after the DEFSTRUCT
+;; was processed, as long as it was in the null lexical environment.
+;; In a perfect world, we'd figure out that a variable declared DX which
+;; receives the value of a structure constructor defined in the same file
+;; and neither expressly INLINE nor NOTINLINE should be locally inlined.
+;; But at least this shows that a declaration at the intended use point
+;; is sufficient, without also a bracketing INLINE/NOTINLINE at the DEFSTRUCT.
+
+;; Verify the precondition for the assertions that claim that DXifying works
+;; even though the MAKE- function was not expressly INLINE when its DEFSTRUCT
+;; was compiled.
+(dolist (s '(make-foo1 make-foo2 make-foo3))
+  (assert (null (sb-int:info :function :inline-expansion-designator s))))
+
 (defstruct foo1 x)
 
 (defun-with-dx make-foo1-on-stack (x)
+  (declare (inline make-foo1))
   (let ((foo (make-foo1 :x x)))
     (declare (dynamic-extent foo))
     (assert (eql x (foo1-x foo)))))
@@ -444,6 +495,8 @@
   c)
 
 (defun-with-dx make-foo2-on-stack (x y)
+  (declare (inline make-foo2))
+  x
   (let ((foo (make-foo2 :y y :c 'c)))
     (declare (dynamic-extent foo))
     (assert (eql 0.0 (foo2-x foo)))
@@ -461,6 +514,7 @@
   (e 4.0d0 :type double-float))
 
 (defun-with-dx make-foo3-on-stack ()
+  (declare (inline make-foo3))
   (let ((foo (make-foo3)))
     (declare (dynamic-extent foo))
     (assert (eql 0 (foo3-a foo)))
@@ -563,7 +617,8 @@
 (defun list-delete-some-stuff ()
   ;; opaque-identity hides the fact that we are calling a destructive function
   ;; on a constant, which is technically illegal. But no deletion occurs,
-  ;; so it's innocuous.
+  ;; so it's innocuous. Also these aren't tests of DX, but oh well...
+  (declare (muffle-conditions style-warning))
   (delete 'a (opaque-identity '(x y)))
   (delete 'a (opaque-identity '(x y)) :from-end t)
   (delete-duplicates (opaque-identity '(x y))))
@@ -573,7 +628,9 @@
 (with-test (:name (:no-consing :dx-closures) :skipped-on '(not :stack-allocatable-closures))
   (assert-no-consing (dxclosure 42)))
 
-(with-test (:name (:no-consing :dx-lists) :skipped-on '(not :stack-allocatable-lists))
+(with-test (:name (:no-consing :dx-lists)
+            :skipped-on '(not (and :stack-allocatable-lists
+                               :stack-allocatable-fixed-objects)))
   (assert-no-consing (dxlength 1 2 3))
   (assert-no-consing (dxlength t t t t t t))
   (assert-no-consing (dxlength))
@@ -589,10 +646,13 @@
   (assert-no-consing (list-delete-some-stuff))
   (assert-no-consing (multiple-dx-uses)))
 
-(with-test (:name (:no-consing :dx-value-cell))
+(with-test (:name (:no-consing :dx-value-cell)
+                  :skipped-on '(not :stack-allocatable-closures))
   (assert-no-consing (dx-value-cell 13)))
 
-(with-test (:name (:no-consing :dx-fixed-objects) :skipped-on '(not :stack-allocatable-fixed-objects))
+(with-test (:name (:no-consing :dx-fixed-objects)
+                  :skipped-on '(not (and :stack-allocatable-fixed-objects
+                                         :stack-allocatable-closures)))
   (assert-no-consing (cons-on-stack 42))
   (assert-no-consing (make-foo1-on-stack 123))
   (assert-no-consing (nested-good 42))
@@ -677,6 +737,7 @@
                   (debug 1) (compilation-speed 3)))
         (let* ((v5 (cons b b)))
           (declare (dynamic-extent v5))
+          v5
           a)))
      'x 'y)
     'x)))
@@ -807,21 +868,23 @@
 
 (with-test (:name :regression-1.0.23.38)
   (compile nil '(lambda ()
+                 (declare (muffle-conditions compiler-note))
                  (flet ((make (x y)
                           (let ((res (cons x x)))
                             (setf (cdr res) y)
                             res)))
-                   (declaim (inline make))
+                   (declare (inline make))
                    (let ((z (make 1 2)))
                      (declare (dynamic-extent z))
                      (print z)
                      t))))
   (compile nil '(lambda ()
+                 (declare (muffle-conditions compiler-note))
                  (flet ((make (x y)
                           (let ((res (cons x x)))
                             (setf (cdr res) y)
                             (if x res y))))
-                   (declaim (inline make))
+                   (declare (inline make))
                    (let ((z (make 1 2)))
                      (declare (dynamic-extent z))
                      (print z)
@@ -839,7 +902,9 @@
 (with-test (:name :length-and-words-packed-in-same-tn)
   (assert (= 1 (length-and-words-packed-in-same-tn -3))))
 
-(with-test (:name :handler-case-bogus-compiler-note)
+(with-test (:name :handler-case-bogus-compiler-note
+            :skipped-on '(not (and :stack-allocatable-fixed-objects
+                                   :stack-allocatable-closures)))
   (handler-bind
       ((compiler-note (lambda (note)
                         (error "compiler issued note ~S during test" note))))
@@ -847,6 +912,7 @@
     ;; failure note.
     (compile nil
              `(lambda (files fasl-dir load)
+                (declare (muffle-conditions style-warning))
                 (let ((needs-recompile nil))
                   (dolist (src files)
                     (let ((dest (binary-pathname src fasl-dir)))
@@ -872,13 +938,16 @@
     v))
 (defun barvector (x y z)
   (make-array 3 :initial-contents (list x y z)))
-(with-test (:name :dx-compiler-notes)
+(with-test (:name :dx-compiler-notes
+            :skipped-on '(not (and :stack-allocatable-vectors
+                                   :stack-allocatable-closures)))
   (flet ((assert-notes (j lambda)
            (let ((n 0))
              (handler-bind ((compiler-note (lambda (c)
                                              (declare (ignore c))
                                              (incf n))))
-               (compile nil lambda)
+               (let ((*error-output* (make-broadcast-stream)))
+                 (compile nil lambda))
                (unless (= j n)
                  (error "Wanted ~S notes, got ~S for~%   ~S"
                         j n lambda))))))
@@ -923,6 +992,7 @@
 ;;; Stack allocating a value cell in HANDLER-CASE would blow up stack
 ;;; in an unfortunate loop.
 (defun handler-case-eating-stack ()
+  (declare (muffle-conditions warning)) ; "dead code detected ... IR1-PHASES"
   (let ((sp nil))
     (do ((n 0 (logand most-positive-fixnum (1+ n))))
         ((>= n 1024))
@@ -931,7 +1001,9 @@
       (if sp
           (assert (= sp (sb-c::%primitive sb-c:current-stack-pointer)))
           (setf sp (sb-c::%primitive sb-c:current-stack-pointer))))))
-(with-test (:name :handler-case-eating-stack)
+(with-test (:name :handler-case-eating-stack
+            :skipped-on '(not (and :stack-allocatable-fixed-objects
+                                   :stack-allocatable-closures)))
   (assert-no-consing (handler-case-eating-stack)))
 
 ;;; A nasty bug where RECHECK-DYNAMIC-EXTENT-LVARS thought something was going
@@ -949,7 +1021,8 @@
     (let ((vec (vec (aref vec 0) (aref vec 1) (aref vec 2))))
       (declare (dynamic-extent vec))
       (funcall fun vec))))
-(with-test (:name :recheck-nested-dx-bug)
+(with-test (:name :recheck-nested-dx-bug
+            :skipped-on '(not :stack-allocatable-vectors))
   (assert (funcall (bad-boy (vec 1.0 2.0 3.3))
                    (lambda (vec) (equalp vec (vec 1.0 2.0 3.3)))))
   (flet ((foo (x) (declare (ignore x))))
@@ -964,7 +1037,8 @@
                                          (unless (typep c type)
                                            (error "wanted ~S for~%  ~S~%got ~S"
                                                   type lambda (type-of c))))))
-               (compile nil lambda))
+               (let ((*error-output* (make-broadcast-stream)))
+                 (compile nil lambda)))
              (assert (= n 1)))))
     (test `(lambda () (declare (dynamic-extent #'bar)))
           'style-warning)
@@ -977,8 +1051,9 @@
                (cons #'bar (lambda () (declare (dynamic-extent #'bar))))))
           'sb-ext:compiler-note)))
 
-(with-test (:name :bug-586105 :fails-on '(not (and :stack-allocatable-vectors
-                                                   :stack-allocatable-lists)))
+(with-test (:name :bug-586105
+            :skipped-on '(not (and :stack-allocatable-vectors
+                               :stack-allocatable-lists)))
   (flet ((test (x)
            (let ((vec1 (make-array 1 :initial-contents (list (list x))))
                  (vec2 (make-array 1 :initial-contents `((,x))))
@@ -1057,8 +1132,11 @@
                                                 11
                                                 10
                                                 21)))))
-  (let ((f4 (compile nil `(lambda (f &optional x &rest args &key y &allow-other-keys)
-                            (apply f y x args)))))
+  (let ((f4
+          (let ((*error-output* (make-broadcast-stream)))
+            (compile nil `(lambda (f &optional x &rest args
+                                     &key y &allow-other-keys)
+                            (apply f y x args))))))
     (assert-no-consing (funcall f4 (lambda (y x yk y2 b c)
                                      (assert (eq y 'y))
                                      (assert (= x 2))

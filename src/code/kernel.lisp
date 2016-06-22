@@ -40,14 +40,8 @@
 ;;; WIDETAG-OF needs extra code to handle LIST and FUNCTION lowtags. When
 ;;; we're only dealing with other pointers (eg. when dispatching on array
 ;;; element type), this is going to be faster.
-(declaim (inline %other-pointer-widetag))
 (defun %other-pointer-widetag (x)
-  (sb!sys:sap-ref-8 (int-sap (get-lisp-obj-address x))
-                    #.(ecase sb!c:*backend-byte-order*
-                        (:little-endian
-                         (- sb!vm:other-pointer-lowtag))
-                        (:big-endian
-                         (- (1- sb!vm:n-word-bytes) sb!vm:other-pointer-lowtag)))))
+  (%other-pointer-widetag x))
 
 ;;; Return a System-Area-Pointer pointing to the data for the vector
 ;;; X, which must be simple.
@@ -147,7 +141,11 @@
 
 ;;; Extract the type from the function header FUNC.
 (defun %simple-fun-type (func)
-  (%simple-fun-type func))
+  (let ((internal-type (sb!vm::%%simple-fun-type func)))
+    ;; For backward-compatibility we expand SFUNCTION -> FUNCTION.
+    (if (and (listp internal-type) (eq (car internal-type) 'sfunction))
+        (sb!ext:typexpand-1 internal-type)
+        internal-type)))
 
 (defun %simple-fun-next (simple-fun)
   (%simple-fun-next simple-fun))

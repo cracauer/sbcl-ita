@@ -148,14 +148,10 @@ format."
    nine values: second, minute, hour, date, month, year, day of week (0 =
    Monday), T (daylight savings time) or NIL (standard time), and timezone.
    Completely ignores daylight-savings-time when time-zone is supplied."
-  (multiple-value-bind (daylight seconds-west)
+  (multiple-value-bind (seconds-west daylight)
       (if time-zone
-          (values nil (* time-zone 60 60))
-          (multiple-value-bind (ignore seconds-west daylight)
-              (sb!unix::get-timezone (truncate-to-unix-range universal-time))
-            (declare (ignore ignore))
-            (declare (fixnum seconds-west))
-            (values daylight seconds-west)))
+          (values (* time-zone 60 60) nil)
+          (sb!unix::get-timezone (truncate-to-unix-range universal-time)))
     (declare (fixnum seconds-west))
     (multiple-value-bind (weeks secs)
         (truncate (+ (- universal-time seconds-west) seconds-offset)
@@ -203,7 +199,7 @@ format."
           (truncate years 100))
        (truncate (+ years 300) 400))))
 
-(defvar *days-before-month*
+(defglobal **days-before-month**
   #.(let ((reversed-result nil)
           (sum 0))
       (push nil reversed-result)
@@ -212,6 +208,7 @@ format."
         (incf sum days-in-month))
       (coerce (nreverse reversed-result) 'simple-vector)))
 
+(declaim (type (simple-vector 13) **days-before-month**))
 
 (defun encode-universal-time (second minute hour date month year
                                      &optional time-zone)
@@ -233,7 +230,8 @@ format."
                    (pick-obvious-year year)
                    year))
          (days (+ (1- date)
-                  (aref *days-before-month* month)
+                  (truly-the (mod 335)
+                             (svref **days-before-month** month))
                   (if (> month 2)
                       (leap-years-before (1+ year))
                       (leap-years-before year))
@@ -243,12 +241,12 @@ format."
     (if time-zone
         (setf encoded-time (+ second (* (+ minute (* (+ hours time-zone) 60)) 60)))
         (let* ((secwest-guess
-                (sb!unix::unix-get-seconds-west
+                (sb!unix::get-timezone
                  (truncate-to-unix-range (* hours 60 60))))
                (guess (+ second (* 60 (+ minute (* hours 60)))
                          secwest-guess))
                (secwest
-                (sb!unix::unix-get-seconds-west
+                (sb!unix::get-timezone
                  (truncate-to-unix-range guess))))
           (setf encoded-time (+ guess (- secwest secwest-guess)))))
     (assert (typep encoded-time '(integer 0)))

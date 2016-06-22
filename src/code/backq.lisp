@@ -15,6 +15,7 @@
 
 ;; An unquoting COMMA struct.
 (defstruct (comma (:constructor unquote (expr &optional (kind 0)))
+                  #+sb-xc-host (:include structure!object)
                   ;; READing unpretty commas requires a default constructor.
                   (:constructor %default-comma-constructor)
                   (:copier nil))
@@ -32,19 +33,7 @@
 (defun comma-constructor (x)
   (svref #(unquote unquote-nsplice unquote-splice) (comma-kind x)))
 (defun comma-splicing-p (comma) (not (zerop (comma-kind comma))))
-
-(declaim (inline singleton-p))
-(defun singleton-p (list)
-  (and (listp list) (null (rest list)) list))
-
-#+sb-xc-host
-(progn
-  ;; tell the host how to dump it
-  (defmethod make-load-form ((self comma) &optional environment)
-    (declare (ignore environment))
-    (list (comma-constructor self) (list 'quote (comma-expr self))))
-  ;; tell the cross-compiler that it can do :just-dump-it-normally
-  (setf (get 'comma :sb-xc-allow-dumping-instances) t))
+(!set-load-form-method comma (:host :xc :target))
 
 (declaim (type (and fixnum unsigned-byte) *backquote-depth*))
 (defvar *backquote-depth* 0 #!+sb-doc "how deep we are into backquotes")
@@ -68,6 +57,7 @@
 
 (defun comma-charmacro (stream char)
   (declare (ignore char))
+  (declare (notinline read-char unread-char))
   (unless (> *backquote-depth* 0)
     (when *read-suppress*
       (return-from comma-charmacro nil))
@@ -87,6 +77,7 @@
 
 (/show0 "backq.lisp 83")
 
+;; KLUDGE: 'sfunction' is not a defined type yet.
 (declaim (ftype (function (t fixnum boolean) (values t t &optional))
                 qq-template-to-sexpr qq-template-1))
 

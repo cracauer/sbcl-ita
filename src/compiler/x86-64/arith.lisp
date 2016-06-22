@@ -824,7 +824,7 @@ constant shift greater than word length")))
           (t
            (move result number)
            (cond ((< -64 amount 64) ;; XXXX
-                  ;; this code is used both in ASH and ASH-MOD32, so
+                  ;; this code is used both in ASH and ASH-MOD64, so
                   ;; be careful
                   (if (plusp amount)
                       (inst shl result amount)
@@ -1406,7 +1406,7 @@ constant shift greater than word length")))
   (:arg-types * (:constant fixnum))
   (:variant-cost 6))
 
-;;;; 32-bit logical operations
+;;;; 64-bit logical operations
 
 ;;; Only the lower 6 bits of the shift amount are significant.
 (define-vop (shift-towards-someplace)
@@ -1970,6 +1970,46 @@ constant shift greater than word length")))
            (let ((delta (- n-word-bits width)))
              (inst shl r delta)
              (inst sar r delta))))))
+
+(define-vop (mask-signed-field-fixnum)
+  (:translate sb!c::mask-signed-field)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg) :target r))
+  (:arg-types (:constant (eql #.n-fixnum-bits)) t)
+  (:results (r :scs (any-reg)))
+  (:result-types fixnum)
+  (:info width)
+  (:ignore width)
+  (:generator 5
+    (move r x)
+    (generate-fixnum-test r)
+    (inst jmp :z DONE)
+    (loadw r r bignum-digits-offset other-pointer-lowtag)
+    (inst shl r (- n-word-bits n-fixnum-bits))
+    DONE))
+
+(define-vop (logand-word-mask)
+  (:translate logand)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types t (:constant (member #.most-positive-word
+                                   #.(ash most-positive-word -1))))
+  (:results (r :scs (unsigned-reg)))
+  (:info mask)
+  (:result-types unsigned-num)
+  (:generator 10
+    (move r x)
+    (generate-fixnum-test r)
+    (inst jmp :nz BIGNUM)
+    (if (= mask most-positive-word)
+        (inst sar r n-fixnum-tag-bits)
+        (inst shr r n-fixnum-tag-bits))
+    (inst jmp DONE)
+    BIGNUM
+    (loadw r x bignum-digits-offset other-pointer-lowtag)
+    (unless (= mask most-positive-word)
+      (inst btr r (1- n-word-bits)))
+    DONE))
 
 ;;;; static functions
 

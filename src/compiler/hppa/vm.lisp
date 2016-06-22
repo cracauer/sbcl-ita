@@ -238,8 +238,8 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
   (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size)
 
   ;; floating point numbers temporarily stuck in integer registers for c-call
   (single-int-carg-reg registers
@@ -319,11 +319,11 @@
          (sc-number-or-lose 'immediate)
          nil))
     (single-float
-     (if (zerop value)
+     (if (eql value 0f0)
          (sc-number-or-lose 'fp-single-zero)
          nil))
     (double-float
-     (if (zerop value)
+     (if (eql value 0d0)
          (sc-number-or-lose 'fp-double-zero)
          nil))))
 
@@ -336,7 +336,6 @@
 
 ;;; The SC numbers for register and stack arguments/return values.
 ;;;
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
 (def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
 (def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 

@@ -15,12 +15,16 @@
 
 (/show0 "code/alien-type.lisp 16")
 
+(sb!xc:defstruct (alien-value (:constructor %sap-alien (sap type)))
+  (sap nil :type sb!sys:system-area-pointer)
+  (type nil :type sb!alien::alien-type))
+(sb!xc:proclaim '(freeze-type alien-value))
+
 (!begin-collecting-cold-init-forms)
 
 (!define-type-class alien :enumerable nil :might-contain-other-types nil)
 
-(!define-type-method (alien :negate) (type)
-  (make-negation-type :type type))
+(!define-type-method (alien :negate) (type) (make-negation-type type))
 
 (!define-type-method (alien :unparse) (type)
   `(alien ,(unparse-alien-type (alien-type-type-alien-type type))))

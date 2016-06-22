@@ -72,37 +72,6 @@
   "Suppress printer errors when the condition is of the type designated by this
 variable: an unreadable object representing the error is printed instead.")
 
-(defmacro with-standard-io-syntax (&body body)
-  #!+sb-doc
-  "Bind the reader and printer control variables to values that enable READ
-   to reliably read the results of PRINT. These values are:
-
-         *PACKAGE*                        the COMMON-LISP-USER package
-         *PRINT-ARRAY*                    T
-         *PRINT-BASE*                     10
-         *PRINT-CASE*                     :UPCASE
-         *PRINT-CIRCLE*                   NIL
-         *PRINT-ESCAPE*                   T
-         *PRINT-GENSYM*                   T
-         *PRINT-LENGTH*                   NIL
-         *PRINT-LEVEL*                    NIL
-         *PRINT-LINES*                    NIL
-         *PRINT-MISER-WIDTH*              NIL
-         *PRINT-PPRINT-DISPATCH*          the standard pprint dispatch table
-         *PRINT-PRETTY*                   NIL
-         *PRINT-RADIX*                    NIL
-         *PRINT-READABLY*                 T
-         *PRINT-RIGHT-MARGIN*             NIL
-         *READ-BASE*                      10
-         *READ-DEFAULT-FLOAT-FORMAT*      SINGLE-FLOAT
-         *READ-EVAL*                      T
-         *READ-SUPPRESS*                  NIL
-         *READTABLE*                      the standard readtable
-  SB-EXT:*SUPPRESS-PRINT-ERRORS*          NIL
-"
-  `(%with-standard-io-syntax (lambda () ,@body)))
-
-(defglobal sb!pretty::*standard-pprint-dispatch-table* nil)
 ;; duplicate defglobal because this file is compiled before "reader"
 (defglobal *standard-readtable* nil)
 
@@ -268,14 +237,15 @@ variable: an unreadable object representing the error is printed instead.")
                (when type
                  (write (type-of object) :stream stream :circle nil
                                          :level nil :length nil)
-                 (write-char #\space stream)
-                 (pprint-newline :fill stream))
+                 ;; Do NOT insert a pprint-newline here.
+                 ;; See ba34717602d80e5fd74d10e61f4729fb0d019a0c
+                 (write-char #\space stream))
                (when body
                  (funcall body))
                (when identity
                  (when (or body (not type))
                    (write-char #\space stream))
-                 (pprint-newline :fill stream)
+                 ;; Nor here.
                  (write-char #\{ stream)
                  (write (get-lisp-obj-address object) :stream stream
                                                       :radix nil :base 16)
@@ -313,9 +283,12 @@ variable: an unreadable object representing the error is printed instead.")
   ;; since the generic function should always receive a stream.
   (declare (explicit-check))
   (labels ((print-it (stream)
-             (if *print-pretty*
-                 (sb!pretty:output-pretty-object object stream)
-                 (output-ugly-object object stream)))
+             (multiple-value-bind (fun pretty)
+                 (and *print-pretty* (pprint-dispatch object))
+               (if pretty
+                   (sb!pretty::with-pretty-stream (stream)
+                     (funcall fun stream object))
+                   (output-ugly-object stream object))))
            (handle-it (stream)
              (if *suppress-print-errors*
                  (handler-bind ((condition
@@ -375,13 +348,13 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; DEFGENERIC PRINT-OBJECT is being built
 ;;;
 ;;; (hopefully will go away naturally when CLOS moves into cold init)
-(defvar *print-object-is-disabled-p*)
+(defvar *print-object-is-disabled-p* nil) ; real soon now
 
 ;;; Output OBJECT to STREAM observing all printer control variables
 ;;; except for *PRINT-PRETTY*. Note: if *PRINT-PRETTY* is non-NIL,
 ;;; then the pretty printer will be used for any components of OBJECT,
 ;;; just not for OBJECT itself.
-(defun output-ugly-object (object stream)
+(defun output-ugly-object (stream object)
   (typecase object
     ;; KLUDGE: The TYPECASE approach here is non-ANSI; the ANSI definition of
     ;; PRINT-OBJECT says it provides printing and we're supposed to provide
@@ -464,7 +437,7 @@ variable: an unreadable object representing the error is printed instead.")
      (output-fdefn object stream))
     #!+sb-simd-pack
     (simd-pack
-     (output-simd-pack object stream))
+     (print-object object stream))
     (t
      (output-random object stream))))
 
@@ -1088,11 +1061,6 @@ variable: an unreadable object representing the error is printed instead.")
                (incf index count)))
            (write-char #\) stream)))))
 
-;;; a trivial non-generic-function placeholder for PRINT-OBJECT, for
-;;; use until CLOS is set up (at which time it will be replaced with
-;;; the real generic function implementation)
-(defun print-object (instance stream)
-  (default-structure-print instance stream *current-level-in-print*))
 
 ;;;; integer, ratio, and complex printing (i.e. everything but floats)
 
@@ -1126,39 +1094,22 @@ variable: an unreadable object representing the error is printed instead.")
 ;;;
 ;;; It doesn't need a lock, but if you work on SCRUB-POWER-CACHE or
 ;;; POWERS-FOR-BASE, see that you don't break the assumptions!
-(defvar *power-cache* nil)
+(defglobal *power-cache* (make-array 37 :initial-element nil))
+(declaim (type (simple-vector 37) *power-cache*))
 
 (defconstant +power-cache-integer-length-limit+ 2048)
 
-(defun scrub-power-cache ()
-  (let ((cache *power-cache*))
-    (dolist (cell cache)
-      (let ((powers (cdr cell)))
-        (declare (simple-vector powers))
+(defun scrub-power-cache (&aux (cache *power-cache*))
+  (dotimes (i (length cache))
+    (let ((powers (aref cache i)))
+      (when powers
         (let ((too-big (position-if
                         (lambda (x)
                           (>= (integer-length x)
                               +power-cache-integer-length-limit+))
-                        powers)))
+                        (the simple-vector powers))))
           (when too-big
-            (setf (cdr cell) (subseq powers 0 too-big))))))
-    ;; Since base 10 is overwhelmingly common, make sure it's at head.
-    ;; Try to keep other bases in a hopefully sensible order as well.
-    (if (eql 10 (caar cache))
-        (setf *power-cache* cache)
-        ;; If we modify the list destructively we need to copy it, otherwise
-        ;; an alist lookup in progress might be screwed.
-        (setf *power-cache* (sort (copy-list cache)
-                                  (lambda (a b)
-                                    (declare (fixnum a b))
-                                    (cond ((= 10 a) t)
-                                          ((= 10 b) nil)
-                                          ((= 16 a) t)
-                                          ((= 16 b) nil)
-                                          ((= 2 a) t)
-                                          ((= 2 b) nil)
-                                          (t (< a b))))
-                                  :key #'car)))))
+            (setf (aref cache i) (subseq powers 0 too-big))))))))
 
 ;;; Compute (and cache) a power vector for a BASE and LIMIT:
 ;;; the vector holds integers for which
@@ -1174,26 +1125,18 @@ variable: an unreadable object representing the error is printed instead.")
                   (push p powers))
                (push p powers))
              (nreverse powers))))
-    ;; Grab a local reference so that we won't stuff consed at the
-    ;; head by other threads -- or sorting by SCRUB-POWER-CACHE.
-    (let ((cache *power-cache*))
-      (let ((cell (assoc base cache)))
-        (if cell
-            (let* ((powers (cdr cell))
-                   (len (length powers))
-                   (max (svref powers (1- len))))
-              (if (> max limit)
-                  powers
-                  (let ((new
-                         (concatenate 'vector powers
-                                      (compute-powers (* max max)))))
-                    (setf (cdr cell) new)
-                    new)))
-            (let ((powers (coerce (compute-powers base) 'vector)))
-              ;; Add new base to head: SCRUB-POWER-CACHE will later
-              ;; put it to a better place.
-              (setf *power-cache* (acons base powers cache))
-              powers))))))
+    (let* ((cache *power-cache*)
+           (powers (aref cache base)))
+      (setf (aref cache base)
+            (concatenate 'vector powers
+                         (compute-powers
+                          (if powers
+                              (let* ((len (length powers))
+                                     (max (svref powers (1- len))))
+                                (if (> max limit)
+                                    (return-from powers-for-base powers)
+                                    (* max max)))
+                              base)))))))
 
 ;; Algorithm by Harald Hanche-Olsen, sbcl-devel 2005-02-05
 (defun %output-huge-integer-in-base (n base stream)
@@ -1404,36 +1347,38 @@ variable: an unreadable object representing the error is printed instead.")
   (nth-value 1 (decode-float least-positive-long-float)))
 
 (defun flonum-to-digits (v &optional position relativep)
-  (let ((print-base 10) ; B
-        (float-radix 2) ; b
+  (let ((print-base 10)                 ; B
+        (float-radix 2)                 ; b
         (float-digits (float-digits v)) ; p
         (digit-characters "0123456789")
         (min-e
-         (etypecase v
-           (single-float single-float-min-e)
-           (double-float double-float-min-e)
-           #!+long-float
-           (long-float long-float-min-e))))
+          (etypecase v
+            (single-float single-float-min-e)
+            (double-float double-float-min-e)
+            #!+long-float
+            (long-float long-float-min-e))))
     (multiple-value-bind (f e)
         (integer-decode-float v)
-      (let (;; FIXME: these even tests assume normal IEEE rounding
+      (let ( ;; FIXME: these even tests assume normal IEEE rounding
             ;; mode.  I wonder if we should cater for non-normal?
             (high-ok (evenp f))
             (low-ok (evenp f)))
         (with-push-char (:element-type base-char)
           (labels ((scale (r s m+ m-)
-                     (do ((k 0 (1+ k))
+                     (do ((r+m+ (+ r m+))
+                          (k 0 (1+ k))
                           (s s (* s print-base)))
-                         ((not (or (> (+ r m+) s)
-                                   (and high-ok (= (+ r m+) s))))
+                         ((not (or (> r+m+ s)
+                                   (and high-ok (= r+m+ s))))
                           (do ((k k (1- k))
                                (r r (* r print-base))
                                (m+ m+ (* m+ print-base))
                                (m- m- (* m- print-base)))
-                              ((not (and (plusp (- r m-)) ; Extension to handle zero
-                                         (or (< (* (+ r m+) print-base) s)
-                                             (and (not high-ok)
-                                                  (= (* (+ r m+) print-base) s)))))
+                              ((not (and (> r m-) ; Extension to handle zero
+                                         (let ((x (* (+ r m+) print-base)))
+                                           (or (< x s)
+                                               (and (not high-ok)
+                                                    (= x s))))))
                                (values k (generate r s m+ m-)))))))
                    (generate (r s m+ m-)
                      (let (d tc1 tc2)
@@ -1443,8 +1388,9 @@ variable: an unreadable object representing the error is printed instead.")
                           (setf m+ (* m+ print-base))
                           (setf m- (* m- print-base))
                           (setf tc1 (or (< r m-) (and low-ok (= r m-))))
-                          (setf tc2 (or (> (+ r m+) s)
-                                        (and high-ok (= (+ r m+) s))))
+                          (setf tc2 (let ((r+m+ (+ r m+)))
+                                      (or (> r+m+ s)
+                                          (and high-ok (= r+m+ s)))))
                           (when (or tc1 tc2)
                             (go end))
                           (push-char (char digit-characters d))
@@ -1453,34 +1399,36 @@ variable: an unreadable object representing the error is printed instead.")
                           (let ((d (cond
                                      ((and (not tc1) tc2) (1+ d))
                                      ((and tc1 (not tc2)) d)
-                                     (t ; (and tc1 tc2)
-                                      (if (< (* r 2) s) d (1+ d))))))
+                                     ((< (* r 2) s)
+                                      d)
+                                     (t
+                                      (1+ d)))))
                             (push-char (char digit-characters d))
                             (return-from generate (get-pushed-string))))))
                    (initialize ()
                      (let (r s m+ m-)
-                       (if (>= e 0)
-                           (let* ((be (expt float-radix e))
-                                  (be1 (* be float-radix)))
-                             (if (/= f (expt float-radix (1- float-digits)))
-                                 (setf r (* f be 2)
-                                       s 2
-                                       m+ be
-                                       m- be)
-                                 (setf r (* f be1 2)
-                                       s (* float-radix 2)
-                                       m+ be1
-                                       m- be)))
-                           (if (or (= e min-e)
-                                   (/= f (expt float-radix (1- float-digits))))
-                               (setf r (* f 2)
-                                     s (* (expt float-radix (- e)) 2)
-                                     m+ 1
-                                     m- 1)
-                               (setf r (* f float-radix 2)
-                                     s (* (expt float-radix (- 1 e)) 2)
-                                     m+ float-radix
-                                     m- 1)))
+                       (cond ((>= e 0)
+                              (let ((be (expt float-radix e)))
+                                (if (/= f (expt float-radix (1- float-digits)))
+                                    (setf r (* f be 2)
+                                          s 2
+                                          m+ be
+                                          m- be)
+                                    (setf m- be
+                                          m+ (* be float-radix)
+                                          r (* f m+ 2)
+                                          s (* float-radix 2)))))
+                             ((or (= e min-e)
+                                  (/= f (expt float-radix (1- float-digits))))
+                              (setf r (* f 2)
+                                    s (expt float-radix (- 1 e))
+                                    m+ 1
+                                    m- 1))
+                             (t
+                              (setf r (* f float-radix 2)
+                                    s (expt float-radix (- 2 e))
+                                    m+ float-radix
+                                    m- 1)))
                        (when position
                          (when relativep
                            (aver (> position 0))
@@ -1490,11 +1438,12 @@ variable: an unreadable object representing the error is printed instead.")
                                ((>= (* s l) (+ r m+))
                                 ;; k is now \hat{k}
                                 (if (< (+ r (* s (/ (expt print-base (- k position)) 2)))
-                                       (* s (expt print-base k)))
+                                       (* s l))
                                     (setf position (- k position))
                                     (setf position (- k position 1))))))
-                         (let ((low (max m- (/ (* s (expt print-base position)) 2)))
-                               (high (max m+ (/ (* s (expt print-base position)) 2))))
+                         (let* ((x (/ (* s (expt print-base position)) 2))
+                                (low (max m- x))
+                                (high (max m+ x)))
                            (when (<= m- low)
                              (setf m- low)
                              (setf low-ok t))
@@ -1592,17 +1541,26 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; Print the appropriate exponent marker for X and the specified exponent.
 (defun print-float-exponent (x exp stream)
   (declare (type float x) (type integer exp) (type stream stream))
-  (let ((*print-radix* nil))
-    (if (typep x *read-default-float-format*)
-        (unless (eql exp 0)
-          (format stream "e~D" exp))
-        (format stream "~C~D"
-                (etypecase x
-                  (single-float #\f)
-                  (double-float #\d)
-                  (short-float #\s)
-                  (long-float #\L))
-                exp))))
+  (cond ((case *read-default-float-format*
+           ((short-float single-float)
+            (typep x 'single-float))
+           ((double-float #!-long-float long-float)
+            (typep x 'double-float))
+           #!+long-float
+           (long-float
+            (typep x 'long-float)))
+         (unless (eql exp 0)
+           (write-char #\e stream)
+           (%output-integer-in-base exp 10 stream)))
+        (t
+         (write-char
+          (etypecase x
+            (single-float #\f)
+            (double-float #\d)
+            (short-float #\s)
+            (long-float #\L))
+          stream)
+         (%output-integer-in-base exp 10 stream))))
 
 (defun output-float-infinity (x stream)
   (declare (float x) (stream stream))
@@ -1722,42 +1680,37 @@ variable: an unreadable object representing the error is printed instead.")
     (write-string "return PC object" stream)))
 
 (defun output-fdefn (fdefn stream)
-  (print-unreadable-object (fdefn stream)
-    (write-string "FDEFINITION for " stream)
-    ;; It's somewhat unhelpful to print as <FDEFINITION for (SETF #)>
-    ;; Generalized function names are indivisible.
+  (print-unreadable-object (fdefn stream :type t)
     (let ((name (fdefn-name fdefn)))
-      (if (atom name)
-          (output-object name stream)
-          ;; This needn't protect against improper lists.
-          ;; (You'd get crashes in INTERNAL-NAME-P and other places)
-          (format stream "(~{~S~^ ~})" name)))))
+      ;; It's somewhat unhelpful to print as <FDEFINITION for (SETF #)>
+      ;; Generalized function names are indivisible.
+      (if (proper-list-p name)
+          (format stream "(~{~S~^ ~})" name)
+          (output-object name stream)))))
 
+;;; Making this a DEFMETHOD defers its compilation until after the inline
+;;; functions %SIMD-PACK-{SINGLES,DOUBLES,UB64S} get defined.
 #!+sb-simd-pack
-(defun output-simd-pack (pack stream)
-  (declare (type simd-pack pack))
+(defmethod print-object ((pack simd-pack) stream)
   (cond ((and *print-readably* *read-eval*)
-         (etypecase pack
-           ((simd-pack double-float)
-            (multiple-value-call #'format stream
-              "#.(~S ~S ~S)"
-              '%make-simd-pack-double
-              (%simd-pack-doubles pack)))
-           ((simd-pack single-float)
-            (multiple-value-call #'format stream
-              "#.(~S ~S ~S ~S ~S)"
-              '%make-simd-pack-single
-              (%simd-pack-singles pack)))
-           (t
-            (multiple-value-call #'format stream
-              "#.(~S #X~16,'0X #X~16,'0X)"
-              '%make-simd-pack-ub64
-              (%simd-pack-ub64s pack)))))
+         (multiple-value-bind (format maker extractor)
+             (etypecase pack
+               ((simd-pack double-float)
+                (values "#.(~S ~S ~S)"
+                        '%make-simd-pack-double #'%simd-pack-doubles))
+               ((simd-pack single-float)
+                (values "#.(~S ~S ~S ~S ~S)"
+                        '%make-simd-pack-single #'%simd-pack-singles))
+               (t
+                (values "#.(~S #X~16,'0X #X~16,'0X)"
+                        '%make-simd-pack-ub64 #'%simd-pack-ub64s)))
+           (multiple-value-call
+            #'format stream format maker (funcall extractor pack))))
         (t
          (print-unreadable-object (pack stream)
            (flet ((all-ones-p (value start end &aux (mask (- (ash 1 end) (ash 1 start))))
                       (= (logand value mask) mask))
-                    (split-num (value start)
+                  (split-num (value start)
                       (loop
                          for i from 0 to 3
                          and v = (ash value (- start)) then (ash v -8)

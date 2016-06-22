@@ -21,7 +21,6 @@
 ;;; is declared to hold a DEFSTRUCT-DESCRIPTION.
 (def!struct (defstruct-description
              (:conc-name dd-)
-             (:make-load-form-fun just-dump-it-normally)
              #-sb-xc-host (:pure t)
              (:constructor make-defstruct-description (null-lexenv-p name)))
   ;; name of the structure
@@ -75,12 +74,11 @@
   ;; NIL if the option was given with no argument.
   (printer-fname nil :type (or cons symbol))
 
-  ;; The number of untagged slots at the end.
-  #!-interleaved-raw-slots (raw-length 0 :type index)
   ;; the value of the :PURE option, or :UNSPECIFIED. This is only
   ;; meaningful if DD-CLASS-P = T.
   (pure :unspecified :type (member t nil :unspecified)))
 #!-sb-fluid (declaim (freeze-type defstruct-description))
+(!set-load-form-method defstruct-description (:host :xc :target))
 
 ;;;; basic LAYOUT stuff
 
@@ -110,29 +108,7 @@
 ;;; well, since the initialization of layout slots is hardcoded there.
 ;;;
 ;;; FIXME: ...it would be better to automate this, of course...
-(def!struct (layout
-             ;; KLUDGE: A special hack keeps this from being
-             ;; called when building code for the
-             ;; cross-compiler. See comments at the DEFUN for
-             ;; this. -- WHN 19990914
-             (:make-load-form-fun #-sb-xc-host ignore-it
-                                  ;; KLUDGE: DEF!STRUCT at #+SB-XC-HOST
-                                  ;; time controls both the
-                                  ;; build-the-cross-compiler behavior
-                                  ;; and the run-the-cross-compiler
-                                  ;; behavior. The value below only
-                                  ;; works for build-the-cross-compiler.
-                                  ;; There's a special hack in
-                                  ;; EMIT-MAKE-LOAD-FORM which gives
-                                  ;; effectively IGNORE-IT behavior for
-                                  ;; LAYOUT at run-the-cross-compiler
-                                  ;; time. It would be cleaner to
-                                  ;; actually have an IGNORE-IT value
-                                  ;; stored, but it's hard to see how to
-                                  ;; do that concisely with the current
-                                  ;; DEF!STRUCT setup. -- WHN 19990930
-                                  #+sb-xc-host
-                                  make-load-form-for-layout))
+(def!struct (layout)
   ;; a pseudo-random hash value for use by CLOS.
   (clos-hash (random-layout-clos-hash) :type layout-clos-hash)
   ;; the class that this is a layout for
@@ -176,14 +152,10 @@
   ;;
   ;; This slot is known to the C runtime support code.
   (pure nil :type (member t nil 0))
-  ;; Number of raw words at the end.
-  ;; This slot is known to the C runtime support code.
-  ;; It counts the number of untagged cells, not user-visible slots.
-  ;; e.g. on 32-bit machines, each (COMPLEX DOUBLE-FLOAT) counts as 4.
-  #!-interleaved-raw-slots (n-untagged-slots 0 :type index)
-  ;; Metadata
-  #!+interleaved-raw-slots (untagged-bitmap 0 :type unsigned-byte)
-  #!+interleaved-raw-slots (equalp-tests #() :type simple-vector)
+  ;; Map of raw slot indices.
+  (bitmap 0 :type unsigned-byte)
+  ;; Per-slot comparator for implementing EQUALP.
+  (equalp-tests #() :type simple-vector)
   ;; Definition location
   (source-location nil)
   ;; If this layout is for an object of metatype STANDARD-CLASS,
@@ -211,7 +183,6 @@
 ;;; away as with the merger of SB-PCL:CLASS and CL:CLASS it's no
 ;;; longer necessary)
 (def!struct (classoid
-             (:make-load-form-fun classoid-make-load-form-fun)
              (:include ctype
                        (class-info (type-class-or-lose 'classoid)))
              (:constructor nil)
@@ -309,10 +280,6 @@
 ;;; definitions with load-time resolution.
 (def!struct (classoid-cell
              (:constructor make-classoid-cell (name &optional classoid))
-             (:make-load-form-fun (lambda (c)
-                                    `(find-classoid-cell
-                                      ',(classoid-cell-name c)
-                                      :create t)))
              #-no-ansi-print-object
              (:print-object (lambda (s stream)
                               (print-unreadable-object (s stream :type t)
@@ -324,10 +291,30 @@
   ;; PCL class, if any
   (pcl-class nil))
 (declaim (freeze-type classoid-cell))
+(!set-load-form-method classoid-cell (:xc :target)
+  (lambda (self env)
+    (declare (ignore env))
+    `(find-classoid-cell ',(classoid-cell-name self) :create t)))
 
-;;; This would be a logical place to define FIND-CLASSOID-CELL,
-;;; but since 'globaldb' occurs later in the build order,
-;;; you'd have to go out of your way to declare INFO notinline.
+(defun find-classoid-cell (name &key create)
+  (let ((real-name (uncross name)))
+    (cond ((info :type :classoid-cell real-name))
+          (create
+           (get-info-value-initializing :type :classoid-cell real-name
+                                        (make-classoid-cell real-name))))))
+
+;;; Return the classoid with the specified NAME. If ERRORP is false,
+;;; then NIL is returned when no such class exists.
+(defun find-classoid (name &optional (errorp t))
+  (declare (type symbol name))
+  (let ((cell (find-classoid-cell name)))
+    (cond ((and cell (classoid-cell-classoid cell)))
+          (errorp
+           (error 'simple-type-error
+                  :datum nil
+                  :expected-type 'class
+                  :format-control "Class not yet defined: ~S"
+                  :format-arguments (list name))))))
 
 ;;;; PCL stuff
 
@@ -344,3 +331,41 @@
 
 (declaim (freeze-type built-in-classoid condition-classoid
                       standard-classoid static-classoid))
+
+(in-package "SB!C")
+
+;;; layout for this type being used by the compiler
+(define-info-type (:type :compiler-layout)
+  :type-spec (or layout null)
+  :default (lambda (name)
+             (let ((class (find-classoid name nil)))
+               (when class (classoid-layout class)))))
+
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+(defun ftype-from-fdefn (name)
+  (declare (ignorable name))
+  ;; Again [as in (DEFINE-INFO-TYPE (:FUNCTION :TYPE) ...)] it's
+  ;; not clear how to generalize the FBOUNDP expression to the
+  ;; cross-compiler. -- WHN 19990330
+  #+sb-xc-host
+  (specifier-type 'function)
+  #-sb-xc-host
+  (let* ((fdefn (sb!kernel::find-fdefn name))
+         (fun (and fdefn (fdefn-fun fdefn))))
+    (if fun
+        (handler-bind ((style-warning #'muffle-warning))
+          (specifier-type (sb!impl::%fun-type fun)))
+        (specifier-type 'function)))))
+
+;;; The type specifier for this function, or a DEFSTRUCT-DESCRIPTION
+;;; or the symbol :GENERIC-FUNTION.
+;;; If a DD, it must contain a constructor whose name is
+;;; the one being sought in globaldb, which is used to derive the type.
+;;; If :GENERIC-FUNCTION, the info is recomputed from existing methods
+;;; and stored back into globaldb.
+(define-info-type (:function :type)
+  :type-spec (or ctype defstruct-description (member :generic-function))
+  :default #'ftype-from-fdefn)
+
+;;; A random place for this :-(
+#+sb-xc-host (setq *info-environment* (make-info-hashtable))

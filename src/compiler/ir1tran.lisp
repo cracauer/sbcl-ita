@@ -105,7 +105,7 @@
   (let ((answer
          (typecase env
            (null nil)
-           #!+sb-fasteval
+           #!+(and sb-fasteval (host-feature sb-xc))
            (sb!interpreter:basic-env
             (sb!interpreter::fun-lexically-notinline-p name env))
            (t
@@ -117,12 +117,6 @@
     ;; If ANSWER is NIL, go for the global value
     (eq (or answer (info :function :inlinep name))
         :notinline)))
-
-;; This will get redefined in PCL boot.
-(declaim (notinline maybe-update-info-for-gf))
-(defun maybe-update-info-for-gf (name)
-  (declare (ignore name))
-  nil)
 
 (defun maybe-defined-here (name where)
   (if (and (eq :defined where)
@@ -162,7 +156,7 @@
                  ftype
                  (specifier-type 'function))
        :defined-type (if (and (not latep) (not notinline))
-                         (or (maybe-update-info-for-gf name) ftype)
+                         ftype
                          (specifier-type 'function))
        :where-from (if notinline
                        where
@@ -379,20 +373,13 @@
                     ;; user-defined MAKE-LOAD-FORM methods?
                     (when (emit-make-load-form value)
                       #+sb-xc-host
-                      (aver (zerop (layout-raw-slot-metadata
-                                    (%instance-layout value))))
+                      (aver (zerop (layout-bitmap (%instance-layout value))))
                       (do-instance-tagged-slot (i value)
                         (grovel (%instance-ref value i)))))
-                   ;; The cross-compiler can dump certain instances that are not
-                   ;; subtypes of STRUCTURE!OBJECT, as long as it has processed
-                   ;; the defstruct.
-                   #+sb-xc-host
-                   ((satisfies sb!kernel::xc-dumpable-structure-instance-p)
-                    (do-instance-tagged-slot (i value)
-                      (grovel (%instance-ref value i))))
                    (t
                     (compiler-error
-                     "Objects of type ~S can't be dumped into fasl files."
+                      "Objects of type ~/sb!impl:print-type-specifier/ ~
+                       can't be dumped into fasl files."
                      (type-of value)))))))
       ;; Dump all non-trivial named constants using the name.
       (if (and namep (not (typep constant '(or symbol character
@@ -689,7 +676,7 @@
     (:always-bound t)
     ;; Compiling to fasl considers a symbol always-bound if its
     ;; :always-bound info value is now T or will eventually be T.
-    (:eventually (fasl-output-p *compile-object*))))
+    (:eventually (producing-fasl-file))))
 
 ;;; Convert a reference to a symbolic constant or variable. If the
 ;;; symbol is entered in the LEXENV-VARS we use that definition,
@@ -956,6 +943,18 @@
 
 
 ;;;; code coverage
+
+;;; Used as the CDR of the code coverage instrumentation records
+;;; (instead of NIL) to ensure that any well-behaving user code will
+;;; not have constants EQUAL to that record. This avoids problems with
+;;; the records getting coalesced with non-record conses, which then
+;;; get mutated when the instrumentation runs. Note that it's
+;;; important for multiple records for the same location to be
+;;; coalesced. -- JES, 2008-01-02
+;;; Use of #. mandates :COMPILE-TOPLEVEL for several Lisps
+;;; even though for us it's immediately accessible to EVAL.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%))
 
 ;;; Check the policy for whether we should generate code coverage
 ;;; instrumentation. If not, just return the original START
@@ -1272,12 +1271,12 @@
                                (warn
                                 'type-warning
                                 :format-control
-                                "The type declarations ~S and ~S for ~S conflict."
+                                 "The type declarations ~
+                                  ~/sb!impl:print-type/ and ~
+                                  ~/sb!impl:print-type/ for ~
+                                  ~S conflict."
                                 :format-arguments
-                                (list
-                                 (type-specifier old-type)
-                                 (type-specifier type)
-                                 var-name))))
+                                (list old-type type var-name))))
                             (bound-var
                              (setf (leaf-type bound-var) int
                                    (leaf-where-from bound-var) :declared))

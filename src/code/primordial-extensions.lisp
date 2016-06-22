@@ -12,104 +12,21 @@
 
 (in-package "SB!IMPL")
 
-;;;; target constants which need to appear as early as possible
+;;; Helper for making the DX closure allocation in macros expanding
+;;; to CALL-WITH-FOO less ugly.
+(defmacro dx-flet (functions &body forms)
+  `(flet ,functions
+     (declare (truly-dynamic-extent ,@(mapcar (lambda (func) `#',(car func))
+                                              functions)))
+     ,@forms))
 
-;;; an internal tag for marking empty slots, which needs to be defined
-;;; as early as possible because it appears in macroexpansions for
-;;; iteration over hash tables
-;;;
-;;; CMU CL 18b used :EMPTY for this purpose, which was somewhat nasty
-;;; since it's easily accessible to the user, so that e.g.
-;;;     (DEFVAR *HT* (MAKE-HASH-TABLE))
-;;;     (SETF (GETHASH :EMPTY *HT*) :EMPTY)
-;;;     (MAPHASH (LAMBDA (K V) (FORMAT T "~&~S ~S~%" K V)))
-;;; gives no output -- oops!
-;;;
-;;; FIXME: It'd probably be good to use the unbound marker for this.
-;;; However, there might be some gotchas involving assumptions by
-;;; e.g. AREF that they're not going to return the unbound marker,
-;;; and there's also the noted-below problem that the C-level code
-;;; contains implicit assumptions about this marker.
-;;;
-;;; KLUDGE: Note that as of version 0.pre7 there's a dependence in the
-;;; gencgc.c code on this value being a symbol. (This is only one of
-;;; several nasty dependencies between that code and this, alas.)
-;;; -- WHN 2001-08-17
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (def!constant +empty-ht-slot+ '%empty-ht-slot%))
-;;; We shouldn't need this mess now that EVAL-WHEN works.
-
-;;; KLUDGE: Using a private symbol still leaves us vulnerable to users
-;;; getting nonconforming behavior by messing around with
-;;; DO-ALL-SYMBOLS. That seems like a fairly obscure problem, so for
-;;; now we just don't worry about it. If for some reason it becomes
-;;; worrisome and the magic value needs replacement:
-;;;   * The replacement value needs to be LOADable with EQL preserved,
-;;;     so that the macroexpansion for WITH-HASH-TABLE-ITERATOR will
-;;;     work when compiled into a file and loaded back into SBCL.
-;;;     (Thus, just uninterning %EMPTY-HT-SLOT% doesn't work.)
-;;;   * The replacement value needs to be acceptable to the
-;;;     low-level gencgc.lisp hash table scavenging code.
-;;;   * The change will break binary compatibility, since comparisons
-;;;     against the value used at the time of compilation are wired
-;;;     into FASL files.
-;;; -- WHN 20000622
-
-;;;; DO-related stuff which needs to be visible on the cross-compilation host
-
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun frob-do-body (varlist endlist decls-and-code bind step name block)
-    (let* ((r-inits nil) ; accumulator for reversed list
-           (r-steps nil) ; accumulator for reversed list
-           (label-1 (gensym))
-           (label-2 (gensym)))
-      ;; Check for illegal old-style DO.
-      (when (or (not (listp varlist)) (atom endlist))
-        (error "ill-formed ~S -- possibly illegal old style DO?" name))
-      ;; Parse VARLIST to get R-INITS and R-STEPS.
-      (dolist (v varlist)
-        (flet (;; (We avoid using CL:PUSH here so that CL:PUSH can be
-               ;; defined in terms of CL:SETF, and CL:SETF can be
-               ;; defined in terms of CL:DO, and CL:DO can be defined
-               ;; in terms of the current function.)
-               (push-on-r-inits (x)
-                 (setq r-inits (cons x r-inits)))
-               ;; common error-handling
-               (illegal-varlist ()
-                 (error "~S is an illegal form for a ~S varlist." v name)))
-          (cond ((symbolp v) (push-on-r-inits v))
-                ((listp v)
-                 (unless (symbolp (first v))
-                   (error "~S step variable is not a symbol: ~S"
-                          name
-                          (first v)))
-                 (let ((lv (length v)))
-                   ;; (We avoid using CL:CASE here so that CL:CASE can
-                   ;; be defined in terms of CL:SETF, and CL:SETF can
-                   ;; be defined in terms of CL:DO, and CL:DO can be
-                   ;; defined in terms of the current function.)
-                   (cond ((= lv 1)
-                          (push-on-r-inits (first v)))
-                         ((= lv 2)
-                          (push-on-r-inits v))
-                         ((= lv 3)
-                          (push-on-r-inits (list (first v) (second v)))
-                          (setq r-steps (list* (third v) (first v) r-steps)))
-                         (t (illegal-varlist)))))
-                (t (illegal-varlist)))))
-      ;; Construct the new form.
-      (multiple-value-bind (code decls) (parse-body decls-and-code nil)
-        `(block ,block
-           (,bind ,(nreverse r-inits)
-                  ,@decls
-                  (tagbody
-                     (go ,label-2)
-                     ,label-1
-                     (tagbody ,@code)
-                     (,step ,@(nreverse r-steps))
-                     ,label-2
-                     (unless ,(first endlist) (go ,label-1))
-                     (return-from ,block (progn ,@(rest endlist))))))))))
+;;; Another similar one.
+(defmacro dx-let (bindings &body forms)
+  `(let ,bindings
+     (declare (truly-dynamic-extent
+               ,@(mapcar (lambda (bind) (if (listp bind) (car bind) bind))
+                         bindings)))
+     ,@forms))
 
 ;; Define "exchanged subtract" So that DECF on a symbol requires no LET binding:
 ;;  (DECF I (EXPR)) -> (SETQ I (XSUBTRACT (EXPR) I))
@@ -130,6 +47,7 @@
 ;;; Incidentally, this is essentially the same operator which
 ;;; _On Lisp_ calls WITH-GENSYMS.
 (defmacro with-unique-names (symbols &body body)
+  (declare (notinline every)) ; because we can't inline ALPHA-CHAR-P
   `(let ,(mapcar (lambda (symbol)
                    (let* ((symbol-name (symbol-name symbol))
                           (stem (if (every #'alpha-char-p symbol-name)
@@ -141,8 +59,6 @@
 
 ;;; Return a list of N gensyms. (This is a common suboperation in
 ;;; macros and other code-manipulating code.)
-(declaim (ftype (function (unsigned-byte &optional t) (values list &optional))
-                make-gensym-list))
 (defun make-gensym-list (n &optional name)
   (let ((arg (if name (string name) "G")))
     (loop repeat n collect (sb!xc:gensym arg))))
@@ -155,7 +71,7 @@
 (macrolet ((def-it (sym expr)
              #+sb-xc-host
              `(progn (declaim (type package ,sym))
-                     (defglobal ,sym ,expr))
+                     (defvar ,sym ,expr))
              #-sb-xc-host
              ;; We don't need to declaim the type. FIND-PACKAGE
              ;; returns a package, and L-T-V propagates types.
@@ -164,12 +80,15 @@
   (def-it *cl-package* (find-package "COMMON-LISP"))
   (def-it *keyword-package* (find-package "KEYWORD")))
 
+(declaim (inline singleton-p))
+(defun singleton-p (list)
+  (and (listp list) (null (rest list)) list))
+
 ;;; Concatenate together the names of some strings and symbols,
 ;;; producing a symbol in the current package.
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun symbolicate (&rest things)
-    (declare (dynamic-extent things))
-    (values
+(defun symbolicate (&rest things)
+  (declare (dynamic-extent things))
+  (values
      (intern
       (if (singleton-p things)
           (string (first things))
@@ -180,7 +99,7 @@
             (dolist (thing things name)
               (let ((x (string thing)))
                 (replace name x :start1 index)
-                (incf index (length x))))))))))
+                (incf index (length x)))))))))
 
 (defun gensymify (x)
   (if (symbolp x)
@@ -197,9 +116,6 @@
 ;;; (Such an assignment is undefined behavior, so it's sort of reasonable for
 ;;; it to cause the system to go totally insane afterwards, but it's a
 ;;; fairly easy mistake to make, so let's try to recover gracefully instead.)
-;;; This function is called while compiling this file because DO-ANONYMOUS
-;;; is a delayed-def!macro, the constructor for which calls SANE-PACKAGE.
-(eval-when (:load-toplevel :execute #+sb-xc-host :compile-toplevel)
 (defun sane-package ()
   ;; Perhaps it's possible for *PACKAGE* to be set to a non-package in some
   ;; host Lisp, but in SBCL it isn't, and the PACKAGEP test below would be
@@ -236,7 +152,7 @@
                                             (if packagep
                                                 "deleted package"
                                                 (type-of maybe-package))
-                                            really-package))))))))
+                                            really-package)))))))
 
 ;;; Access *DEFAULT-PATHNAME-DEFAULTS*, issuing a warning if its value
 ;;; is silly. (Unlike the vaguely-analogous SANE-PACKAGE, we don't
@@ -257,53 +173,21 @@
        '*default-pathname-defaults*))
     dfd))
 
-;;; Compile a version of BODY for all TYPES, and dispatch to the
-;;; correct one based on the value of VAR. This was originally used
-;;; only for strings, hence the name. Renaming it to something more
-;;; generic might not be a bad idea.
-(def!macro string-dispatch ((&rest types) var &body body)
-  (let ((fun (sb!xc:gensym "STRING-DISPATCH-FUN")))
-    `(flet ((,fun (,var)
-              ,@body))
-       (declare (inline ,fun))
-       (etypecase ,var
-         ,@(loop for type in types
-                 ;; TRULY-THE allows transforms to take advantage of the type
-                 ;; information without need for constraint propagation.
-                 collect `(,type (,fun (truly-the ,type ,var))))))))
-
 ;;; Give names to elements of a numeric sequence.
 (defmacro defenum ((&key (start 0) (step 1))
                    &rest identifiers)
-  (let ((results nil)
-        (index 0)
-        (start (eval start))
-        (step (eval step)))
-    (dolist (id identifiers)
-      (when id
-        (multiple-value-bind (sym docs)
-            (if (consp id)
-                (values (car id) (cdr id))
-                (values id nil))
-          (push `(def!constant ,sym
-                   ,(+ start (* step index))
-                   ,@docs)
-                results)))
-      (incf index))
+  (declare (type integer start step))
+  (let ((value (- start step)))
     `(progn
-       ,@(nreverse results))))
-
-;;; generalization of DEFCONSTANT to values which are the same not
-;;; under EQL but under e.g. EQUAL or EQUALP
-;;;
-;;; DEFCONSTANT-EQX is to be used instead of DEFCONSTANT for values
-;;; which are appropriately compared using the function given by the
-;;; EQX argument instead of EQL.
-;;;
-(defmacro defconstant-eqx (symbol expr eqx &optional doc)
-  `(def!constant ,symbol
-     (%defconstant-eqx-value ',symbol ,expr ,eqx)
-     ,@(when doc (list doc))))
+       ,@(mapcar (lambda (id)
+                   (incf value step)
+                   (when id
+                     (multiple-value-bind (sym docstring)
+                         (if (consp id)
+                             (values (car id) (cdr id))
+                             (values id nil))
+                       `(def!constant ,sym ,value ,@docstring))))
+                 identifiers))))
 
 ;;; a helper function for various macros which expect clauses of a
 ;;; given length, etc.
@@ -359,10 +243,6 @@
             :format-control ,control
             :format-arguments (if ,controlp ',arguments (list ',name)))))
 
-;;; This is like DO, except it has no implicit NIL block.
-(def!macro do-anonymous (varlist endlist &rest body)
-  (frob-do-body varlist endlist body 'let 'psetq 'do-anonymous (gensym)))
-
 ;;; Anaphoric macros
 (defmacro awhen (test &body body)
   `(let ((it ,test))
@@ -380,3 +260,14 @@
                       `(let ((it ,it)) (declare (ignorable it)) ,@body)
                       it)
                  (acond ,@rest)))))))
+
+;; This is not an 'extension', but is needed super early, so ....
+(defmacro sb!xc:defconstant (name value &optional (doc nil docp))
+  #!+sb-doc
+  "Define a global constant, saying that the value is constant and may be
+  compiled into code. If the variable already has a value, and this is not
+  EQL to the new value, the code is not portable (undefined behavior). The
+  third argument is an optional documentation string for the variable."
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (sb!c::%defconstant ',name ,value (sb!c:source-location)
+                         ,@(and docp `(',doc)))))

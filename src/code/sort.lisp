@@ -443,13 +443,16 @@
              ;; - use the specialized reffer for inputs + output
              (merge-vectors vector-1 length-1 vector-2 length-2
                             result pred-fun key-fun aref))))
-      ((and (csubtypep type (specifier-type 'sequence))
-            (awhen (find-class result-type nil)
+      ((when-extended-sequence-type
+           (result-type type :expandedp nil :prototype prototype)
+         ;; This function has the EXPLICIT-CHECK declaration, so we
+         ;; manually assert that it returns a SEQUENCE.
+         (the extended-sequence
+              ;; GF dispatch deals with the erroneous situation
+              ;; wherein either of SEQUENCE1 or SEQUENCE2 is not a
+              ;; sequence.  Note that the one builtin method optimizes
+              ;; for NIL as the key fun, and we correctly preserve a
+              ;; NIL here.
               (sb!sequence:merge
-               (sb!mop:class-prototype (sb!pcl:ensure-class-finalized it))
-               ;; GF dispatch deals with the erroneous situation wherein
-               ;; either of SEQUENCE1 or SEQUENCE2 is not a sequence.
-               ;; Note that the one builtin method optimizes for NIL as
-               ;; the key fun, and we correctly preserve a NIL here.
-               sequence1 sequence2 pred-fun :key key-fun))))
+               prototype sequence1 sequence2 pred-fun :key key-fun))))
       (t (bad-sequence-type-error result-type)))))

@@ -10,24 +10,6 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-
-;;;; Interfaces to IR2 conversion:
-
-;;; Return a wired TN describing the N'th full call argument passing
-;;; location.
-(defun standard-arg-location (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-wired-tn *backend-t-primitive-type* register-arg-scn
-                     (elt *register-arg-offsets* n))
-      (make-wired-tn *backend-t-primitive-type* control-stack-arg-scn n)))
-
-(defun standard-arg-location-sc (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-sc-offset register-arg-scn
-                      (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-arg-scn n)))
 
 (defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
@@ -84,36 +66,6 @@
 ;;; passed when we are using non-standard conventions.
 (defun make-arg-count-location ()
   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
-
-
-;;; Make a TN to hold the number-stack frame pointer.  This is
-;;; allocated once per component, and is component-live.
-(defun make-nfp-tn ()
-  (component-live-tn
-   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nfp-offset)))
-
-(defun make-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-(defun make-number-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-;;; Return a list of TNs that can be used to represent an unknown-values
-;;; continuation within a function.
-(defun make-unknown-values-locations ()
-  (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
-
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure.  We push
-;;; placeholder entries in the Constants to leave room for additional
-;;; noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (dotimes (i code-constants-offset)
-    (vector-push-extend nil
-                        (ir2-component-constants (component-info component))))
-  (values))
 
 ;;;; Frame hackery:
 
@@ -333,14 +285,15 @@
     (inst mov count (fixnumize 1))
     (inst b DONE)
     MULTIPLE
-    (do ((arg *register-arg-tns* (rest arg))
-         (i 0 (1+ i)))
+    #.(assert (evenp register-arg-count))
+    (do ((arg *register-arg-tns* (cddr arg))
+         (i 0 (+ i 2)))
         ((null arg))
-      (storew (first arg) args i 0))
+      (inst stp (first arg) (second arg)
+            (@ args (* i n-word-bytes))))
     (move start args)
     (move count nargs)
     DONE))
-
 
 ;;; VOP that can be inherited by unknown values receivers.  The main
 ;;; thing this handles is allocation of the result temporaries.
@@ -542,8 +495,7 @@
 
       ;; Grab one value.
       ENTER
-      (loadw temp context)
-      (inst add context context n-word-bytes)
+      (inst ldr temp (@ context n-word-bytes :post-index))
 
       ;; Dec count, and if != zero, go back for more.
       (inst subs count count (fixnumize 1))
@@ -589,49 +541,25 @@
   (:generator 3
     (let ((err-lab
            (generate-error-code vop 'invalid-arg-count-error)))
-      (flet ((load-immediate (x)
-               (add-sub-immediate (fixnumize x))))
+      (labels ((load-immediate (x)
+                 (add-sub-immediate (fixnumize x)))
+               (check-min ()
+                 (cond ((= min 1)
+                        (inst cbz nargs err-lab))
+                       ((plusp min)
+                        (inst cmp nargs (load-immediate min))
+                        (inst b :lo err-lab)))))
         (cond ((eql max 0)
                (inst cbnz nargs err-lab))
               ((not min)
                (inst cmp nargs (load-immediate max))
                (inst b :ne err-lab))
-             (max
-              (when (plusp min)
-                (inst cmp nargs (load-immediate min))
-                (inst b :lo err-lab))
-              (inst cmp nargs (load-immediate max))
-              (inst b :hi err-lab))
-             ((eql min 1)
-              (inst cbz nargs err-lab))
-             ((plusp min)
-              (inst cmp nargs (load-immediate min))
-              (inst b :lo err-lab)))))))
-
-;;; Signal various errors.
-(macrolet ((frob (name error translate &rest args)
-             `(define-vop (,name)
-                ,@(when translate
-                    `((:policy :fast-safe)
-                      (:translate ,translate)))
-                (:args ,@(mapcar #'(lambda (arg)
-                                     `(,arg :scs (any-reg descriptor-reg)))
-                                 args))
-                (:vop-var vop)
-                (:save-p :compute-only)
-                (:generator 1000
-                  (error-call vop ',error ,@args)))))
-  (frob arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nargs fname)
-  (frob type-check-error object-not-type-error sb!c::%type-check-error
-    object type)
-  (frob layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
-    object layout)
-  (frob odd-key-args-error odd-key-args-error
-        sb!c::%odd-key-args-error)
-  (frob unknown-key-arg-error unknown-key-arg-error
-        sb!c::%unknown-key-arg-error key)
-  (frob nil-fun-returned-error nil-fun-returned-error nil fun))
+              (max
+               (check-min)
+               (inst cmp nargs (load-immediate max))
+               (inst b :hi err-lab))
+              (t
+               (check-min)))))))
 
 ;;;; Local call with unknown values convention return:
 
@@ -940,10 +868,14 @@
                                (inst add csp-tn nargs-pass (* 2 n-word-bytes))
                                (inst sub nargs-pass nargs-pass new-fp)
                                (inst asr nargs-pass nargs-pass (- word-shift n-fixnum-tag-bits))
-                               ,@(let ((index -1))
-                                   (mapcar #'(lambda (name)
-                                               `(loadw ,name new-fp ,(incf index)))
-                                           *register-arg-names*))
+                               ,@(do ((arg *register-arg-names* (cddr arg))
+                                      (i 0 (+ i 2))
+                                      (insts))
+                                     ((null arg) (nreverse insts))
+                                   #.(assert (evenp register-arg-count))
+                                   (push `(inst ldp ,(first arg) ,(second arg)
+                                                (@ new-fp ,(* i n-word-bytes)))
+                                         insts))
                                (storew cfp-tn new-fp ocfp-save-offset))
                              '((inst mov nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)

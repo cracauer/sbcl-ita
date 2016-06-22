@@ -27,42 +27,47 @@
 ;;;
 ;;; The bug was fixed by Douglas Crosher's patch, massaged for SBCL by
 ;;; Martin Atzmueller (2000-09-13 on sbcl-devel).
-(funcall (compile nil
-                  '(lambda ()
-                     (labels ((fun1 ()
-                                (fun2))
-                              (fun2 ()
-                                (when nil
-                                  (tagbody
-                                   tag
-                                   (fun2)
-                                   (go tag)))
-                                (when nil
-                                  (tagbody
-                                   tag
-                                   (fun1)
-                                   (go tag)))))
-
-                       (fun1)
-                       nil))))
+(with-test (:name (:compiler-bug labels tagbody))
+  (funcall (checked-compile
+            `(lambda ()
+               (labels ((fun1 ()
+                          (fun2))
+                        (fun2 ()
+                          (when nil
+                            (tagbody
+                             tag
+                               (fun2)
+                               (go tag)))
+                          (when nil
+                            (tagbody
+                             tag
+                               (fun1)
+                               (go tag)))))
+                 (fun1)
+                 nil)))))
 
 ;;; Exercise a compiler bug (by crashing the compiler).
 ;;;
 ;;; Tim Moore gave a patch for this bug in CMU CL 2000-05-24 on
 ;;; cmucl-imp, and Martin Atzmueller applied it to SBCL.
-(funcall (compile nil
-                  '(lambda (x)
-                     (or (integerp x)
-                         (block used-by-some-y?
-                           (flet ((frob (stk)
-                                    (dolist (y stk)
-                                      (unless (rejected? y)
-                                        (return-from used-by-some-y? t)))))
-                             (declare (inline frob))
-                             (frob (rstk x))
-                             (frob (mrstk x)))
-                           nil))))
-         13)
+(with-test (:name (:compiler-bug flet inline :undefined-function))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile
+       `(lambda (x)
+          (or (integerp x)
+              (block used-by-some-y?
+                (flet ((frob (stk)
+                         (dolist (y stk)
+                           (unless (rejected? y)
+                             (return-from used-by-some-y? t)))))
+                  (declare (inline frob))
+                  (frob (rstk x))
+                  (frob (mrstk x)))
+                nil)))
+       :allow-style-warnings t)
+    (declare (ignore failure-p warnings))
+    (assert (= 3 (length style-warnings)))
+    (funcall fun 13)))
 
 ;;; bug 112, reported by Martin Atzmueller 2001-06-25 (originally
 ;;; from Bruno Haible in CMU CL bugs collection), fixed by
@@ -82,45 +87,41 @@
 
 ;;; another LET-related bug fixed by Alexey Dejneka at the same
 ;;; time as bug 112
-(multiple-value-bind (fun warnings-p failure-p)
-    ;; should complain about duplicate variable names in LET binding
-    (compile nil
-             '(lambda ()
-               (let (x
-                     (x 1))
-                 (list x))))
-  (declare (ignore warnings-p))
-  (assert (functionp fun))
-  (assert failure-p))
+(with-test (:name (let :repeated-name :bug-112))
+  ;; Should complain about duplicate variable names in LET binding
+  (multiple-value-bind (fun failure-p)
+      (checked-compile `(lambda ()
+                          (let (x
+                                (x 1))
+                            (list x)))
+                       :allow-failure t)
+    (assert (functionp fun))
+    (assert failure-p)))
 
 ;;; bug 169 (reported by Alexey Dejneka 2002-05-12, fixed by David
 ;;; Lichteblau 2002-05-21)
-(progn
-  (multiple-value-bind (fun warnings-p failure-p)
-      (compile nil
-               ;; Compiling this code should cause a STYLE-WARNING
-               ;; about *X* looking like a special variable but not
-               ;; being one.
-               '(lambda (n)
-                  (let ((*x* n))
-                    (funcall (symbol-function 'x-getter))
-                    (print *x*))))
+(with-test (:name (let :earmuffs))
+  ;; Compiling this code should cause a STYLE-WARNING about *X*
+  ;; looking like a special variable but not being one.
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile
+       `(lambda (n)
+          (let ((*x* n))
+            (funcall (symbol-function 'x-getter))
+            (print *x*)))
+       :allow-style-warnings 'sb-kernel:asterisks-around-lexical-variable-name)
+    (declare (ignore failure-p warnings))
     (assert (functionp fun))
-    (assert warnings-p)
-    (assert (not failure-p)))
-  (multiple-value-bind (fun warnings-p failure-p)
-      (compile nil
-               ;; Compiling this code should not cause a warning
-               ;; (because the DECLARE turns *X* into a special
-               ;; variable as its name suggests it should be).
-               '(lambda (n)
-                  (let ((*x* n))
-                    (declare (special *x*))
-                    (funcall (symbol-function 'x-getter))
-                    (print *x*))))
-    (assert (functionp fun))
-    (assert (not warnings-p))
-    (assert (not failure-p))))
+    (assert (= 1 (length style-warnings))))
+  ;; Compiling this code should not cause a warning (because the
+  ;; DECLARE turns *X* into a special variable as its name suggests it
+  ;; should be).
+  (let ((fun (checked-compile `(lambda (n)
+                                 (let ((*x* n))
+                                   (declare (special *x*))
+                                   (funcall (symbol-function 'x-getter))
+                                   (print *x*))))))
+    (assert (functionp fun))))
 
 ;;; a bug in 0.7.4.11
 (dolist (i '(a b 1 2 "x" "y"))
@@ -146,7 +147,11 @@
 
 ;;; bug caught and fixed by Raymond Toy cmucl-imp 2002-07-10: &REST
 ;;; variable is not optional.
-(assert (null (ignore-errors (eval '(funcall (lambda (&rest) 12))))))
+(with-test (:name (:lambda-list &rest :missing-name))
+  (multiple-value-bind (fun failure-p)
+      (checked-compile `(lambda (&rest) 12) :allow-failure t)
+    (assert failure-p)
+    (assert-error (funcall fun))))
 
 ;;; on the PPC, we got the magic numbers in undefined_tramp wrong for
 ;;; a while; fixed by CSR 2002-07-18
@@ -174,18 +179,32 @@
 
 ;;; Non-symbols shouldn't be allowed as VARs in lambda lists. (Where VAR
 ;;; is a variable name, as in section 3.4.1 of the ANSI spec.)
-(assert (null (ignore-errors (eval '(lambda ("foo") 12)))))
-(assert (ignore-errors (eval '(lambda (foo) 12))))
-(assert (null (ignore-errors (eval '(lambda (&optional 12) "foo")))))
-(assert (ignore-errors (eval '(lambda (&optional twelve) "foo"))))
-(assert (null (ignore-errors (eval '(lambda (&optional (12 12)) "foo")))))
-(assert (ignore-errors (eval '(lambda (&optional (twelve 12)) "foo"))))
-(assert (null (ignore-errors (eval '(lambda (&key #\c) "foo")))))
-(assert (ignore-errors (eval '(lambda (&key c) "foo"))))
-(assert (null (ignore-errors (eval '(lambda (&key (#\c #\c)) "foo")))))
-(assert (ignore-errors (eval '(lambda (&key (c #\c)) "foo"))))
-(assert (null (ignore-errors (eval '(lambda (&key ((#\c #\c) #\c)) "foo")))))
-(assert (ignore-errors (eval '(lambda (&key ((:c cbyanyothername) #\c)) "foo"))))
+(with-test (:name (:lambda-list :non-symbols))
+  (mapc (lambda (case)
+          (destructuring-bind (form wrongp) case
+            (multiple-value-bind (fun failure-p)
+                (checked-compile form :allow-failure wrongp)
+              (assert (functionp fun))
+              (when wrongp
+                (assert failure-p)
+                (assert-error (funcall fun))))))
+        '(((lambda ("foo") 12)                     t)
+          ((lambda (foo) foo)                      nil)
+
+          ((lambda (&optional 12) "foo")           t)
+          ((lambda (&optional twelve) twelve)      nil)
+
+          ((lambda (&optional (12 12)) "foo")      t)
+          ((lambda (&optional (twelve 12)) twelve) nil)
+
+          ((lambda (&key #\c) "foo")               t)
+          ((lambda (&key c) c)                     nil)
+
+          ((lambda (&key (#\c #\c)) "foo")         t)
+          ((lambda (&key (c #\c)) c)               nil)
+
+          ((lambda (&key ((#\c #\c) #\c)) "foo")   t)
+          ((lambda (&key ((:c c-var) #\c)) c-var)  nil))))
 
 ;;; As reported and fixed by Antonio Martinez-Shotton sbcl-devel
 ;;; 2002-09-12, this failed in sbcl-0.7.7.23. (with failed AVER
@@ -194,13 +213,26 @@
            17))
 
 ;;; bug 181: bad type specifier dropped compiler into debugger
-(assert (list (compile nil '(lambda (x)
-                             (declare (type (0) x))
-                             x))))
+(with-test (:name (compile declare :bad-type-specifier :bug-181))
+  (multiple-value-bind (fun failure-p)
+      (checked-compile `(lambda (x)
+                          (declare (type (0) x))
+                          x)
+                       :allow-failure t)
+    (assert failure-p)
+    (assert (functionp fun))
+    (assert-error (funcall fun 1))))
 
-(let ((f (compile nil '(lambda (x)
-                        (make-array 1 :element-type '(0))))))
-  (assert (null (ignore-errors (funcall f)))))
+(with-test (:name (compile make-array :bad-type-specifier :bug-181))
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile `(lambda (x)
+                          (declare (ignore x))
+                          (make-array 1 :element-type '(0)))
+                       :allow-warnings t)
+    (declare (ignore failure-p warnings))
+    ;; FIXME (assert (= 1 (length warnings)))
+    (assert (functionp fun))
+    (assert-error (funcall fun 1))))
 
 ;;; the following functions must not be flushable
 (dolist (form '((make-sequence 'fixnum 10)
@@ -261,30 +293,26 @@
            "The return value of NSET-EXCLUSIVE-OR should not be discarded."))
         for expected = (sb-int:ensure-list expected-des)
         do
-        (multiple-value-bind (fun warnings-p failure-p)
-            (handler-bind ((style-warning (lambda (c)
-                                            (if expected
-                                                (let ((expect-one (pop expected)))
-                                                  (assert (search expect-one
-                                                                  (with-standard-io-syntax
-                                                                    (let ((*print-right-margin* nil))
-                                                                      (princ-to-string c))))
-                                                          ()
-                                                          "~S should have warned ~S, but instead warned: ~A"
-                                                          form expect-one c))
-                                                (error "~S shouldn't give a(nother) warning, but did: ~A" form c)))))
-              (compile nil `(lambda () ,form)))
-          (declare (ignore warnings-p))
-          (assert (functionp fun))
-          (assert (null expected)
-                  ()
-                  "~S should have warned ~S, but didn't."
-                  form expected)
-          (assert (not failure-p)))))
+       (multiple-value-bind (fun failure-p warnings style-warnings)
+           (checked-compile `(lambda () ,form) :allow-style-warnings (when expected t))
+         (declare (ignore failure-p warnings))
+         (when expected
+           (assert (= (length expected) (length style-warnings)))
+           (dolist (warning style-warnings)
+             (let ((expect-one (pop expected)))
+               (assert (search expect-one
+                               (with-standard-io-syntax
+                                 (let ((*print-right-margin* nil))
+                                   (princ-to-string warning))))
+                       ()
+                       "~S should have warned ~S, but instead warned: ~A"
+                       form expect-one warning))))
+         (assert (functionp fun)))))
 
 ;;; a bug in the MAP deftransform caused non-VECTOR array specifiers
 ;;; to cause errors in the compiler.  Fixed by CSR in 0.7.8.10
-(assert (list (compile nil '(lambda (x) (map 'simple-array 'identity x)))))
+(with-test (:name (map :non-vector))
+  (checked-compile `(lambda (x) (map 'simple-array 'identity x))))
 
 ;;; bug 129: insufficient syntax checking in MACROLET
 (multiple-value-bind (result error)
@@ -370,38 +398,45 @@
 ;;; FUNCTION-LAMBDA-EXPRESSION to return a proper lambda expression in
 ;;; certain circumstances, one of which is when compile is called from
 ;;; top-level.
-(assert (equal
-         (function-lambda-expression
-          (compile nil '(lambda (x) (block nil (print x)))))
-         '(lambda (x) (block nil (print x)))))
+(with-test (:name (compile function-lambda-expression
+                   :toplevel :must-return-lambda-expression))
+  (let ((form '(lambda (x) (block nil (print x)))))
+    (assert (equal form (function-lambda-expression
+                         (checked-compile form))))))
 
 ;;; bug 62: too cautious type inference in a loop
-(assert (nth-value
-         2
-         (compile nil
-                  '(lambda (a)
-                    (declare (optimize speed (safety 0)))
-                    (typecase a
-                      (array (loop (print (car a)))))))))
+(with-test (:name (compile loop :type-inference))
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile `(lambda (a)
+                          (declare (optimize speed (safety 0)))
+                          (typecase a
+                            (array (loop (print (car a))))))
+                       :allow-failure t
+                       :allow-warnings t)
+    (declare (ignore fun))
+    (assert failure-p)
+    (assert (= 1 (length warnings)))))
 
 ;;; Bug reported by Robert E. Brown sbcl-devel 2003-02-02: compiler
 ;;; failure
-(compile nil
-         '(lambda (key tree collect-path-p)
-           (let ((lessp (key-lessp tree))
-                 (equalp (key-equalp tree)))
-             (declare (type (function (t t) boolean) lessp equalp))
-             (let ((path '(nil)))
-               (loop for node = (root-node tree)
-                  then (if (funcall lessp key (node-key node))
-                           (left-child node)
-                           (right-child node))
-                  when (null node)
-                  do (return (values nil nil nil))
-                  do (when collect-path-p
-                       (push node path))
-                  (when (funcall equalp key (node-key node))
-                    (return (values node path t))))))))
+(with-test (:name (:compiler-bug declare type loop))
+  (checked-compile
+   `(lambda (key tree collect-path-p)
+      (let ((lessp (key-lessp tree))
+            (equalp (key-equalp tree)))
+        (declare (type (function (t t) boolean) lessp equalp))
+        (let ((path '(nil)))
+          (loop for node = (root-node tree)
+             then (if (funcall lessp key (node-key node))
+                      (left-child node)
+                      (right-child node))
+             when (null node)
+             do (return (values nil nil nil))
+             do (when collect-path-p
+                  (push node path))
+               (when (funcall equalp key (node-key node))
+                 (return (values node path t)))))))
+   :allow-style-warnings t))
 
 ;;; CONSTANTLY should return a side-effect-free function (bug caught
 ;;; by Paul Dietz' test suite)
@@ -414,15 +449,18 @@
     (assert (= i 1))))
 
 ;;; Bug 240 reported by tonyms on #lisp IRC 2003-02-25 (modified version)
-(loop for (fun warns-p) in
-     '(((lambda (&optional *x*) *x*) t)
-       ((lambda (&optional *x* &rest y) (values *x* y)) t)
-       ((lambda (&optional *print-length*) (values *print-length*)) nil)
-       ((lambda (&optional *print-length* &rest y) (values *print-length* y)) nil)
-       ((lambda (&optional *x*) (declare (special *x*)) (values *x*)) nil)
-       ((lambda (&optional *x* &rest y) (declare (special *x*)) (values *x* y)) nil))
-   for real-warns-p = (nth-value 1 (compile nil fun))
-   do (assert (eq warns-p real-warns-p)))
+(with-test (:name (:lambda-list &optional :earmuffs))
+  (loop for (form warns-p) in
+       '(((lambda (&optional *x*) *x*) t)
+         ((lambda (&optional *x* &rest y) (values *x* y)) t)
+         ((lambda (&optional *print-length*) (values *print-length*)) nil)
+         ((lambda (&optional *print-length* &rest y) (values *print-length* y)) nil)
+         ((lambda (&optional *x*) (declare (special *x*)) (values *x*)) nil)
+         ((lambda (&optional *x* &rest y) (declare (special *x*)) (values *x* y)) nil))
+     do (let ((style-warnings (nth-value
+                               3 (checked-compile
+                                  form :allow-style-warnings warns-p))))
+          (assert (= (if warns-p 1 0) (length style-warnings))))))
 
 ;;; Bug reported by Gilbert Baumann on #lisp IRC 2003-03-26
 (assert (equal (funcall (eval '(lambda (x &optional (y (pop x))) (list x y)))
@@ -456,40 +494,46 @@
              1))
 
 ;;; MACROLET should check for duplicated names
-(dolist (ll '((x (z x))
-              (x y &optional z x w)
-              (x y &optional z z)
-              (x &rest x)
-              (x &rest (y x))
-              (x &optional (y nil x))
-              (x &optional (y nil y))
-              (x &key x)
-              (x &key (y nil x))
-              (&key (y nil z) (z nil w))
-              (&whole x &optional x)
-              ;; Uh, this test is semi-bogus - it's trying to test that
-              ;; you can't repeat, but it's now actually testing that
-              ;; &WHOLE has to appear first, per the formal spec.
-              (&environment x &whole x)))
-  (assert (nth-value 2
-                     (handler-case
-                         (compile nil
-                                  `(lambda ()
-                                     (macrolet ((foo ,ll nil)
-                                                (bar (&environment env)
-                                                  `',(macro-function 'foo env)))
-                                       (bar))))
-                       ((or warning error) (c)
-                         (declare (ignore c))
-                         (values nil t t))))))
+(with-test (:name (macrolet :lambda-list :repeated-names))
+  (dolist (ll '((x (z x))
+                (x y &optional z x w)
+                (x y &optional z z)
+                (x &rest x)
+                (x &rest (y x))
+                (x &optional (y nil x))
+                (x &optional (y nil y)) ; TODO this case prints "caught ERROR: ..." but doesn't set failure-p
+                (x &key x)
+                (x &key (y nil x))
+                (&key (y nil z) (z nil w))
+                (&whole x &optional x)))
+    (let ((style-warnings (nth-value
+                           3 (checked-compile
+                              `(lambda ()
+                                 (macrolet ((foo ,ll nil)
+                                            (bar (&environment env)
+                                              `',(macro-function 'foo env)))
+                                   (bar)))
+                              :allow-style-warnings t))))
+      (assert style-warnings))))
+
+;; Uh, this test is semi-bogus - it's trying to test that you can't
+;; repeat, but it's now actually testing that &WHOLE has to appear
+;; first, per the formal spec.
+(with-test (:name (macrolet :lambda-list &whole :must-be-first))
+  (assert-error (checked-compile
+                 `(lambda ()
+                    (macrolet ((foo (&environment x &whole x) nil)
+                               (bar (&environment env)
+                                 `',(macro-function 'foo env)))
+                      (bar))))))
 
 (assert (typep (eval `(the arithmetic-error
                            ',(make-condition 'arithmetic-error)))
                'arithmetic-error))
 
-(assert (not (nth-value
-              2 (compile nil '(lambda ()
-                               (make-array nil :initial-element 11))))))
+(with-test (:name (compile make-array :dimensions nil))
+  (checked-compile `(lambda ()
+                      (make-array nil :initial-element 11))))
 
 (assert-error (funcall (eval #'open) "assertoid.lisp"
                        :external-format '#:nonsense))
@@ -506,74 +550,93 @@
   (assert-error (funcall f -1) type-error))
 
 ;;; the implicit block does not enclose lambda list
-(let ((forms '((defmacro #1=#:foo (&optional (x (return-from #1#))))
-               #+nil(macrolet ((#2=#:foo (&optional (x (return-from #2#))))))
-               (define-compiler-macro #3=#:foo (&optional (x (return-from #3#))))
-               (deftype #4=#:foo (&optional (x (return-from #4#))))
-               (define-setf-expander #5=#:foo (&optional (x (return-from #5#))))
-               (defsetf #6=#:foo (&optional (x (return-from #6#))) ()))))
-  (dolist (form forms)
-    (assert (nth-value 2 (compile nil `(lambda () ,form))))))
+(with-test (:name (compile :implicit block :does-not-enclose :lambda-list))
+  (let ((forms '((defmacro #1=#:foo (&optional (x (return-from #1#)))
+                   (declare (ignore x)))
+                 #+nil(macrolet ((#2=#:foo (&optional (x (return-from #2#))))))
+                 (define-compiler-macro #3=#:foo (&optional (x (return-from #3#)))
+                   (declare (ignore x)))
+                 (deftype #4=#:foo (&optional (x (return-from #4#)))
+                   (declare (ignore x)))
+                 (define-setf-expander #5=#:foo (&optional (x (return-from #5#)))
+                   (declare (ignore x)))
+                 (defsetf #6=#:foo (&optional (x (return-from #6#))) ()
+                   (declare (ignore x))))))
+    (dolist (form forms)
+      (assert (nth-value
+               1 (checked-compile `(lambda () ,form) :allow-failure t))))))
 
-(assert (nth-value 2 (compile nil
-                              '(lambda ()
-                                (svref (make-array '(8 9) :adjustable t) 1)))))
+(with-test (:name (compile make-array svref :derive-type))
+  (multiple-value-bind (fun failurep warnings)
+      (checked-compile `(lambda ()
+                          (svref (make-array '(8 9) :adjustable t) 1))
+                       :allow-warnings t)
+    (declare (ignore fun))
+    (assert failurep)
+    (assert (= 1 (length warnings)))))
 
 ;;; CHAR= did not check types of its arguments (reported by Adam Warner)
-(assert-error (funcall (compile nil '(lambda (x y z) (char= x y z)))
-                        #\a #\b nil)
-               type-error)
-(assert-error (funcall (compile nil
-                                 '(lambda (x y z)
-                                   (declare (optimize (speed 3) (safety 3)))
-                                   (char/= x y z)))
-                        nil #\a #\a)
-               type-error)
+(macrolet ((define-char=-test (function form)
+             `(with-test (:name (compile ,function :argument-type-check))
+                (assert-error (funcall (checked-compile ,form) #\a #\b nil)
+                              type-error))))
+  (define-char=-test char= `(lambda (x y z) (char= x y z)))
+  (define-char=-test char/= `(lambda (x y z)
+                               (declare (optimize (speed 3) (safety 3)))
+                               (char/= x y z))))
 
 ;;; Compiler lost return type of MAPCAR and friends
-(dolist (fun '(mapcar mapc maplist mapl))
-  (assert (nth-value 2 (compile nil
-                                `(lambda (x)
-                                   (1+ (,fun #'print x)))))))
+(with-test (:name (compile mapcar mapc maplist mapl
+                           :return-type :type-derivation))
+  (dolist (fun '(mapcar mapc maplist mapl))
+    (assert (= 1 (length (nth-value
+                          2 (checked-compile
+                             `(lambda (x)
+                                (1+ (,fun #'print x)))
+                             :allow-warnings t))))))
 
-(assert (nth-value 2 (compile nil
-                              '(lambda ()
-                                (declare (notinline mapcar))
-                                (1+ (mapcar #'print '(1 2 3)))))))
+  (assert (= 1 (length (nth-value
+                        2 (checked-compile
+                           `(lambda ()
+                              (declare (notinline mapcar))
+                              (1+ (mapcar #'print '(1 2 3))))
+                           :allow-warnings t))))))
 
 ;;; bug found by Paul Dietz: (SETF AREF) for bit vectors with constant
 ;;; index was effectless
-(let ((f (compile nil '(lambda (a v)
-                        (declare (type simple-bit-vector a) (type bit v))
-                        (declare (optimize (speed 3) (safety 0)))
-                        (setf (aref a 0) v)
-                        a))))
-  (let ((y (make-array 2 :element-type 'bit :initial-element 0)))
-    (assert (equal y #*00))
-    (funcall f y 1)
-    (assert (equal y #*10))))
+(with-test (:name (compile setf aref bit-vector))
+  (let ((f (checked-compile `(lambda (a v)
+                               (declare (type simple-bit-vector a) (type bit v))
+                               (declare (optimize (speed 3) (safety 0)))
+                               (setf (aref a 0) v)
+                               a))))
+    (let ((y (make-array 2 :element-type 'bit :initial-element 0)))
+      (assert (equal y #*00))
+      (funcall f y 1)
+      (assert (equal y #*10)))))
 
 ;;; use of declared array types
-(handler-bind ((sb-ext:compiler-note #'error))
-  (compile nil '(lambda (x)
-                 (declare (type (simple-array (simple-string 3) (5)) x)
-                          (optimize speed))
-                 (aref (aref x 0) 0))))
-
-(handler-bind ((sb-ext:compiler-note #'error))
-  (compile nil '(lambda (x)
-                 (declare (type (simple-array (simple-array bit (10)) (10)) x)
-                          (optimize speed))
-                 (1+ (aref (aref x 0) 0)))))
+(with-test (:name (compile declare array type :no sb-ext:compiler-note))
+  (dolist (form `((lambda (x)
+                    (declare (type (simple-array (simple-string 3) (5)) x)
+                             (optimize speed))
+                    (aref (aref x 0) 0))
+                  (lambda (x)
+                    (declare (type (simple-array (simple-array bit (10)) (10)) x)
+                             (optimize speed))
+                    (1+ (aref (aref x 0) 0)))))
+    (checked-compile form :allow-notes nil)))
 
 ;;; compiler failure
-(let ((f (compile nil '(lambda (x) (typep x '(not (member 0d0)))))))
-  (assert (funcall f 1d0)))
+(with-test (:name (compile typep not member))
+  (let ((f (checked-compile `(lambda (x) (typep x '(not (member 0d0)))))))
+    (assert (funcall f 1d0))))
 
-(compile nil '(lambda (x)
-               (declare (double-float x))
-               (let ((y (* x pi)))
-                 (atan y y))))
+(with-test (:name (compile double-float atan))
+  (checked-compile `(lambda (x)
+                      (declare (double-float x))
+                      (let ((y (* x pi)))
+                        (atan y y)))))
 
 ;;; bogus optimization of BIT-NOT
 (multiple-value-bind (result x)
@@ -585,53 +648,54 @@
   (assert (equal result #*0110)))
 
 ;;; the VECTOR type in CONCATENATE/MERGE/MAKE-SEQUENCE means (VECTOR T).
-(handler-bind ((sb-ext:compiler-note #'error))
-  (assert (equalp (funcall
-                   (compile
-                    nil
-                    '(lambda ()
-                      (let ((x (make-sequence 'vector 10 :initial-element 'a)))
-                        (setf (aref x 4) 'b)
-                        x))))
-                  #(a a a a b a a a a a))))
+(with-test (:name (compile vector make-sequence sb-ext:compiler-note))
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (let ((x (make-sequence 'vector 10 :initial-element 'a)))
+                   (setf (aref x 4) 'b)
+                   x))
+              :allow-notes t)))
+    (assert (equalp (funcall fun) #(a a a a b a a a a a)))))
 
 ;;; this is not a check for a bug, but rather a test of compiler
 ;;; quality
-(dolist (type '((integer 0 *)           ; upper bound
-                (real (-1) *)
-                float                   ; class
-                (real * (-10))          ; lower bound
-                ))
-  (assert (nth-value
-           1 (compile nil
-                      `(lambda (n)
-                         (declare (optimize (speed 3) (compilation-speed 0)))
-                         (loop for i from 1 to (the (integer -17 10) n) by 2
-                               collect (when (> (random 10) 5)
-                                         (the ,type (- i 11)))))))))
+(with-test (:name (compile integer :type-derivation))
+  (dolist (type '((integer 0 *)         ; upper bound
+                  (real (-1) *)
+                  float                 ; class
+                  (real * (-10))        ; lower bound
+                  ))
+    (assert (= 1 (length (nth-value
+                          2 (checked-compile
+                             `(lambda (n)
+                                (declare (optimize (speed 3) (compilation-speed 0)))
+                                (loop for i from 1 to (the (integer -17 10) n) by 2
+                                   collect (when (> (random 10) 5)
+                                             (the ,type (- i 11)))))
+                             :allow-warnings t)))))))
 
 ;;; bug 278b
 ;;;
 ;;; We suppose that INTEGER arithmetic cannot be efficient, and the
 ;;; compiler has an optimized VOP for +; so this code should cause an
 ;;; efficiency note.
-(assert (eq (block nil
-              (handler-case
-                  (compile nil '(lambda (i)
-                                 (declare (optimize speed))
-                                 (declare (type integer i))
-                                 (+ i 2)))
-                (sb-ext:compiler-note (c) (return :good))))
-            :good))
+(with-test (:name (compile integer + sb-ext:compiler-note :bug-278b))
+  (assert (= 1 (length (nth-value
+                        4 (checked-compile
+                           `(lambda (i)
+                              (declare (optimize speed))
+                              (declare (type integer i))
+                              (+ i 2))))))))
 
 ;;; bug 277: IGNORE/IGNORABLE declarations should be acceptable for
 ;;; symbol macros
-(assert (not (nth-value 1 (compile nil '(lambda (u v)
-                                         (symbol-macrolet ((x u)
-                                                           (y v))
-                                             (declare (ignore x)
-                                                      (ignorable y))
-                                           (list u v)))))))
+(with-test (:name (compile symbol-macrolet ignore ignorable :bug-277))
+  (checked-compile `(lambda (u v)
+                      (symbol-macrolet ((x u)
+                                        (y v))
+                        (declare (ignore x)
+                                 (ignorable y))
+                        (list u v)))))
 
 ;;; bug reported by Paul Dietz: wrong optimizer for (EXPT ... 0)
 (loop for (x type) in
@@ -677,37 +741,38 @@
 
 ;;; from PFD's torture test, triggering a bug in our effective address
 ;;; treatment.
-(compile
- nil
- `(lambda (a b)
-    (declare (type (integer 8 22337) b))
-    (logandc2
-     (logandc2
-      (* (logandc1 (max -29303 b) 4) b)
-      (abs (logorc1 (+ (logandc1 -11 b) 2607688420) -31153924)))
-     (logeqv (max a 0) b))))
+(with-test (:name (compile declare type logandc1 logandc2))
+  (checked-compile `(lambda (a b)
+                      (declare (type (integer 8 22337) b))
+                      (logandc2
+                       (logandc2
+                        (* (logandc1 (max -29303 b) 4) b)
+                        (abs (logorc1 (+ (logandc1 -11 b) 2607688420) -31153924)))
+                       (logeqv (max a 0) b)))))
 
 ;;; Alpha floating point modes weren't being reset after an exception,
 ;;; leading to an exception on the second compile, below.
-(compile nil '(lambda (x y) (declare (type (double-float 0.0d0) x y)) (/ x y)))
-(handler-case (/ 1.0 0.0)
-  ;; provoke an exception
-  (arithmetic-error ()))
-(compile nil '(lambda (x y) (declare (type (double-float 0.0d0) x y)) (/ x y)))
+(with-test (:name (compile :floating-point-mode))
+  (let ((form `(lambda (x y) (declare (type (double-float 0.0d0) x y)) (/ x y))))
+    (checked-compile form)
+    (handler-case (/ 1.0 0.0)
+      ;; provoke an exception
+      (arithmetic-error ()))
+    (checked-compile form)))
 
 ;;; bug reported by Paul Dietz: component last block does not have
 ;;; start ctran
-(compile nil
-         '(lambda ()
-           (declare (notinline + logand)
-            (optimize (speed 0)))
-           (LOGAND
-            (BLOCK B5
-              (FLET ((%F1 ()
-                       (RETURN-FROM B5 -220)))
-                (LET ((V7 (%F1)))
-                  (+ 359749 35728422))))
-            -24076)))
+(with-test (:name (compile block return-from))
+  (checked-compile `(lambda ()
+                      (declare (notinline + logand)
+                               (optimize (speed 0)))
+                      (logand
+                       (block b5
+                         (flet ((%f1 ()
+                                  (return-from b5 -220)))
+                           (let ((v7 (%f1)))
+                             (+ 359749 35728422))))
+                       -24076))))
 
 (with-test (:name :ansi-misc.293a)
   (assert (= (funcall
@@ -728,63 +793,67 @@
 
 (with-test (:name :ansi-misc.293d)
   (assert (= (funcall
-              (compile
-               nil
-               '(lambda ()
-                 (declare (optimize (debug 3) (safety 0) (space 2)
-                           (compilation-speed 2) (speed 2)))
-                 (block b4
-                   (multiple-value-prog1
-                       0
-                     (catch 'ct8
-                       (return-from b4 (catch 'ct2 (progn (tagbody) 0)))))))))
+              (checked-compile
+               `(lambda ()
+                  (declare (optimize (debug 3) (safety 0) (space 2)
+                                     (compilation-speed 2) (speed 2)))
+                  (block b4
+                    (multiple-value-prog1
+                        0
+                      (catch 'ct8
+                        (return-from b4 (catch 'ct2 (progn (tagbody) 0)))))))))
              0)))
 
 (with-test (:name :ansi-misc.618)
   (assert (= (funcall
-              (compile
-               nil
-               '(lambda (c)
-                 (declare (optimize (space 0) (compilation-speed 2) (debug 0)
-                           (speed 3) (safety 0)))
-                 (block b1
-                   (ignore-errors
-                    (multiple-value-prog1 0
-                      (apply (constantly 0)
-                             c
-                             (catch 'ct2 (return-from b1 0))
-                             nil))))))
+              (checked-compile
+               `(lambda (c)
+                  (declare (optimize (space 0) (compilation-speed 2) (debug 0)
+                                     (speed 3) (safety 0)))
+                  (block b1
+                    (ignore-errors
+                      (multiple-value-prog1 0
+                        (apply (constantly 0)
+                               c
+                               (catch 'ct2 (return-from b1 0))
+                               nil))))))
               -4951)
              0)))
 
 ;;; bug 294 reported by Paul Dietz: miscompilation of REM and MOD
-(assert (= (funcall (compile nil `(lambda (b)
-                                    (declare (optimize (speed 3))
-                                             (type (integer 2 152044363) b))
-                                    (rem b (min -16 0))))
-                    108251912)
-           8))
+(with-test (:name (compile rem :bug-294))
+  (assert (= (funcall (checked-compile
+                       `(lambda (b)
+                          (declare (optimize (speed 3))
+                                   (type (integer 2 152044363) b))
+                          (rem b (min -16 0))))
+                      108251912)
+             8)))
 
-(assert (= (funcall (compile nil `(lambda (c)
-                                    (declare (optimize (speed 3))
-                                             (type (integer 23062188 149459656) c))
-                                    (mod c (min -2 0))))
-                    95019853)
-           -1))
+(with-test (:name (compile mod :bug-294))
+  (assert (= (funcall (checked-compile
+                       `(lambda (c)
+                          (declare (optimize (speed 3))
+                                   (type (integer 23062188 149459656) c))
+                          (mod c (min -2 0))))
+                      95019853)
+             -1)))
 
 ;;; bug reported by Paul Dietz: block splitting inside FLUSH-DEAD-CODE
-(compile nil
-         '(LAMBDA (A B C)
-           (BLOCK B6
-             (LOGEQV (REM C -6758)
-                     (REM B (MAX 44 (RETURN-FROM B6 A)))))))
+(with-test (:name (compile logeqv rem :dead-code :block-splitting))
+  (checked-compile `(lambda (a b c)
+                      (block b6
+                        (logeqv (rem c -6758)
+                                (rem b (max 44 (return-from b6 a))))))))
 
-(compile nil '(lambda ()
-               (block nil
-                 (flet ((foo (x y) (if (> x y) (print x) (print y))))
-                   (foo 1 2)
-                   (bar)
-                   (foo (return 14) 2)))))
+(with-test (:name (compile block flet :dead-code :block-splitting))
+  (checked-compile `(lambda ()
+                      (block nil
+                        (flet ((foo (x y) (if (> x y) (print x) (print y))))
+                          (foo 1 2)
+                          (bar)
+                          (foo (return 14) 2))))
+                   :allow-style-warnings t))
 
 ;;; bug in Alpha backend: not enough sanity checking of arguments to
 ;;; instructions
@@ -797,35 +866,40 @@
 
 ;;; bug found by WHN and pfdietz: compiler failure while referencing
 ;;; an entry point inside a deleted lambda
-(compile nil '(lambda ()
-               (let (r3533)
-                 (flet ((bbfn ()
-                          (setf r3533
-                                (progn
-                                  (flet ((truly (fn bbd)
-                                           (let (r3534)
-                                             (let ((p3537 nil))
-                                               (unwind-protect
-                                                    (multiple-value-prog1
-                                                        (progn
-                                                          (setf r3534
-                                                                (progn
-                                                                  (bubf bbd t)
-                                                                  (flet ((c-3536 ()
-                                                                           (funcall fn)))
-                                                                    (cdec #'c-3536
-                                                                          (vector bbd))))))
-                                                      (setf p3537 t))
-                                                 (unless p3537
-                                                   (error "j"))))
-                                             r3534))
-                                         (c (pd) (pdc pd)))
-                                    (let ((a (smock a))
-                                          (b (smock b))
-                                          (b (smock c)))))))))
-                   (wum #'bbfn "hc3" (list)))
-                 r3533)))
-(compile nil '(lambda () (flet ((%f () (unwind-protect nil))) nil)))
+(with-test (:name (compile :reference-entry-point-in-deleted lambda))
+  (checked-compile
+   `(lambda ()
+      (let (r3533)
+        (flet ((bbfn ()
+                 (setf r3533
+                       (progn
+                         (flet ((truly (fn bbd)
+                                  (let (r3534)
+                                    (let ((p3537 nil))
+                                      (unwind-protect
+                                           (multiple-value-prog1
+                                               (progn
+                                                 (setf r3534
+                                                       (progn
+                                                         (bubf bbd t)
+                                                         (flet ((c-3536 ()
+                                                                  (funcall fn)))
+                                                           (cdec #'c-3536
+                                                                 (vector bbd))))))
+                                             (setf p3537 t))
+                                        (unless p3537
+                                          (error "j"))))
+                                    r3534))
+                                (c (pd) (pdc pd)))
+                           (let ((a (smock a))
+                                 (b (smock b))
+                                 (b (smock c)))))))))
+          (wum #'bbfn "hc3" (list)))
+        r3533))
+   :allow-failure t :allow-style-warnings t))
+
+(with-test (:name (compile flet unwind-protect :dead-code))
+  (checked-compile `(lambda () (flet ((%f () (unwind-protect nil))) nil))))
 
 ;;; the strength reduction of constant multiplication used (before
 ;;; sbcl-0.8.4.x) to lie to the compiler.  This meant that, under
@@ -1931,14 +2005,16 @@
 
 ;;; reported by Lutz Euler: we shouldn't signal a compiler note for
 ;;; simple-bit-vector functions.
-(handler-bind ((sb-ext:compiler-note #'error))
-  (compile nil '(lambda (x)
-                 (declare (type simple-bit-vector x))
-                 (count 1 x))))
-(handler-bind ((sb-ext:compiler-note #'error))
-  (compile nil '(lambda (x y)
-                 (declare (type simple-bit-vector x y))
-                 (equal x y))))
+(with-test (:name (:simple-bit-vector :count :should-not-compiler-note))
+  (handler-bind ((sb-ext:compiler-note (lambda (c) (error "~A" c))))
+    (compile nil '(lambda (x)
+                   (declare (type simple-bit-vector x))
+                   (count 1 x)))))
+(with-test (:name (:simple-bit-vector :equal :should-not-compiler-note))
+  (handler-bind ((sb-ext:compiler-note (lambda (c) (error "~A" c))))
+    (compile nil '(lambda (x y)
+                   (declare (type simple-bit-vector x y))
+                   (equal x y)))))
 
 ;;; MISC.550: CAST merging in IR1 finalization caused unexpected
 ;;; code transformations.
@@ -1981,38 +2057,39 @@
 ;;; machine's ASH instruction's immediate field) that the compiler
 ;;; thought was legitimate.
 (with-test (:name :overlarge-immediate-in-ash-vop)
-  (compile 'nil
-           '(LAMBDA (B)
-             (DECLARE (TYPE (INTEGER -2 14) B))
-             (DECLARE (IGNORABLE B))
-             (ASH (IMAGPART B) 57))))
+  (checked-compile `(lambda (b)
+                      (declare (type (integer -2 14) b))
+                      (declare (ignorable b))
+                      (ash (imagpart b) 57))))
 
 ;;; bug reported by Eduardo Mu\~noz
-(multiple-value-bind (fun warnings failure)
-    (compile nil '(lambda (struct first)
-                   (declare (optimize speed))
-                   (let* ((nodes (nodes struct))
-                          (bars (bars struct))
-                          (length (length nodes))
-                          (new (make-array length :fill-pointer 0)))
-                     (vector-push first new)
-                     (loop with i fixnum = 0
-                           for newl fixnum = (length new)
-                           while (< newl length) do
-                           (let ((oldl (length new)))
-                             (loop for j fixnum from i below newl do
-                                   (dolist (n (node-neighbours (aref new j) bars))
-                                     (unless (find n new)
-                                       (vector-push n new))))
-                             (setq i oldl)))
-                     new)))
-  (declare (ignore fun warnings failure))
-  (assert (not failure)))
+(with-test (:name (compile vector loop))
+  (checked-compile
+   `(lambda (struct first)
+      (declare (optimize speed))
+      (let* ((nodes (nodes struct))
+             (bars (bars struct))
+             (length (length nodes))
+             (new (make-array length :fill-pointer 0)))
+        (vector-push first new)
+        (loop with i fixnum = 0
+           for newl fixnum = (length new)
+           while (< newl length) do
+             (let ((oldl (length new)))
+               (loop for j fixnum from i below newl do
+                    (dolist (n (node-neighbours (aref new j) bars))
+                      (unless (find n new)
+                        (vector-push n new))))
+               (setq i oldl)))
+        new))
+   :allow-style-warnings t))
 
 ;;; bug #389: "0.0 can't be converted to type NIL."  (Brian Rowe
 ;;; sbcl-devel)
-(compile nil '(lambda (x y a b c)
-               (- y (* (signum x) (sqrt (abs (- (* b x) c)))))))
+(with-test (:name (compile float :bug-389))
+  (checked-compile `(lambda (x y a b c)
+                      (- y (* (signum x) (sqrt (abs (- (* b x) c))))))
+                   :allow-style-warnings t))
 
 ;;; Type inference from CHECK-TYPE
 (let ((count0 0) (count1 0))
@@ -2094,168 +2171,164 @@
               -829253)))
 
 ;; MISC.628: constant-folding %LOGBITP was buggy
-(assert (eql t
-             (funcall
-              (compile
-               nil
-               '(lambda ()
-                  (declare (optimize (safety 3) (space 3) (compilation-speed 3)
-                                     (speed 0) (debug 1)))
-                  (not (not (logbitp 0 (floor 2147483651 (min -23 0))))))))))
+(with-test (:name (compile logbitp :constant-folding))
+  (assert (eql t
+               (funcall
+                (checked-compile
+                 `(lambda ()
+                    (declare (optimize (safety 3) (space 3) (compilation-speed 3)
+                                       (speed 0) (debug 1)))
+                    (not (not (logbitp 0 (floor 2147483651 (min -23 0)))))))))))
 
 ;; mistyping found by random-tester
-(assert (zerop
-  (funcall
-   (compile
-    nil
-    '(lambda ()
-      (declare (optimize (speed 1) (debug 0)
-                (space 2) (safety 0) (compilation-speed 0)))
-      (unwind-protect 0
-        (* (/ (multiple-value-prog1 -29457482 -5602513511) 1))))))))
+(with-test (:name (compile :type-derivation))
+  (assert (zerop
+           (funcall
+            (checked-compile
+             `(lambda ()
+                (declare (optimize (speed 1) (debug 0)
+                                   (space 2) (safety 0) (compilation-speed 0)))
+                (unwind-protect 0
+                  (* (/ (multiple-value-prog1 -29457482 -5602513511) 1)))))))))
 
 ;; aggressive constant folding (bug #400)
-(assert
- (eq t (funcall (compile nil '(lambda () (or t (the integer (/ 1 0))))))))
+(with-test (:name (compile :aggressive-constant-folding :bug-400))
+  (assert
+   (eq t (funcall (checked-compile `(lambda () (or t (the integer (/ 1 0)))))))))
 
 (with-test (:name (:compiler :constraint-propagation :var-eql-to-non-var-1))
-  (assert
-   (handler-case
-       (compile nil '(lambda (x y)
-                       (when (eql x (length y))
-                         (locally
-                             (declare (optimize (speed 3)))
-                           (1+ x)))))
-     (compiler-note () (error "The code is not optimized.")))))
+  (checked-compile `(lambda (x y)
+                      (when (eql x (length y))
+                        (locally
+                            (declare (optimize (speed 3)))
+                          (1+ x))))
+                   :allow-notes '(not compiler-note)))
 
 (with-test (:name (:compiler :constraint-propagation :var-eql-to-non-var-2))
-  (assert
-   (handler-case
-       (compile nil '(lambda (x y)
-                       (when (eql (length y) x)
-                         (locally
-                             (declare (optimize (speed 3)))
-                           (1+ x)))))
-     (compiler-note () (error "The code is not optimized.")))))
+  (checked-compile `(lambda (x y)
+                      (when (eql (length y) x)
+                        (locally
+                            (declare (optimize (speed 3)))
+                          (1+ x))))
+                   :allow-notes '(not compiler-note)))
 
 (with-test (:name (:compiler :constraint-propagation :float-bounds-1))
-  (handler-case
-      (compile nil '(lambda (x)
+  (checked-compile `(lambda (x)
                       (declare (type (single-float * (3.0)) x))
                       (when (<= x 2.0)
                         (when (<= 2.0 x)
-                          x))))
-    (compiler-note () (error "Deleted reachable code."))))
+                          x)))
+                   :allow-notes '(not compiler-note)))
 
 (defun assert-code-deletion-note (lambda &optional (howmany 1))
-  (let ((n 0))
-    (handler-bind ((code-deletion-note
-                    (lambda (c)
-                      (incf n)
-                      ;; even though notes are not warnings,
-                      ;; compiler-notify provides the MUFFLE-WARNING restart.
-                      (muffle-warning c))))
-      (compile nil lambda)
-      (assert (eql n howmany)))))
+  (let ((notes (nth-value
+                4 (checked-compile lambda :allow-notes 'code-deletion-note))))
+    (assert (= howmany (length notes)))))
 
 (with-test (:name (:compiler :constraint-propagation :float-bounds-2))
   (assert-code-deletion-note
-                     '(lambda (x)
-                        (declare (type single-float x))
-                        (when (< 1.0 x)
-                          (when (<= x 1.0)
-                            (error "This is unreachable."))))))
+   `(lambda (x)
+      (declare (type single-float x))
+      (when (< 1.0 x)
+        (when (<= x 1.0)
+          (error "This is unreachable."))))))
 
 (with-test (:name (:compiler :constraint-propagation :float-bounds-3
-                   :LP-894498))
+                             :LP-894498))
   (assert-code-deletion-note
-                     '(lambda (x)
-                        (declare (type (single-float 0.0) x))
-                        (when (> x 0.0)
-                          (when (zerop x)
-                            (error "This is unreachable."))))))
+   `(lambda (x)
+      (declare (type (single-float 0.0) x))
+      (when (> x 0.0)
+        (when (zerop x)
+          (error "This is unreachable."))))))
 
 (with-test (:name (:compiler :constraint-propagation :float-bounds-4
-                   :LP-894498))
+                             :LP-894498))
   (assert-code-deletion-note
-                     '(lambda (x y)
-                        (declare (type (single-float 0.0) x)
-                                 (type (single-float (0.0)) y))
-                        (when (> x y)
-                          (when (zerop x)
-                            (error "This is unreachable."))))))
+   `(lambda (x y)
+      (declare (type (single-float 0.0) x)
+               (type (single-float (0.0)) y))
+      (when (> x y)
+        (when (zerop x)
+          (error "This is unreachable."))))))
 
 (with-test (:name (:compiler :constraint-propagation :var-eql-to-var-1))
   (assert-code-deletion-note
-                     '(lambda (x y)
-                        (when (typep y 'fixnum)
-                          (when (eql x y)
-                            (unless (typep x 'fixnum)
-                              (error "This is unreachable"))
-                            (setq y nil))))))
+   `(lambda (x y)
+      (when (typep y 'fixnum)
+        (when (eql x y)
+          (unless (typep x 'fixnum)
+            (error "This is unreachable"))
+          (setq y nil))))))
 
 (with-test (:name (:compiler :constraint-propagation :var-eql-to-var-2))
   (assert-code-deletion-note
-                     '(lambda (x y)
-                        (when (typep y 'fixnum)
-                          (when (eql y x)
-                            (unless (typep x 'fixnum)
-                              (error "This is unreachable"))
-                            (setq y nil))))))
+   `(lambda (x y)
+      (when (typep y 'fixnum)
+        (when (eql y x)
+          (unless (typep x 'fixnum)
+            (error "This is unreachable"))
+          (setq y nil))))))
 
 ;; Reported by John Wiseman, sbcl-devel
 ;; Subject: [Sbcl-devel] float type derivation bug?
 ;; Date: Tue, 4 Apr 2006 15:28:15 -0700
-(with-test (:name (:type-derivation :float-bounds))
-  (compile nil '(lambda (bits)
-                 (let* ((s (if (= (ash bits -31) 0) 1 -1))
-                        (e (logand (ash bits -23) #xff))
-                        (m (if (= e 0)
-                               (ash (logand bits #x7fffff) 1)
-                               (logior (logand bits #x7fffff) #x800000))))
-                   (float (* s m (expt 2 (- e 150))))))))
+(with-test (:name (compile :type-derivation :float-bounds))
+  (checked-compile
+   `(lambda (bits)
+      (let* ((s (if (= (ash bits -31) 0) 1 -1))
+             (e (logand (ash bits -23) #xff))
+             (m (if (= e 0)
+                    (ash (logand bits #x7fffff) 1)
+                    (logior (logand bits #x7fffff) #x800000))))
+        (float (* s m (expt 2 (- e 150))))))))
 
 ;; Reported by James Knight
 ;; Subject: [Sbcl-devel] AVER: "(EQ (SB-NAME (SC-SB (TN-SC TN))) 'REGISTERS)"
 ;; Date: Fri, 24 Mar 2006 19:30:00 -0500
-(with-test (:name :logbitp-vop)
-  (compile nil
-           '(lambda (days shift)
-             (declare (type fixnum shift days))
-             (let* ((result 0)
-                    (canonicalized-shift (+ shift 1))
-                    (first-wrapping-day (- 1 canonicalized-shift)))
-               (declare (type fixnum result))
-               (dotimes (source-day 7)
-                 (declare (type (integer 0 6) source-day))
-                 (when (logbitp source-day days)
-                   (setf result
-                         (logior result
-                                 (the fixnum
-                                   (if (< source-day first-wrapping-day)
-                                       (+ source-day canonicalized-shift)
-                                       (- (+ source-day
-                                             canonicalized-shift) 7)))))))
-               result))))
+(with-test (:name (compile logbitp :vop))
+  (checked-compile
+   `(lambda (days shift)
+      (declare (type fixnum shift days))
+      (let* ((result 0)
+             (canonicalized-shift (+ shift 1))
+             (first-wrapping-day (- 1 canonicalized-shift)))
+        (declare (type fixnum result))
+        (dotimes (source-day 7)
+          (declare (type (integer 0 6) source-day))
+          (when (logbitp source-day days)
+            (setf result
+                  (logior result
+                          (the fixnum
+                               (if (< source-day first-wrapping-day)
+                                   (+ source-day canonicalized-shift)
+                                   (- (+ source-day
+                                         canonicalized-shift)
+                                      7)))))))
+        result))))
 
 ;;; MISC.637: incorrect delaying of conversion of optional entries
 ;;; with hairy constant defaults
-(let ((f '(lambda ()
-  (labels ((%f11 (f11-2 &key key1)
-             (labels ((%f8 (f8-2 &optional (f8-5 (if nil (return-from %f11 0) 0)))
-                        :bad1))
-               (%f8 (%f8 0)))
-             :bad2))
-    :good))))
-  (assert (eq (funcall (compile nil f)) :good)))
+(with-test (:name (compile :optional-entry :hairy-defaults :misc.637))
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (labels ((%f11 (f11-2 &key key1)
+                            (labels ((%f8 (f8-2 &optional (f8-5 (if nil (return-from %f11 0) 0)))
+                                       :bad1))
+                              (%f8 (%f8 0)))
+                            :bad2))
+                   :good)))))
+    (assert (eq (funcall fun) :good))))
 
 ;;; MISC.555: new reference to an already-optimized local function
-(let* ((l '(lambda (p1)
-    (declare (optimize (speed 1) (safety 2) (debug 2) (space 0)) (type keyword p1))
-    (keywordp p1)))
-       (f (compile nil l)))
-  (assert (funcall f :good))
-  (assert (nth-value 1 (ignore-errors (funcall f 42)))))
+(with-test (:name (compile :already-optimized :local-function :misc.555))
+  (let ((fun (checked-compile
+              `(lambda (p1)
+                 (declare (optimize (speed 1) (safety 2) (debug 2) (space 0))
+                          (type keyword p1))
+                 (keywordp p1)))))
+    (assert (funcall fun :good))
+    (assert-error (funcall fun 42) type-error)))
 
 ;;; Check that the compiler doesn't munge *RANDOM-STATE*.
 (let* ((state (make-random-state))
@@ -2271,27 +2344,31 @@
   (assert (= a (random most-positive-fixnum))))
 
 ;;; MISC.641: LET-conversion after physical environment analysis lost NLX-INFOs
-(let ((form '(lambda ()
-              (declare (optimize (speed 1) (space 0) (debug 2)
-                           (compilation-speed 0) (safety 1)))
-              (flet ((%f3 (f3-1 &key (key1 (count (floor 0 (min -74 0)) #())))
+(with-test (:name (compile let :conversion :lost :nlx-infos :misc.641))
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (declare (optimize (speed 1) (space 0) (debug 2)
+                                    (compilation-speed 0) (safety 1)))
+                 (flet ((%f3 (f3-1 &key (key1 (count (floor 0 (min -74 0)) #())))
                           0))
-                   (apply #'%f3 0 nil)))))
-  (assert (zerop (funcall (compile nil form)))))
+                   (apply #'%f3 0 nil)))
+              :allow-style-warnings t)))
+    (assert (zerop (funcall fun)))))
 
 ;;;  size mismatch: #<SB-VM::EA :DWORD base=#<SB-C:TN t1[RDX]> disp=1> is a :DWORD and #<SB-C:TN t2[RAX]> is a :QWORD. on x86-64
-(compile nil '(lambda ()
-               (let ((x (make-array '(1) :element-type '(signed-byte 32))))
-                 (setf (aref x 0) 1))))
+(with-test (:name (compile make-array aref :size-mismatch))
+  (checked-compile `(lambda ()
+                      (let ((x (make-array '(1) :element-type '(signed-byte 32))))
+                        (setf (aref x 0) 1)))))
 
 ;;; step instrumentation confusing the compiler, reported by Faré
-(handler-bind ((warning #'error))
-  (compile nil '(lambda ()
-                 (declare (optimize (debug 2))) ; not debug 3!
-                 (let ((val "foobar"))
-                   (map-into (make-array (list (length val))
-                                         :element-type '(unsigned-byte 8))
-                             #'char-code val)))))
+(with-test (:name (compile step))
+  (checked-compile `(lambda ()
+                      (declare (optimize (debug 2))) ; not debug 3!
+                      (let ((val "foobar"))
+                        (map-into (make-array (list (length val))
+                                              :element-type '(unsigned-byte 8))
+                                  #'char-code val)))))
 
 ;;; overconfident primitive type computation leading to bogus type
 ;;; checking.
@@ -2814,9 +2891,9 @@
               t)))
 
 (with-test (:name :regression-1.0.24.37)
-  (compile nil '(lambda (&key (test (constantly t)))
-                 (when (funcall test)
-                   :quux))))
+  (checked-compile `(lambda (&key (test (constantly t)))
+                      (when (funcall test)
+                        :quux))))
 
 ;;; Attempt to test a decent cross section of conditions
 ;;; and values types to move conditionally.
@@ -2854,7 +2931,7 @@
                                             `(,a ,b)))
                   collect
                   `(progn
-                     (eql (funcall (compile nil ',lambda)
+                     (eql (funcall (checked-compile ',lambda)
                                    ,@args)
                           (eval '(,lambda ,@args))))))))
   (sb-vm::with-float-traps-masked
@@ -2957,19 +3034,19 @@
       (test-comparison >   double-float 0d0 (/ 0d0 0d0)))))
 
 (with-test (:name :car-and-cdr-type-derivation-conservative)
-  (let ((f1 (compile nil
-                     `(lambda (y)
-                        (declare (optimize speed))
-                        (let ((x (the (cons fixnum fixnum) (cons 1 2))))
-                          (declare (type (cons t fixnum) x))
-                          (rplaca x y)
-                          (+ (car x) (cdr x))))))
-        (f2 (compile nil
-                     `(lambda (y)
-                        (declare (optimize speed))
-                        (let ((x (the (cons fixnum fixnum) (cons 1 2))))
-                          (setf (cdr x) y)
-                          (+ (car x) (cdr x)))))))
+  (let ((f1 (checked-compile
+             `(lambda (y)
+                (declare (optimize speed))
+                (let ((x (the (cons fixnum fixnum) (cons 1 2))))
+                  (declare (type (cons t fixnum) x))
+                  (rplaca x y)
+                  (+ (car x) (cdr x))))))
+        (f2 (checked-compile
+             `(lambda (y)
+                (declare (optimize speed))
+                (let ((x (the (cons fixnum fixnum) (cons 1 2))))
+                  (setf (cdr x) y)
+                  (+ (car x) (cdr x)))))))
     (flet ((test-error (e value)
              (assert (typep e 'type-error))
              (assert (eq 'number (type-error-expected-type e)))
@@ -2984,40 +3061,40 @@
           (test-error err v2))))))
 
 (with-test (:name :array-dimension-derivation-conservative)
-  (let ((f (compile nil
-                    `(lambda (x)
-                       (declare (optimize speed))
-                       (declare (type (array * (4 4)) x))
-                       (let ((y x))
-                         (setq x (make-array '(4 4)))
-                         (adjust-array y '(3 5))
-                         (array-dimension y 0))))))
+  (let ((f (checked-compile `(lambda (x)
+                               (declare (optimize speed))
+                               (declare (type (array * (4 4)) x))
+                               (let ((y x))
+                                 (setq x (make-array '(4 4)))
+                                 (adjust-array y '(3 5))
+                                 (array-dimension y 0))))))
     (assert (= 3 (funcall f (make-array '(4 4) :adjustable t))))))
 
 (with-test (:name :with-timeout-code-deletion-note)
-  (handler-bind ((sb-ext:code-deletion-note #'error))
-    (compile nil `(lambda ()
-                    (sb-ext:with-timeout 0
-                      (sleep 1))))))
+  (checked-compile `(lambda ()
+                      (sb-ext:with-timeout 0
+                        (sleep 1)))
+                   :allow-notes nil))
 
 (with-test (:name :full-warning-for-undefined-type-in-cl)
-  (assert (eq :full
-              (handler-case
-                  (compile nil `(lambda (x) (the replace x)))
-                (style-warning ()
-                  :style)
-                (warning ()
-                  :full)))))
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile `(lambda (x) (the replace x)) :allow-warnings t)
+    (declare (ignore fun failure-p))
+    (assert (= 1 (length warnings)))))
 
 (with-test (:name :single-warning-for-single-undefined-type)
-  (let ((n 0))
-    (handler-bind ((warning (lambda (c)
-                              (declare (ignore c))
-                              (incf n))))
-      (compile nil `(lambda (x) (the #:no-type x)))
-      (assert (= 1 n))
-      (compile nil `(lambda (x) (the 'fixnum x)))
-      (assert (= 2 n)))))
+  ;; STYLE-WARNING for symbol not in cl package.
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile `(lambda (x) (the #:no-type x))
+                       :allow-style-warnings t)
+    (declare (ignore fun failure-p warnings))
+    (assert (= 1 (length style-warnings))))
+
+  ;; Full WARNING for invalid type specifier starting with QUOTE.
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile `(lambda (x) (the 'fixnum x)) :allow-warnings t)
+    (declare (ignore fun failure-p))
+    (assert (= 1 (length warnings)))))
 
 (with-test (:name :complex-subtype-dumping-in-xc)
   (assert
@@ -3047,46 +3124,39 @@
     (assert (not (funcall fun (make-array '(2 2)))))))
 
 (with-test (:name :no-silly-compiler-notes-from-character-function)
-  (let (current)
-    (handler-bind ((compiler-note (lambda (e) (error "~S: ~A" current e))))
-      (dolist (name '(char-code char-int character char-name standard-char-p
-                      graphic-char-p alpha-char-p upper-case-p lower-case-p
-                      both-case-p digit-char-p alphanumericp digit-char-p))
-        (setf current name)
-        (compile nil `(lambda (x)
-                        (declare (character x) (optimize speed))
-                        (,name x))))
-      (dolist (name '(char= char/= char< char> char<= char>=
-                      char-lessp char-greaterp char-not-greaterp
-                      char-not-lessp))
-        (setf current name)
-        (compile nil `(lambda (x y)
+  (dolist (name '(char-code char-int character char-name standard-char-p
+                  graphic-char-p alpha-char-p upper-case-p lower-case-p
+                  both-case-p digit-char-p alphanumericp digit-char-p))
+    (checked-compile `(lambda (x)
+                        (declare (character x) (optimize (speed 3)))
+                        (,name x))
+                     :allow-notes nil))
+  (dolist (name '(char= char/= char< char> char<= char>=
+                  char-lessp char-greaterp char-not-greaterp
+                  char-not-lessp))
+    (checked-compile `(lambda (x y)
                         (declare (character x y) (optimize speed))
-                        (,name x y)))))))
+                        (,name x y))
+                     :allow-notes nil)))
 
 ;;; optimizing make-array
 (with-test (:name (make-array :open-code-initial-contents))
-  (assert (not (ctu:find-named-callees
-                (compile nil
-                         `(lambda (x y z)
-                            (make-array '(3) :initial-contents (list x y z)))))))
-  (assert (not (ctu:find-named-callees
-                (compile nil
-                         `(lambda (x y z)
-                            (make-array '3 :initial-contents (vector x y z)))))))
-  (assert (not (ctu:find-named-callees
-                (compile nil
-                         `(lambda (x y z)
-                            (make-array '3 :initial-contents `(,x ,y ,z))))))))
+  (flet ((test (form)
+           (assert (not (ctu:find-named-callees
+                         (checked-compile form))))))
+    (test `(lambda (x y z)
+             (make-array '(3) :initial-contents (list x y z))))
+    (test `(lambda (x y z)
+             (make-array '3 :initial-contents (vector x y z))))
+    (test `(lambda (x y z)
+             (make-array '3 :initial-contents `(,x ,y ,z))))))
 
 ;;; optimizing array-in-bounds-p
 (with-test (:name :optimize-array-in-bounds-p)
   (locally
     (macrolet ((find-callees (&body body)
                  `(ctu:find-named-callees
-                    (compile nil
-                             '(lambda ()
-                                ,@body))
+                    (checked-compile '(lambda () ,@body))
                     :name 'array-in-bounds-p))
                (must-optimize (&body exprs)
                  `(progn
@@ -3154,7 +3224,7 @@
 ;;; optimizing (EXPT -1 INTEGER)
 (with-test (:name (expt -1 integer))
   (dolist (x '(-1 -1.0 -1.0d0))
-    (let ((fun (compile nil `(lambda (x) (expt ,x (the fixnum x))))))
+    (let ((fun (checked-compile `(lambda (x) (expt ,x (the fixnum x))))))
       (assert (not (ctu:find-named-callees fun)))
       (dotimes (i 12)
         (if (oddp i)
@@ -3163,7 +3233,7 @@
 
 (with-test (:name :float-division-using-exact-reciprocal)
   (flet ((test (lambda-form arg res &key (check-insts t))
-           (let* ((fun (compile nil lambda-form))
+           (let* ((fun (checked-compile lambda-form))
                   (disassembly (with-output-to-string (s)
                                   (disassemble fun :stream s))))
              ;; Let's make sure there is no division at runtime: for x86 and
@@ -3202,10 +3272,11 @@
 
 (with-test (:name :float-multiplication-by-one)
   (flet ((test (lambda-form arg &optional (result arg))
-           (let* ((fun1 (compile nil lambda-form))
-                  (fun2 (funcall (compile nil `(lambda ()
-                                                 (declare (optimize (sb-c::float-accuracy 0)))
-                                                 ,lambda-form))))
+           (let* ((fun1 (checked-compile lambda-form))
+                  (fun2 (funcall (checked-compile
+                                  `(lambda ()
+                                     (declare (optimize (sb-c::float-accuracy 0)))
+                                     ,lambda-form))))
                   (disassembly1 (with-output-to-string (s)
                                   (disassemble fun1 :stream s)))
                   (disassembly2 (with-output-to-string (s)
@@ -3231,10 +3302,11 @@
 
 (with-test (:name :float-addition-of-zero)
   (flet ((test (lambda-form arg &optional (result arg))
-           (let* ((fun1 (compile nil lambda-form))
-                  (fun2 (funcall (compile nil `(lambda ()
-                                                 (declare (optimize (sb-c::float-accuracy 0)))
-                                                 ,lambda-form))))
+           (let* ((fun1 (checked-compile lambda-form))
+                  (fun2 (funcall (checked-compile
+                                  `(lambda ()
+                                     (declare (optimize (sb-c::float-accuracy 0)))
+                                     ,lambda-form))))
                   (disassembly1 (with-output-to-string (s)
                                   (disassemble fun1 :stream s)))
                   (disassembly2 (with-output-to-string (s)
@@ -3321,23 +3393,23 @@
 
 (with-test (:name :bug-392203)
   ;; Used to hit an AVER in COMVERT-MV-CALL.
-  (assert (zerop
-           (funcall
-            (compile nil
-                     `(lambda ()
-                        (flet ((k (&rest x) (declare (ignore x)) 0))
-                          (multiple-value-call #'k #'k))))))))
+  (assert (zerop (funcall
+                  (checked-compile
+                   `(lambda ()
+                      (flet ((k (&rest x) (declare (ignore x)) 0))
+                        (multiple-value-call #'k #'k))))))))
 
 (with-test (:name :allocate-closures-failing-aver)
-  (let ((f (compile nil `(lambda ()
-                           (labels ((k (&optional x) #'k)))))))
+  (let ((f (checked-compile `(lambda ()
+                               (labels ((k (&optional x) #'k))))
+                            :allow-style-warnings t)))
     (assert (null (funcall f)))))
 
 (with-test (:name :flush-vector-creation :skipped-on :interpreter)
-  (let ((f (compile nil `(lambda ()
-                           (dotimes (i 1024)
-                             (vector i i i))
-                           t))))
+  (let ((f (checked-compile `(lambda ()
+                               (dotimes (i 1024)
+                                 (vector i i i))
+                               t))))
     (ctu:assert-no-consing (funcall f))))
 
 (with-test (:name :array-type-predicates)
@@ -3360,29 +3432,31 @@
                      sb-kernel::*specialized-array-element-types*))
     (when et
       (let* ((v (make-array 3 :element-type et))
-             (fun (compile nil `(lambda ()
-                                  (list
-                                   (if (typep ,v '(simple-array ,et (*)))
-                                       :good
-                                       :bad)
-                                   (if (typep (elt ,v 0) '(simple-array ,et (*)))
-                                       :bad
-                                       :good))))))
+             (fun (checked-compile
+                   `(lambda ()
+                      (list (if (typep ,v '(simple-array ,et (*)))
+                                :good
+                                :bad)
+                            (if (typep (elt ,v 0) '(simple-array ,et (*)))
+                                :bad
+                                :good))))))
         (assert (equal '(:good :good) (funcall fun)))))))
 
 (with-test (:name :truncate-float)
-  (let ((s (compile nil `(lambda (x)
-                           (declare (single-float x))
-                           (truncate x))))
-        (d (compile nil `(lambda (x)
-                           (declare (double-float x))
-                           (truncate x))))
-        (s-inlined (compile nil '(lambda (x)
-                                  (declare (type (single-float 0.0s0 1.0s0) x))
-                                  (truncate x))))
-        (d-inlined (compile nil '(lambda (x)
-                                  (declare (type (double-float 0.0d0 1.0d0) x))
-                                  (truncate x)))))
+  (let ((s (checked-compile `(lambda (x)
+                               (declare (single-float x))
+                               (truncate x))))
+        (d (checked-compile `(lambda (x)
+                               (declare (double-float x))
+                               (truncate x))))
+        (s-inlined (checked-compile
+                    `(lambda (x)
+                       (declare (type (single-float 0.0s0 1.0s0) x))
+                       (truncate x))))
+        (d-inlined (checked-compile
+                    `(lambda (x)
+                       (declare (type (double-float 0.0d0 1.0d0) x))
+                       (truncate x)))))
     ;; Check that there is no generic arithmetic
     (assert (not (search "GENERIC"
                          (with-output-to-string (out)
@@ -3398,19 +3472,19 @@
                          (with-output-to-string (out)
                            (disassemble d-inlined :stream out)))))))
 
-(with-test (:name :make-array-unnamed-dimension-leaf)
-  (let ((fun (compile nil `(lambda (stuff)
-                             (make-array (map 'list 'length stuff))))))
+(with-test (:name (make-array :unnamed-dimension-leaf))
+  (let ((fun (checked-compile `(lambda (stuff)
+                                 (make-array (map 'list 'length stuff))))))
     (assert (equalp #2A((0 0 0) (0 0 0))
                     (funcall fun '((1 2) (1 2 3)))))))
 
 (with-test (:name :fp-decoding-funs-not-flushable-in-safe-code)
   (dolist (name '(float-sign float-radix float-digits float-precision decode-float
                   integer-decode-float))
-    (let ((fun (compile nil `(lambda (x)
-                               (declare (optimize safety))
-                               (,name x)
-                               nil))))
+    (let ((fun (checked-compile `(lambda (x)
+                                   (declare (optimize safety))
+                                   (,name x)
+                                   nil))))
       (flet ((test (arg)
                (unless (eq :error
                            (handler-case
@@ -3426,10 +3500,11 @@
           (test sb-ext:single-float-positive-infinity))))))
 
 (with-test (:name :sap-ref-16)
-  (let* ((fun (compile nil `(lambda (x y)
-                              (declare (type sb-sys:system-area-pointer x)
-                                       (type (integer 0 100) y))
-                              (sb-sys:sap-ref-16 x (+ 4 y)))))
+  (let* ((fun (checked-compile
+               `(lambda (x y)
+                  (declare (type sb-sys:system-area-pointer x)
+                           (type (integer 0 100) y))
+                  (sb-sys:sap-ref-16 x (+ 4 y)))))
          (vector (coerce '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)
                          '(simple-array (unsigned-byte 8) (*))))
          (sap (sb-sys:vector-sap vector))
@@ -3437,41 +3512,34 @@
     ;; test for either endianness
     (assert (or (= ret (+ (* 5 256) 4)) (= ret (+ (* 4 256) 5))))))
 
-(with-test (:name :coerce-type-warning)
+(with-test (:name (compile coerce :type-warning))
   (dolist (type '(t (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32)
                   (signed-byte 8) (signed-byte 16) (signed-byte 32)))
-    (multiple-value-bind (fun warningsp failurep)
-        (compile nil `(lambda (x)
-                        (declare (type simple-vector x))
-                        (coerce x '(vector ,type))))
-      (assert (null warningsp))
-      (assert (null failurep))
+    (let ((fun (checked-compile `(lambda (x)
+                                   (declare (type simple-vector x))
+                                   (coerce x '(vector ,type))))))
       (assert (typep (funcall fun #(1)) `(simple-array ,type (*)))))))
 
-(with-test (:name :truncate-double-float)
-  (let ((fun (compile nil `(lambda (x)
-                             (multiple-value-bind (q r)
-                                 (truncate (coerce x 'double-float))
-                               (declare (type unsigned-byte q)
-                                        (type double-float r))
-                               (list q r))))))
+(with-test (:name (compile truncate double-float))
+  (let ((fun (checked-compile `(lambda (x)
+                                 (multiple-value-bind (q r)
+                                     (truncate (coerce x 'double-float))
+                                   (declare (type unsigned-byte q)
+                                            (type double-float r))
+                                   (list q r))))))
     (assert (equal (funcall fun 1.0d0) '(1 0.0d0)))))
 
 (with-test (:name :set-slot-value-no-warning)
-  (let ((notes 0))
-    (handler-bind ((warning #'error)
-                   (sb-ext:compiler-note (lambda (c)
-                                           (declare (ignore c))
-                                           (incf notes))))
-      (compile nil `(lambda (x y)
-                      (declare (optimize speed safety))
-                      (setf (slot-value x 'bar) y))))
-    (assert (= 1 notes))))
+  (let ((notes (nth-value
+                4 (checked-compile `(lambda (x y)
+                                      (declare (optimize speed safety))
+                                      (setf (slot-value x 'bar) y))))))
+    (assert (= 1 (length notes)))))
 
-(with-test (:name :concatenate-string-opt)
+(with-test (:name (concatenate :string-opt))
   (flet ((test (type grep)
-           (let* ((fun (compile nil `(lambda (a b c d e)
-                                      (concatenate ',type a b c d e))))
+           (let* ((fun (checked-compile `(lambda (a b c d e)
+                                           (concatenate ',type a b c d e))))
                   (args '("foo" #(#\.) "bar" (#\-) "quux"))
                   (res (apply fun args)))
              (assert (search grep (with-output-to-string (out)
@@ -3479,18 +3547,21 @@
              (assert (equal (apply #'concatenate type args)
                             res))
              (assert (typep res type)))))
+    #+sb-unicode
     (test 'string "%CONCATENATE-TO-STRING")
+    #+sb-unicode
     (test 'simple-string "%CONCATENATE-TO-STRING")
     (test 'base-string "%CONCATENATE-TO-BASE-STRING")
     (test 'simple-base-string "%CONCATENATE-TO-BASE-STRING")))
 
-(with-test (:name :satisfies-no-local-fun)
-  (let ((fun (compile nil `(lambda (arg)
-                             (labels ((local-not-global-bug (x)
-                                        t)
-                                      (bar (x)
-                                        (typep x '(satisfies local-not-global-bug))))
-                               (bar arg))))))
+(with-test (:name (satisfies :no-local-fun))
+  (let ((fun (checked-compile
+              `(lambda (arg)
+                 (labels ((local-not-global-bug (x)
+                            t)
+                          (bar (x)
+                            (typep x '(satisfies local-not-global-bug))))
+                   (bar arg))))))
     (assert (eq 'local-not-global-bug
                 (handler-case
                     (funcall fun 42)
@@ -3502,15 +3573,15 @@
 ;;; processing) failed an AVER.  The first attempt at a fix caused
 ;;; doing the same in-core to break.
 (with-test (:name :bug-310132)
-  (compile nil '(lambda (&optional (foo #p"foo/bar")))))
+  (checked-compile `(lambda (&optional (foo #p"foo/bar")))
+                   :allow-style-warnings t))
 
 (with-test (:name :bug-309129)
-  (let* ((src '(lambda (v) (values (svref v 0) (vector-pop v))))
-         (warningp nil)
-         (fun (handler-bind ((warning (lambda (c)
-                                        (setf warningp t) (muffle-warning c))))
-                (compile nil src))))
-    (assert warningp)
+  (multiple-value-bind (fun failurep warnings)
+      (checked-compile `(lambda (v) (values (svref v 0) (vector-pop v)))
+                       :allow-failure t :allow-warnings t)
+    (assert failurep)
+    (assert (= 1 (length warnings)))
     (handler-case (funcall fun #(1))
       (type-error (c)
         ;; we used to put simply VECTOR into EXPECTED-TYPE, rather
@@ -3520,110 +3591,104 @@
         (declare (ignore values))
         (error "no error")))))
 
-(with-test (:name :unary-round-type-derivation)
-  (let* ((src '(lambda (zone)
-                (multiple-value-bind (h m) (truncate (abs zone) 1.0)
-                  (declare (ignore h))
-                  (round (* 60.0 m)))))
-         (fun (compile nil src)))
+(with-test (:name (round :unary :type-derivation))
+  (let ((fun (checked-compile
+              `(lambda (zone)
+                 (multiple-value-bind (h m) (truncate (abs zone) 1.0)
+                   (declare (ignore h))
+                   (round (* 60.0 m)))))))
     (assert (= (funcall fun 0.5) 30))))
 
 (with-test (:name :bug-525949)
-  (let* ((src '(lambda ()
-                (labels ((always-one () 1)
-                         (f (z)
-                           (let ((n (funcall z)))
-                             (declare (fixnum n))
-                             (the double-float (expt n 1.0d0)))))
-                  (f #'always-one))))
-         (warningp nil)
-         (fun (handler-bind ((warning (lambda (c)
-                                        (setf warningp t) (muffle-warning c))))
-                (compile nil src))))
-    (assert (not warningp))
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (labels ((always-one () 1)
+                          (f (z)
+                            (let ((n (funcall z)))
+                              (declare (fixnum n))
+                              (the double-float (expt n 1.0d0)))))
+                   (f #'always-one))))))
     (assert (= 1.0d0 (funcall fun)))))
 
 (with-test (:name :%array-data-vector-type-derivation)
-  (let* ((f (compile nil
-                     `(lambda (ary)
-                        (declare (type (simple-array (unsigned-byte 32) (3 3)) ary))
-                        (setf (aref ary 0 0) 0))))
+  (let* ((f (checked-compile
+             `(lambda (ary)
+                (declare (type (simple-array (unsigned-byte 32) (3 3)) ary))
+                (setf (aref ary 0 0) 0))))
          (text (with-output-to-string (s)
                  (disassemble f :stream s))))
     (assert (not (search "OBJECT-NOT-SIMPLE-ARRAY-UNSIGNED-BYTE-32-ERROR" text)))))
 
 (with-test (:name :array-storage-vector-type-derivation)
-  (let ((f (compile nil
-                    `(lambda (ary)
-                       (declare (type (simple-array (unsigned-byte 32) (3 3)) ary))
-                       (ctu:compiler-derived-type (array-storage-vector ary))))))
+  (let ((f (checked-compile
+            `(lambda (ary)
+               (declare (type (simple-array (unsigned-byte 32) (3 3)) ary))
+               (ctu:compiler-derived-type (array-storage-vector ary))))))
     (assert (equal '(simple-array (unsigned-byte 32) (9))
                    (funcall f (make-array '(3 3) :element-type '(unsigned-byte 32)))))))
 
 (with-test (:name :bug-523612)
-  (let ((fun
-         (compile nil
-                  `(lambda (&key toff)
-                     (make-array 3 :element-type 'double-float
-                                 :initial-contents
-                                 (if toff (list toff 0d0 0d0) (list 0d0 0d0 0d0)))))))
+  (let ((fun (checked-compile
+              `(lambda (&key toff)
+                 (make-array 3 :element-type 'double-float
+                             :initial-contents
+                             (if toff (list toff 0d0 0d0) (list 0d0 0d0 0d0)))))))
     (assert (equalp (vector 0.0d0 0.0d0 0.0d0) (funcall fun :toff nil)))
     (assert (equalp (vector 2.3d0 0.0d0 0.0d0) (funcall fun :toff 2.3d0)))))
 
 (with-test (:name :bug-309788)
-  (let ((fun
-         (compile nil
-                  `(lambda (x)
-                     (declare (optimize speed))
-                     (let ((env nil))
-                       (typep x 'fixnum env))))))
+  (let ((fun (checked-compile `(lambda (x)
+                                 (declare (optimize speed))
+                                 (let ((env nil))
+                                   (typep x 'fixnum env))))))
     (assert (not (ctu:find-named-callees fun)))))
 
 (with-test (:name :bug-309124)
-  (let ((fun
-         (compile nil
-                  `(lambda (x)
-                     (declare (integer x))
-                     (declare (optimize speed))
-                     (cond ((typep x 'fixnum)
-                            "hala")
-                           ((typep x 'fixnum)
-                            "buba")
-                           ((typep x 'bignum)
-                            "hip")
-                           (t
-                            "zuz"))))))
+  (let ((fun (checked-compile `(lambda (x)
+                                 (declare (integer x))
+                                 (declare (optimize speed))
+                                 (cond ((typep x 'fixnum)
+                                        "hala")
+                                       ((typep x 'fixnum)
+                                        "buba")
+                                       ((typep x 'bignum)
+                                        "hip")
+                                       (t
+                                        "zuz"))))))
     (assert (equal (list "hala" "hip")
                    (sort (ctu:find-code-constants fun :type 'string)
                          #'string<)))))
 
 (with-test (:name :bug-316078)
-  (let ((fun
-         (compile nil
-                  `(lambda (x)
-                     (declare (type (and simple-bit-vector (satisfies bar)) x)
-                              (optimize speed))
-                     (elt x 5)))))
+  (let ((fun (checked-compile
+              `(lambda (x)
+                 (declare (type (and simple-bit-vector (satisfies bar)) x)
+                          (optimize speed))
+                 (elt x 5)))))
     (assert (not (ctu:find-named-callees fun)))
     (assert (= 1 (funcall fun #*000001)))
     (assert (= 0 (funcall fun #*000010)))))
 
 (with-test (:name :mult-by-one-in-float-acc-zero)
-  (assert (eql 1.0 (funcall (compile nil `(lambda (x)
-                                            (declare (optimize (sb-c::float-accuracy 0)))
-                                            (* x 1.0)))
+  (assert (eql 1.0 (funcall (checked-compile
+                             `(lambda (x)
+                                (declare (optimize (sb-c::float-accuracy 0)))
+                                (* x 1.0)))
                             1)))
-  (assert (eql -1.0 (funcall (compile nil `(lambda (x)
-                                             (declare (optimize (sb-c::float-accuracy 0)))
-                                             (* x -1.0)))
+  (assert (eql -1.0 (funcall (checked-compile
+                              `(lambda (x)
+                                 (declare (optimize (sb-c::float-accuracy 0)))
+                                 (* x -1.0)))
                              1)))
-  (assert (eql 1.0d0 (funcall (compile nil `(lambda (x)
-                                              (declare (optimize (sb-c::float-accuracy 0)))
-                                              (* x 1.0d0)))
+  (assert (eql 1.0d0 (funcall (checked-compile
+                               `(lambda (x)
+                                  (declare (optimize (sb-c::float-accuracy 0)))
+                                  (* x 1.0d0)))
                               1)))
-  (assert (eql -1.0d0 (funcall (compile nil `(lambda (x)
-                                               (declare (optimize (sb-c::float-accuracy 0)))
-                                               (* x -1.0d0)))
+  (assert (eql -1.0d0 (funcall (checked-compile
+                                `(lambda (x)
+                                   (declare (optimize (sb-c::float-accuracy 0)))
+                                   (* x -1.0d0)))
                                1))))
 
 (with-test (:name :dotimes-non-integer-counter-value)
@@ -3632,15 +3697,16 @@
 (with-test (:name :bug-454681)
   ;; This used to break due to reference to a dead lambda-var during
   ;; inline expansion.
-  (assert (compile nil
-                   `(lambda ()
-                      (multiple-value-bind (iterator+977 getter+978)
-                          (does-not-exist-but-does-not-matter)
-                        (flet ((iterator+976 ()
-                                 (funcall iterator+977)))
-                          (declare (inline iterator+976))
-                          (let ((iterator+976 #'iterator+976))
-                            (funcall iterator+976))))))))
+  (assert (checked-compile
+           `(lambda ()
+              (multiple-value-bind (iterator+977 getter+978)
+                  (does-not-exist-but-does-not-matter)
+                (flet ((iterator+976 ()
+                         (funcall iterator+977)))
+                  (declare (inline iterator+976))
+                  (let ((iterator+976 #'iterator+976))
+                    (funcall iterator+976)))))
+           :allow-style-warnings t)))
 
 (with-test (:name :complex-float-local-fun-args)
   ;; As of 1.0.27.14, the lambda below failed to compile due to the
@@ -3648,46 +3714,32 @@
   ;; MOVE-ARG method not expecting the register being used as a
   ;; temporary frame pointer.  Reported by sykopomp in #lispgames,
   ;; reduced test case provided by _3b`.
-  (compile nil '(lambda (a)
-                  (labels ((z (b c)
-                              (declare ((complex double-float) b c))
-                              (* b (z b c))))
-                          (loop for i below 10 do
-                                (setf a (z a a)))))))
+  (checked-compile `(lambda (a)
+                      (labels ((z (b c)
+                                 (declare ((complex double-float) b c))
+                                 (* b (z b c))))
+                        (loop for i below 10 do
+                             (setf a (z a a)))))))
 
 (with-test (:name :bug-309130)
-  (assert (eq :warning
-              (handler-case
-                  (compile nil `(lambda () (svref (make-array 8 :adjustable t) 1)))
-                ((and warning (not style-warning)) ()
-                  :warning))))
-  (assert (eq :warning
-              (handler-case
-                  (compile nil `(lambda (x)
-                                  (declare (optimize (debug 0)))
-                                  (declare (type vector x))
-                                  (list (fill-pointer x) (svref x 1))))
-                ((and warning (not style-warning)) ()
-                  :warning))))
-  (assert (eq :warning
-              (handler-case
-                  (compile nil `(lambda (x)
-                                  (list (vector-push (svref x 0) x))))
-                ((and warning (not style-warning)) ()
-                  :warning))))
-  (assert (eq :warning
-              (handler-case
-                  (compile nil `(lambda (x)
-                                  (list (vector-push-extend (svref x 0) x))))
-                ((and warning (not style-warning)) ()
-                  :warning)))))
+  (flet ((test (form)
+           (let ((warnings (nth-value
+                            2 (checked-compile form :allow-warnings t))))
+             (assert (= 1 (length warnings))))))
+    (test `(lambda () (svref (make-array 8 :adjustable t) 1)))
+    (test `(lambda (x)
+             (declare (optimize (debug 0)))
+             (declare (type vector x))
+             (list (fill-pointer x) (svref x 1))))
+    (test `(lambda (x)
+             (list (vector-push (svref x 0) x))))
+    (test `(lambda (x)
+             (list (vector-push-extend (svref x 0) x))))))
 
 (with-test (:name :bug-646796)
-  (assert 42
-          (funcall
-           (compile nil
-                    `(lambda ()
-                       (load-time-value (the (values fixnum) 42)))))))
+  (assert (= 42 (funcall (checked-compile
+                          `(lambda ()
+                             (load-time-value (the (values fixnum) 42))))))))
 
 (with-test (:name :bug-654289)
   ;; Test that compile-times don't explode when quoted constants
@@ -3764,35 +3816,32 @@
            (l2 (make-lambda 100))
            (l3 (make-lambda 1000))
            (t0 (get-internal-run-time))
-           (f0 (compile nil l0))
+           (f0 (checked-compile l0))
            (t1 (get-internal-run-time))
-           (f1 (compile nil l1))
+           (f1 (checked-compile l1))
            (t2 (get-internal-run-time))
-           (f2 (compile nil l2))
+           (f2 (checked-compile l2))
            (t3 (get-internal-run-time))
-           (f3 (compile nil l3))
+           (f3 (checked-compile l3))
            (t4 (get-internal-run-time))
            (d0 (- t1 t0))
            (d1 (- t2 t1))
            (d2 (- t3 t2))
            (d3 (- t4 t3))
            (short-avg (/ (+ d0 d1 d2) 3)))
-      (assert (and f1 f2 f3))
+      (assert (and f0 f1 f2 f3))
       (assert (< d3 (* 10 short-avg))))))
 
 (with-test (:name :bug-384892)
   (assert (equal
-           ;; The assertion that BOOLEAN becomes (MEMBER T NIL)
-           ;; is slightly brittle, but the rest of the
-           ;; assertion is ok.
-           '(function (fixnum fixnum &key (:k1 (member t nil)))
+           '(function (fixnum fixnum &key (:k1 boolean))
              (values (member t) &optional))
            (sb-kernel:%simple-fun-type
-            (compile nil `(lambda (x y &key k1)
-                            (declare (fixnum x y))
-                            (declare (boolean k1))
-                            (declare (ignore x y k1))
-                            t))))))
+            (checked-compile `(lambda (x y &key k1)
+                                (declare (fixnum x y))
+                                (declare (boolean k1))
+                                (declare (ignore x y k1))
+                                t))))))
 
 (with-test (:name :bug-309448)
   ;; Like all tests trying to verify that something doesn't blow up
@@ -3804,9 +3853,9 @@
                     (iterations 0)
                     (fun (if times
                              (loop repeat times
-                                   for result = (compile nil lambda)
+                                   for result = (checked-compile lambda)
                                    finally (return result))
-                             (loop for result = (compile nil lambda)
+                             (loop for result = (checked-compile lambda)
                                    do (incf iterations)
                                    until (> (get-internal-run-time) (+ start 10))
                                    finally (return result))))
@@ -3858,24 +3907,27 @@
              233168)))
 
 (with-test (:name :regression-1.0.44.34)
-  (compile nil '(lambda (z &rest args)
-                 (declare (dynamic-extent args))
-                 (flet ((foo (w v) (list v w)))
-                   (setq z 0)
-                   (flet ((foo ()
-                            (foo z args)))
-                     (declare (sb-int:truly-dynamic-extent #'foo))
-                     (call #'foo nil))))))
+  (checked-compile
+   `(lambda (z &rest args)
+      (declare (dynamic-extent args))
+      (flet ((foo (w v) (list v w)))
+        (setq z 0)
+        (flet ((foo ()
+                 (foo z args)))
+          (declare (sb-int:truly-dynamic-extent #'foo))
+          (call #'foo nil))))
+   :allow-style-warnings t))
 
 (with-test (:name :bug-713626)
   (let ((f (eval '(constantly 42))))
-    (handler-bind ((warning #'error))
-      (assert (= 42 (funcall (compile nil `(lambda () (funcall ,f 1 2 3)))))))))
+    (assert (= 42 (funcall (checked-compile
+                            `(lambda () (funcall ,f 1 2 3))))))))
 
 (with-test (:name :known-fun-allows-other-keys)
-  (handler-bind ((warning #'error))
-    (funcall (compile nil '(lambda () (directory "." :allow-other-keys t))))
-    (funcall (compile nil `(lambda () (directory "." :bar t :allow-other-keys t))))))
+  (funcall (checked-compile
+            `(lambda () (directory "." :allow-other-keys t))))
+  (funcall (checked-compile
+            `(lambda () (directory "." :bar t :allow-other-keys t)))))
 
 (with-test (:name :bug-551227)
   ;; This function causes constraint analysis to perform a
@@ -3884,34 +3936,31 @@
   ;; LET-converted inline-expansion of MOD.  This leads to attempting
   ;; to CLOSE-OVER a variable that simply isn't in scope when it is
   ;; referenced.
-  (compile nil '(lambda (a)
-                  (if (let ((s a))
-                        (block :block
-                          (map nil
-                               (lambda (e)
-                                 (return-from :block
-                                   (f (mod a e))))
-                               s)))
-                      (g a)))))
+  (checked-compile
+   `(lambda (a)
+      (if (let ((s a))
+            (block :block
+              (map nil
+                   (lambda (e)
+                     (return-from :block
+                       (f (mod a e))))
+                   s)))
+          (g a)))
+   :allow-style-warnings t))
 
 (with-test (:name :funcall-lambda-inlined)
   (assert (not
            (ctu:find-code-constants
-            (compile nil
-                     `(lambda (x y)
-                        (+ x (funcall (lambda (z) z) y))))
+            (checked-compile `(lambda (x y)
+                                (+ x (funcall (lambda (z) z) y))))
             :type 'function))))
 
 (with-test (:name :bug-720382)
-  (let ((w 0))
-    (let ((f
-           (handler-bind (((and warning (not style-warning))
-                           (lambda (c) (incf w))))
-             (compile nil `(lambda (b) ((lambda () b) 1))))))
-      (assert (= w 1))
-      (assert (eq :error
-                  (handler-case (funcall f 0)
-                    (error () :error)))))))
+  (multiple-value-bind (fun failurep warnings)
+      (checked-compile `(lambda (b) ((lambda () b) 1)) :allow-warnings t)
+    (assert failurep)
+    (assert (= 1 (length warnings)))
+    (assert-error (funcall fun 0))))
 
 (with-test (:name :multiple-args-to-function)
   (let ((form `(flet ((foo (&optional (x 13)) x))
@@ -4030,19 +4079,21 @@
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-793771 *))
-  (let ((f (compile nil `(lambda (x)
-                            (declare (type (single-float (0.0)) x))
-                           (* x 0.1)))))
+  (let ((f (checked-compile
+            `(lambda (x)
+               (declare (type (single-float (0.0)) x))
+               (* x 0.1)))))
     (assert (equal `(function ((single-float (0.0)))
-                              (values (or (member 0.0) (single-float (0.0))) &optional))
+                              (values (single-float 0.0) &optional))
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-793771 /))
-  (let ((f (compile nil `(lambda (x)
-                            (declare (type (single-float (0.0)) x))
-                           (/ x 3.0)))))
+  (let ((f (checked-compile
+            `(lambda (x)
+               (declare (type (single-float (0.0)) x))
+               (/ x 3.0)))))
     (assert (equal `(function ((single-float (0.0)))
-                              (values (or (member 0.0) (single-float (0.0))) &optional))
+                              (values (single-float 0.0) &optional))
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-486812 single-float))
@@ -4921,7 +4972,8 @@
               (list "lisT")))))
 
 (with-test (:name (restart-case optimize speed compiler-note)
-                 :skipped-on :sparc) ; crashes the test driver
+            ;; Cannot-DX note crashes test driver unless we have this:
+            :skipped-on '(not :stack-allocatable-fixed-objects))
   (handler-bind ((compiler-note #'error))
     (compile nil '(lambda ()
                    (declare (optimize speed))
@@ -4979,7 +5031,9 @@
     (assert failure-p)))
 
 ;; quantifiers shouldn't cons themselves.
-(with-test (:name :quantifiers-no-consing :skipped-on :interpreter)
+(with-test (:name :quantifiers-no-consing
+            :skipped-on '(or :interpreter
+                             (not :stack-allocatable-closures)))
   (let ((constantly-t (lambda (x) x t))
         (constantly-nil (lambda (x) x nil))
         (list (make-list 1000 :initial-element nil))
@@ -4998,10 +5052,10 @@
 (with-test (:name :propagate-complex-type-tests)
   (flet ((test (type value)
            (let ((ftype (sb-kernel:%simple-fun-type
-                         (compile nil `(lambda (x)
-                                         (if (typep x ',type)
-                                             x
-                                             ',value))))))
+                         (checked-compile `(lambda (x)
+                                             (if (typep x ',type)
+                                                 x
+                                                 ',value))))))
              (assert (typep ftype `(cons (eql function))))
              (assert (= 3 (length ftype)))
              (let* ((return (third ftype))
@@ -5020,81 +5074,69 @@
 
 (with-test (:name :constant-fold-complex-type-tests)
   (assert (equal (sb-kernel:%simple-fun-type
-                  (compile nil `(lambda (x)
-                                  (if (typep x '(member 1 3))
-                                      (typep x '(member 1 3 15))
-                                      t))))
+                  (checked-compile `(lambda (x)
+                                      (if (typep x '(member 1 3))
+                                          (typep x '(member 1 3 15))
+                                          t))))
                  `(function (t) (values (member t) &optional))))
   (assert (equal (sb-kernel:%simple-fun-type
-                  (compile nil `(lambda (x)
-                                  (declare (type (member 1 3) x))
-                                  (typep x '(member 1 3 15)))))
+                  (checked-compile `(lambda (x)
+                                      (declare (type (member 1 3) x))
+                                      (typep x '(member 1 3 15)))))
                  `(function ((or (integer 1 1) (integer 3 3)))
                             (values (member t) &optional)))))
 
 (with-test (:name :quietly-row-major-index-no-dimensions)
-  (assert (handler-case
-              (compile nil `(lambda (x) (array-row-major-index x)))
-            (warning () nil))))
+  (checked-compile `(lambda (x) (array-row-major-index x))))
 
 (with-test (:name :array-rank-transform)
-  (compile nil `(lambda (a) (array-rank (the an-imaginary-type a)))))
+  (checked-compile `(lambda (a) (array-rank (the an-imaginary-type a)))
+                   :allow-style-warnings t))
 
 (with-test (:name (:array-rank-fold :bug-1252108))
-  (let (noted)
-    (handler-bind ((sb-ext::code-deletion-note
-                     (lambda (x)
-                       (setf noted x))))
-      (compile nil
-               `(lambda (a)
-                  (typecase a
-                    ((array t 2)
-                     (when (= (array-rank a) 3)
-                       (array-dimension a 2)))))))
-    (assert noted)))
+  (let ((notes (nth-value
+                4 (checked-compile
+                   `(lambda (a)
+                      (typecase a
+                        ((array t 2)
+                         (when (= (array-rank a) 3)
+                           (array-dimension a 2)))))))))
+    (assert (= 1 (length notes)))))
 
 (assert-error (upgraded-array-element-type 'an-undefined-type))
 
 (with-test (:name :xchg-misencoding)
-  (assert (eql (funcall (compile nil '(lambda (a b)
-                                       (declare (optimize (speed 3) (safety 2))
-                                        (type single-float a))
-                                       (unless (eql b 1/2)
-                                         (min a -1f0))))
+  (assert (eql (funcall (checked-compile
+                         `(lambda (a b)
+                            (declare (optimize (speed 3) (safety 2))
+                                     (type single-float a))
+                            (unless (eql b 1/2)
+                              (min a -1f0))))
                         0f0 1)
                -1f0)))
 
 (with-test (:name :malformed-declare)
-  (multiple-value-bind (fun warnings-p failure-p)
-      (compile nil '(lambda (x)
-                     (declare (unsigned-byte (x)))
-                     x))
-    (assert (and fun warnings-p failure-p))))
+  (assert (nth-value
+           1 (checked-compile `(lambda (x)
+                                 (declare (unsigned-byte (x)))
+                                 x)
+                              :allow-failure t))))
 
 (with-test (:name :no-dubious-asterisk-warning)
-  (multiple-value-bind (fun warnings-p failure-p)
-      (compile
-       nil
-       '(lambda (foo)
-         (macrolet ((frob-some-stuff (&rest exprs)
-                      (let ((temps
-                             (mapcar
-                              (lambda (x)
-                                (if (symbolp x) (copy-symbol x) (gensym)))
-                              exprs)))
-                        `(let ,(mapcar #'list temps exprs)
-                           (if (and ,@temps)
-                               (format t "Got~@{ ~S~^ and~}~%" ,@temps))))))
-           (frob-some-stuff *print-base* (car foo)))))
-    (assert (and fun (not warnings-p) (not failure-p)))))
+  (checked-compile
+   `(lambda (foo)
+      (macrolet ((frob-some-stuff (&rest exprs)
+                   (let ((temps
+                          (mapcar
+                           (lambda (x)
+                             (if (symbolp x) (copy-symbol x) (gensym)))
+                           exprs)))
+                     `(let ,(mapcar #'list temps exprs)
+                        (if (and ,@temps)
+                            (format t "Got~@{ ~S~^ and~}~%" ,@temps))))))
+        (frob-some-stuff *print-base* (car foo))))))
 
-(with-test (:name :interr-type-specifier-hashing
-            ;; Fails due to lack of VOP TYPE-CHECK-ERROR/C, see
-            ;; compiler/checkgen.lisp (DEFGLOBAL
-            ;; **TYPE-SPEC-INTERR-SYMBOLS**) and
-            ;; compiler/generic/type-error.lisp (DEFINE-VOP
-            ;; TYPE-CHECK-ERROR/C) for details.
-            :fails-on '(or :alpha :hppa))
+(with-test (:name :interr-type-specifier-hashing)
   (let ((specifiers
          (remove
           'simple-vector
@@ -5109,8 +5151,8 @@
              `(or ,@specifiers system-area-pointer)))))
 
 (with-test (:name :simple-rank-1-array-*-p-works)
-  (assert (funcall (compile nil
-                            '(lambda () (typep #() '(simple-array * (*)))))))
+  (assert (funcall (checked-compile
+                    `(lambda () (typep #() '(simple-array * (*)))))))
   (loop for saetp across sb-vm:*specialized-array-element-type-properties*
      do
      (dotimes (n-dimensions 3) ; test ranks 0, 1, and 2.
@@ -5123,9 +5165,9 @@
 
 (with-test (:name :array-subtype-tests
             :skipped-on '(:not (:or :x86 :x86-64)))
-  (assert (funcall (compile nil
-                            '(lambda ()
-                              (typep #() '(or simple-vector simple-string))))))
+  (assert (funcall (checked-compile
+                    `(lambda ()
+                       (typep #() '(or simple-vector simple-string))))))
   (flet ((approx-lines-of-assembly-code (type-expr)
            (count #\Newline
                   (with-output-to-string (s)
@@ -5154,40 +5196,35 @@
                29))))
 
 (with-test (:name :local-argument-mismatch-error-string)
-  (let ((f (compile nil `(lambda (x)
-                           (flet ((foo ()))
-                             (foo x))))))
-    (multiple-value-bind (ok err) (ignore-errors (funcall f 42))
+  (multiple-value-bind (fun failurep warnings)
+      (checked-compile `(lambda (x)
+                          (flet ((foo ()))
+                            (foo x)))
+                       :allow-warnings t)
+    (declare (ignore failurep))
+    (assert (= 1 (length warnings)))
+    (multiple-value-bind (ok err) (ignore-errors (funcall fun 42))
       (assert (not ok))
       (assert (search "FLET FOO" (princ-to-string err))))))
 
 (with-test (:name :bug-1310574-0)
-  (multiple-value-bind (function warning failure)
-      (compile nil `(lambda (a)
+  (checked-compile `(lambda (a)
                       (typecase a
                         ((or (array * (* * 3)) (array * (* * 4)))
                          (case (array-rank a)
-                           (2 (aref a 1 2)))))))
-    (declare (ignore function))
-    (assert (not warning))
-    (assert (not failure))))
+                           (2 (aref a 1 2))))))))
 
 (with-test (:name :bug-1310574-1)
-  (multiple-value-bind (function warning failure)
-      (compile nil `(lambda (a)
+  (checked-compile `(lambda (a)
                       (typecase a
                         ((or (array * ()) (array * (1)) (array * (1 2)))
                          (case (array-rank a)
-                           (3 (aref a 1 2 3)))))))
-    (declare (ignore function))
-    (assert (not warning))
-    (assert (not failure))))
+                           (3 (aref a 1 2 3))))))))
 
 (with-test (:name :bug-573747)
-  (multiple-value-bind (function warnings-p failure-p)
-      (compile nil '(lambda (x) (progn (declare (integer x)) (* x 6))))
-    (assert warnings-p)
-    (assert failure-p)))
+  (assert (nth-value
+           1 (checked-compile `(lambda (x) (progn (declare (integer x)) (* x 6)))
+                              :allow-failure t))))
 
 ;; Something in this function used to confuse lifetime analysis into
 ;; recording multiple conflicts for a single TNs in the dolist block.
@@ -5309,14 +5346,13 @@
                   exit-reason)))))
 
 (with-test (:name :dead-code-in-optional-dispatch)
-  (multiple-value-bind (f warningp)
-      ;; the translation of each optional entry is
-      ;;   (let ((#:g (error "nope"))) (funcall #<clambda> ...))
-      ;; but the funcall is unreachable. Since this is an artifact of how the
-      ;; lambda is converted, it should not generate a note as if in user code.
-      (compile nil '(lambda (a &optional (b (error "nope")) (c (error "nope")))
-                     (values c b a)))
-    (assert (and f (not warningp)))))
+  ;; the translation of each optional entry is
+  ;;   (let ((#:g (error "nope"))) (funcall #<clambda> ...))
+  ;; but the funcall is unreachable. Since this is an artifact of how the
+  ;; lambda is converted, it should not generate a note as if in user code.
+  (checked-compile
+   `(lambda (a &optional (b (error "nope")) (c (error "nope")))
+      (values c b a))))
 
 (with-test (:name :nth-value-of-non-constant-N :skipped-on :interpreter)
   (labels ((foo (n f) (nth-value n (funcall f)))
@@ -5370,43 +5406,33 @@
                          (nreverse list))))))))
 
 ;; lp# 310267
-(with-test (:name :optimize-quality-multiply-specified)
-  (let ((*error-output* (make-broadcast-stream)))
-    (let ((sb-c::*policy* sb-c::*policy*)) ; to keep this test pure
-      (assert-signal (proclaim '(optimize space debug (space 0)))
-                     style-warning))
-    (assert-signal
-     (compile nil '(lambda () (declare (optimize speed (speed 0))) 5))
-     style-warning)
-    (assert-signal
-     (compile nil '(lambda () (declare (optimize speed) (optimize (speed 0))) 5))
-     style-warning)
-    (assert-signal
-     (compile nil '(lambda ()
-                     (declare (optimize speed)) (declare (optimize (speed 0)))
-                     5))
-     style-warning))
+(with-test (:name (optimize :quality-multiply-specified :bug-310267))
+  (let ((sb-c::*policy* sb-c::*policy*)) ; to keep this test pure
+    (assert-signal (proclaim '(optimize space debug (space 0)))
+                   style-warning)
+    (flet ((test (form)
+             (assert (= 1 (length (nth-value
+                                   3 (checked-compile
+                                      form :allow-style-warnings t)))))))
+      (test `(lambda () (declare (optimize speed (speed 0))) 5))
+      (test `(lambda () (declare (optimize speed) (optimize (speed 0))) 5))
+      (test `(lambda ()
+               (declare (optimize speed)) (declare (optimize (speed 0)))
+               5)))
 
-  ;; these are OK
-  (assert-no-signal (proclaim '(optimize (space 3) space)))
-  (assert-no-signal
-   (compile nil '(lambda () (declare (optimize speed (speed 3))) 5)))
-  (assert-no-signal
-   (compile nil '(lambda () (declare (optimize speed) (optimize (speed 3))) 5)))
-  (assert-no-signal
-   (compile nil '(lambda ()
-                   (declare (optimize speed)) (declare (optimize (speed 3)))
-                   5))))
+    ;; these are OK
+    (assert-no-signal (proclaim '(optimize (space 3) space)))
+    (checked-compile `(lambda () (declare (optimize speed (speed 3))) 5))
+    (checked-compile `(lambda () (declare (optimize speed) (optimize (speed 3))) 5))
+    (checked-compile `(lambda ()
+                        (declare (optimize speed)) (declare (optimize (speed 3)))
+                        5))))
 
-(with-test (:name :truncate-type-derivation)
-  (assert (=
-           4
-           (funcall
-            (compile nil
-                     '(lambda (a b)
-                       (truncate a
-                        (the (rational (1) (3)) b))))
-            10 5/2))))
+(with-test (:name (truncate :type-derivation))
+  (assert (= 4 (funcall (checked-compile
+                         `(lambda (a b)
+                            (truncate a (the (rational (1) (3)) b))))
+                        10 5/2))))
 
 (with-test (:name :constantp-on-a-literal-function-works)
   (assert (constantp `(the (function (list) t) ,#'car))))
@@ -5417,43 +5443,45 @@
                      (condition () :lose)))))
 
 (with-test (:name :mv-conversion)
-  (compile nil '(lambda (a)
-                 (tagbody (go 0)
-                    (list (unwind-protect a))
-                    (multiple-value-call #'list
-                      (values (catch 'ct5 (go 0))))
-                  0))))
+  (checked-compile `(lambda (a)
+                      (tagbody (go 0)
+                         (list (unwind-protect a))
+                         (multiple-value-call #'list
+                           (values (catch 'ct5 (go 0))))
+                       0))))
 
 (with-test (:name (:null-cleanups-1 :bug-1416704 :bug-404441))
   (let ((x (funcall
-            (compile nil `(lambda ()
-                            (lambda (x)
-                              (declare (optimize speed))
-                              (if x
-                                  (funcall (flet ((bar () 10)) #'bar))
-                                  (funcall (flet ((fez ()
-                                                    (funcall (flet ((foo () 20)) #'foo))))
-                                             #'fez)))))))))
+            (checked-compile
+             `(lambda ()
+                (lambda (x)
+                  (declare (optimize speed))
+                  (if x
+                      (funcall (flet ((bar () 10)) #'bar))
+                      (funcall (flet ((fez ()
+                                        (funcall (flet ((foo () 20)) #'foo))))
+                                 #'fez)))))))))
     (assert (= (funcall x t) 10))
     (assert (= (funcall x nil) 20))))
 
 (with-test (:name (:null-cleanups-2 :bug-1416704 :bug-404441))
   (let ((fun (funcall
-              (compile nil `(lambda ()
-                              (lambda (x)
-                                (declare (optimize speed))
-                                (let* ((a2 (lambda () 20))
-                                       (a4 (lambda ()))
-                                       (a0 (flet ((f () (funcall a2)))
-                                             #'f))
-                                       (a3 (lambda ()
-                                             (if x
-                                                 (if x
-                                                     (throw 'x 10)
-                                                     (let ((a5 (lambda () (funcall a4))))
-                                                       (funcall a5)))
-                                                 (funcall a0)))))
-                                  (funcall a3))))))))
+              (checked-compile
+               `(lambda ()
+                  (lambda (x)
+                    (declare (optimize speed))
+                    (let* ((a2 (lambda () 20))
+                           (a4 (lambda ()))
+                           (a0 (flet ((f () (funcall a2)))
+                                 #'f))
+                           (a3 (lambda ()
+                                 (if x
+                                     (if x
+                                         (throw 'x 10)
+                                         (let ((a5 (lambda () (funcall a4))))
+                                           (funcall a5)))
+                                     (funcall a0)))))
+                      (funcall a3))))))))
     (assert (= (catch 'x (funcall fun t)) 10))
     (assert (= (catch 'x (funcall fun nil)) 20))))
 
@@ -5461,58 +5489,57 @@
 (with-test (:name :locall-already-let-converted)
   (assert (eq (funcall
                (funcall
-                (compile
-                 nil
-                 '(lambda ()
-                   (flet ((call (ff)
-                            (flet ((f () (return-from f ff)))
-                              (declare (inline f))
-                              (f)
-                              (f))))
-                     (declare (inline call))
-                     (call 1)
-                     (call (lambda () 'result)))))))
+                (checked-compile
+                 `(lambda ()
+                    (flet ((call (ff)
+                             (flet ((f () (return-from f ff)))
+                               (declare (inline f))
+                               (f)
+                               (f))))
+                      (declare (inline call))
+                      (call 1)
+                      (call (lambda () 'result)))))))
               'result)))
 
 (with-test (:name :debug-dump-elsewhere)
-  (assert
-   (eql
-    (catch 'x
-      (funcall
-       (compile nil
-                '(lambda ()
-                  (declare (optimize debug))
-                  (throw 'x *)))))
-    *)))
+  (assert (eql (catch 'x
+                 (funcall
+                  (checked-compile
+                   `(lambda ()
+                      (declare (optimize debug))
+                      (throw 'x *)))))
+               *)))
 
-(with-test (:name :typep-quasiquoted-constant)
+(with-test (:name (typep :quasiquoted-constant))
   (assert (null (ctu:find-named-callees
-                 (compile nil
-                          '(lambda (x)
-                             (typep x `(signed-byte ,sb-vm:n-word-bits))))))))
-(with-test (:name :logior-transform)
-  (let ((function (compile nil '(lambda (c)
-                                 (flet ((f (x)
-                                          (the integer x)))
-                                   (logior c (f nil)))))))
-    (assert-error (funcall function 10)
-                  type-error)))
+                 (checked-compile
+                  `(lambda (x)
+                     (typep x `(signed-byte ,sb-vm:n-word-bits))))))))
+
+(with-test (:name (logior :transform))
+  (multiple-value-bind (fun failurep warnings)
+      (checked-compile `(lambda (c)
+                          (flet ((f (x)
+                                   (the integer x)))
+                            (logior c (f nil))))
+                       :allow-warnings t)
+    (assert failurep)
+    (assert (= 1 (length warnings)))
+    (assert-error (funcall fun 10) type-error)))
 
 (with-test (:name :eql/integer-folding)
-  (multiple-value-bind (f warning)
-    (compile nil
-             '(lambda (a)
-                (fceiling (the (member 2.3 21672589639883401935) a))))
-   (assert (and f (not warning)))))
+  (checked-compile
+   `(lambda (a)
+      (fceiling (the (member 2.3 21672589639883401935) a)))))
 
-(with-test (:name :position-derive-type)
-  (let ((f (compile nil
-                    '(lambda (x)
-                      (declare (type (simple-string 90) x))
-                      (declare (muffle-conditions code-deletion-note))
-                      (let ((b (position #\i x)))
-                        (if (and (integerp b) (> b 100))
-                            'yikes 'okey-dokey))))))
+(with-test (:name (position :derive-type))
+  (let ((f (checked-compile
+            `(lambda (x)
+               (declare (type (simple-string 90) x))
+               (declare (muffle-conditions code-deletion-note))
+               (let ((b (position #\i x)))
+                 (if (and (integerp b) (> b 100))
+                     'yikes 'okey-dokey))))))
     ;; The function can not return YIKES
     (assert (not (ctu:find-code-constants f :type '(eql yikes))))))
 
@@ -5524,10 +5551,11 @@
                           (compile-file input :print nil))))
         (assert (search expect err-string))))))
 
-(with-test (:name :coerce-derive-type)
+(with-test (:name (coerce :derive-type))
   (macrolet ((check (type ll form &rest values)
-               `(assert (equal (funcall (compile nil `(lambda ,',ll
-                                                        (ctu:compiler-derived-type ,',form)))
+               `(assert (equal (funcall (checked-compile
+                                         `(lambda ,',ll
+                                            (ctu:compiler-derived-type ,',form)))
                                         ,@values)
                                ',type))))
     (check list
@@ -5550,11 +5578,14 @@
            (make-array 10 :element-type '(unsigned-byte 32)))))
 
 (with-test (:name :associate-args)
-  (assert-error
-   (funcall (compile nil `(lambda (x) (+ 1 x nil)))
-            2))
-  (assert-error
-   (funcall (compile nil `(lambda (x) (/ 1 x nil))) 4)))
+  (flet ((test (form argument)
+           (multiple-value-bind (fun failurep warnings)
+               (checked-compile form :allow-warnings t)
+             (assert failurep)
+             (assert (= 1 (length warnings)))
+             (assert-error (funcall fun argument)))))
+    (test `(lambda (x) (+ 1 x nil)) 2)
+    (test `(lambda (x) (/ 1 x nil)) 4)))
 
 (with-test (:name :eager-substitute-single-use-lvar)
   (assert (= (funcall
@@ -5587,45 +5618,194 @@
               3)
              -5)))
 
-(with-test (:name :malformed-macrolet)
-  (flet ((test (form)
-           (multiple-value-bind (fun warn fail)
-               (compile nil `(lambda () ,form))
-             (assert (and warn fail))
-             (assert-error (funcall fun) sb-int:compiled-program-error))))
+(flet ((test (form)
+         (multiple-value-bind (fun failurep)
+             (checked-compile `(lambda () ,form)
+                              :allow-failure t)
+           (assert failurep)
+           (assert-error (funcall fun) sb-int:compiled-program-error))))
+
+  (with-test (:name (compile macrolet :malformed))
     (test '(macrolet (foo () 'bar)))
     (test '(macrolet x))
     (test '(symbol-macrolet x))
-    (test '(symbol-macrolet (x)))))
+    (test '(symbol-macrolet (x))))
 
-
-(with-test (:name :malformed-flet)
-  (flet ((test (form)
-           (multiple-value-bind (fun warn fail)
-               (compile nil `(lambda () ,form))
-             (assert (and warn fail))
-             (assert-error (funcall fun) sb-int:compiled-program-error))))
+  (with-test (:name (compile flet :malformed))
     (test '(flet (foo () 'bar)))
     (test '(flet x))
     (test '(labels (foo () 'bar)))
     (test '(labels x))))
 
 (with-test (:name :compile-load-time-value-interpreted-mode)
-  ;; This test exercises the same pattern as HANDLER-BIND (to a degree).
-  ;; In particular a HANDLER-BIND that was compiled when the *EVALUATOR-MODE*
-  ;; was :INTERPRET would not compile its class predicates, because
-  ;; LOAD-TIME-VALUE just called EVAL, and you would get back a list
-  ;; with an interpreted function it it.
-  ;; In the code below, this function when called would generate a new symbol
-  ;; each time. But if the compiler processes the guts as it should,
-  ;; you get back a compiled lambda which returns a constant symbol.
+  ;; This test exercises the same pattern as HANDLER-BIND (to a
+  ;; degree).  In particular a HANDLER-BIND that was compiled when the
+  ;; *EVALUATOR-MODE* was :INTERPRET would not compile its class
+  ;; predicates, because LOAD-TIME-VALUE just called EVAL, and you
+  ;; would get back a list with an interpreted function in it.
+  ;;
+  ;; In the code below, this function when called would generate a new
+  ;; symbol each time. But if the compiler processes the guts as it
+  ;; should, you get back a compiled lambda which returns a constant
+  ;; symbol.
   (let ((f (let ((sb-ext:*evaluator-mode* :interpret))
-             (compile nil
-                      '(lambda ()
-                        (load-time-value
-                         (list (lambda ()
-                                 (macrolet ((foo ()
-                                              (sb-int:keywordicate (gensym))))
-                                   (foo))))))))))
+             (checked-compile
+              `(lambda ()
+                 (load-time-value
+                  (list (lambda ()
+                          (macrolet ((foo ()
+                                       (sb-int:keywordicate (gensym))))
+                            (foo))))))))))
     (eq (funcall (car (funcall f)))
         (funcall (car (funcall f))))))
+
+(with-test (:name :constant-fold-%eql/integer)
+  (assert (null
+           (funcall (checked-compile
+                     `(lambda (x)
+                        (declare (type (complex single-float) x)
+                                 (optimize (debug 2)))
+                        (member (the (eql #c(0.0 0.0)) x)
+                                '(1 2 3 9912477572127105188))))
+            #C(0.0 0.0)))))
+
+(with-test (:name (compile svref :constant))
+  (assert
+   (= (funcall (checked-compile
+                `(lambda () (svref #(1 2 3) 1))))
+      2)))
+
+(with-test (:name (compile char-equal :type-intersection))
+  (assert
+   (eq (funcall (checked-compile
+                 `(lambda (x y)
+                    (char-equal (the (member #\a #\B) x)
+                                (the (eql #\A) y))))
+                #\a #\A)
+       t)))
+
+(with-test (:name (oddp fixnum :no-consing))
+  (let ((f (compile nil '(lambda (x) (oddp x)))))
+    (ctu:assert-no-consing (funcall f most-positive-fixnum))))
+(with-test (:name (oddp bignum :no-consing))
+  (let ((f (compile nil '(lambda (x) (oddp x))))
+        (x (* most-positive-fixnum most-positive-fixnum 3)))
+    (ctu:assert-no-consing (funcall f x))))
+(with-test (:name (logtest fixnum :no-consing :bug-1277690))
+  (let ((f (compile nil '(lambda (x) (logtest x most-positive-fixnum)))))
+    (ctu:assert-no-consing (funcall f 1))))
+(with-test (:name (logtest bignum :no-consing))
+  (let ((f (compile nil '(lambda (x) (logtest x 1))))
+        (x (* most-positive-fixnum most-positive-fixnum 3)))
+    (ctu:assert-no-consing (funcall f x))))
+
+(with-test (:name (:randomized :mask-signed-field))
+  (let (result)
+    (dotimes (i 1000)
+      (let* ((ool (compile nil '(lambda (s i) (sb-c::mask-signed-field s i))))
+             (size (random (* sb-vm:n-word-bits 2)))
+             (constant (compile nil `(lambda (i) (sb-c::mask-signed-field ,size i))))
+             (arg (- (random (* most-positive-fixnum 8)) (* most-positive-fixnum 4)))
+             (declared (compile nil `(lambda (i) (declare (type (integer ,(- (abs arg)) ,(abs arg)) i)) (sb-c::mask-signed-field ,size i))))
+             (ool-answer (funcall ool size arg))
+             (constant-answer (funcall constant arg))
+             (declared-answer (funcall declared arg)))
+        (unless (= ool-answer constant-answer declared-answer)
+          (push (list size arg ool-answer constant-answer declared-answer) result))))
+    (assert (null result))))
+
+(with-test (:name :array-dimensions-*)
+  (= (funcall (compile nil `(lambda  (array)
+                              (declare ((or (vector t) (array character)) array))
+                              (array-dimension array 0)))
+              #(1 2 3))
+     3))
+
+(with-test (:name :generate-type-checks-on-dead-blocks)
+  (assert (equalp (funcall (compile nil `(lambda (a b)
+                                          (declare (optimize (safety 3))
+                                                   (type (member vector 42) a))
+                                          (map a 'list (the vector b) #*)))
+                          'vector #())
+                  #())))
+
+(with-test (:name (make-list :large 1))
+  (checked-compile `(lambda ()
+                      (make-list (expt 2 28) :initial-element 0))))
+
+(with-test (:name (make-list :large 2)
+            :skipped-on '(not :64-bit))
+ (checked-compile `(lambda ()
+                     (make-list (expt 2 30) :initial-element 0))))
+
+(with-test (:name :bad-cond)
+  (assert-error
+   (checked-compile
+    '(lambda () (cond (t 10) 20)))))
+
+(with-test (:name :removed-dx-cast)
+  (assert (= (funcall
+              (checked-compile `(lambda ()
+                                  (loop
+                                   (let ((x (the integer (return 0))))
+                                     (declare (dynamic-extent x))
+                                     (unwind-protect x 1))))))
+             0)))
+
+(with-test (:name :isqrt-derivation)
+  (assert (eql (funcall (checked-compile
+                         `(lambda (i)
+                            (isqrt (count (the bit i) #*11101))))
+                        1)
+               2)))
+
+(with-test (:name :vector-zero-initialization)
+  (assert (equalp (funcall (funcall (checked-compile
+                              `(lambda (x b)
+                                 (declare ((eql 0) x)
+                                          (optimize (debug 2)))
+                                 (lambda ()
+                                   (vector x (isqrt b)))))
+                                    0 4))
+                  #(0 2))))
+
+(with-test (:name :cons-zero-initialization)
+  (assert (equalp (funcall (funcall (checked-compile
+                              `(lambda (x b)
+                                 (declare ((eql 0) x)
+                                          (optimize (debug 2)))
+                                 (lambda ()
+                                   (cons x (isqrt b)))))
+                                    0 4))
+                  '(0 . 2))))
+
+(with-test (:name :check-important-result-warning)
+  (multiple-value-bind (fun failure warnings style-warnings)
+      (checked-compile '(lambda (x z)
+                         (declare (notinline nintersection))
+                         (nintersection x z) x)
+                       :allow-style-warnings t)
+    (declare (ignore fun failure warnings))
+    (loop for c in style-warnings
+          do
+          (assert (search "NINTERSECTION"
+                          (princ-to-string c))))))
+
+(with-test (:name :destroyed-constant-warning)
+  (multiple-value-bind (fun failure warnings)
+      (checked-compile '(lambda ()
+                         (declare (notinline nunion))
+                         (nunion '(1 2 3) '(1 2 4)))
+                       :allow-warnings t)
+    (declare (ignore fun failure))
+    (loop for c in warnings
+          do
+          (assert (search "NUNION"
+                          (princ-to-string c))))))
+
+(with-test (:name :%array-data-vector-complex-type-derivation)
+  (let ((type (funcall (checked-compile
+                        `(lambda (x)
+                           (ctu:compiler-derived-type (sb-kernel:%array-data-vector (the array x)))))
+                       #2A())))
+    (assert (eq type 'array))))

@@ -41,7 +41,13 @@
 
 (define-move-fun (load-constant 5) (vop x y)
   ((constant) (descriptor-reg any-reg))
-  (loadw y code-tn (tn-offset x) other-pointer-lowtag))
+  (let ((offset (- (ash (tn-offset x) word-shift) other-pointer-lowtag)))
+    (cond
+      ((typep offset '(signed-byte 11))
+       (inst ldw offset code-tn y))
+      (t
+       (inst li offset lip-tn)
+       (inst ldwx lip-tn code-tn y)))))
 
 (define-move-fun (load-stack 5) (vop x y)
   ((control-stack) (any-reg descriptor-reg))
@@ -88,11 +94,6 @@
 (define-move-vop move :move
   (any-reg descriptor-reg zero null)
   (any-reg descriptor-reg))
-
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type.  This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The MOVE-ARG VOP is used for moving descriptor values into another
 ;;; frame for argument or known value passing.

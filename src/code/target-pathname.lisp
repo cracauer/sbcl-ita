@@ -16,10 +16,6 @@
 ;;; To be initialized in unix/win32-pathname.lisp
 (defvar *physical-host*)
 
-(defun make-host-load-form (host)
-  (declare (ignore host))
-  '*physical-host*)
-
 ;;; Return a value suitable, e.g., for preinitializing
 ;;; *DEFAULT-PATHNAME-DEFAULTS* before *DEFAULT-PATHNAME-DEFAULTS* is
 ;;; initialized (at which time we can't safely call e.g. #'PATHNAME).
@@ -28,7 +24,7 @@
 
 ;;; pathname methods
 
-(def!method print-object ((pathname pathname) stream)
+(defmethod print-object ((pathname pathname) stream)
   (let ((namestring (handler-case (namestring pathname)
                       (error nil))))
     (if namestring
@@ -48,7 +44,7 @@
                   (%pathname-type pathname)
                   (%pathname-version pathname))))))
 
-(def!method make-load-form ((pathname pathname) &optional environment)
+(defmethod make-load-form ((pathname pathname) &optional environment)
   (make-load-form-saving-slots pathname :environment environment))
 
 ;;; A pathname is logical if the host component is a logical host.
@@ -78,10 +74,10 @@
 
 ;;;; patterns
 
-(def!method make-load-form ((pattern pattern) &optional environment)
+(defmethod make-load-form ((pattern pattern) &optional environment)
   (make-load-form-saving-slots pattern :environment environment))
 
-(def!method print-object ((pattern pattern) stream)
+(defmethod print-object ((pattern pattern) stream)
   (print-unreadable-object (pattern stream :type t)
     (if *print-pretty*
         (let ((*print-escape* t))
@@ -798,6 +794,8 @@ a host-structure or string."
            (type (or index null) end)
            (type (or t null) junk-allowed)
            (values (or null pathname) (or null index)))
+  (declare (ftype (function * (values (or null pathname) (or null index)))
+                  %parse-native-namestring))
   (with-host (found-host host)
     (let (;; According to ANSI defaults may be any valid pathname designator
           (defaults (etypecase defaults
@@ -894,6 +892,8 @@ directory."
            (type (or index null) end)
            (type (or t null) junk-allowed)
            (values (or null pathname) (or null index)))
+  (declare (ftype (function * (values (or null pathname) (or null index)))
+                  %parse-native-namestring))
   (with-host (found-host host)
     (let ((defaults (etypecase defaults
                       (pathname
@@ -1336,7 +1336,6 @@ unspecified elements into a completed to-pathname based on the to-wildname."
 ;;; Given a logical host name or host, return a logical host, creating
 ;;; a new one if necessary.
 (defun intern-logical-host (thing)
-  (declare (values logical-host))
   (with-locked-system-table (*logical-hosts*)
     (or (find-logical-host thing nil)
         (let* ((name (logical-word-or-lose thing))

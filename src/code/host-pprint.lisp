@@ -25,13 +25,16 @@
   ;; form (CONS (MEMBER <thing>)). If the type specifier is of this form,
   ;; we put it in this hash table instead of the regular entries table.
   (cons-entries (make-hash-table :test 'eql) :read-only t))
+
+(declaim (freeze-type pprint-dispatch-table))
+
 #+sb-xc
-(def!method print-object ((table pprint-dispatch-table) stream)
+(defmethod print-object ((table pprint-dispatch-table) stream)
   (print-unreadable-object (table stream :type t :identity t)))
 
 ;;; These structures are mutually referential and we want to compile their
 ;;; type-checks efficiently. Essentially the way to do that is define
-;;; each structure during both make-host passes.
+;;; each structure during both make-host passes. This is a KLUDGE.
 
 (sb!xc:deftype posn () 'fixnum)
 

@@ -188,12 +188,6 @@
       (let ((symbol (make-class-symbol class-name)))
         (push (list class-name symbol) *built-in-class-symbols*)
         symbol)))
-
-(defun get-built-in-wrapper-symbol (class-name)
-  (or (cadr (assq class-name *built-in-wrapper-symbols*))
-      (let ((symbol (make-wrapper-symbol class-name)))
-        (push (list class-name symbol) *built-in-wrapper-symbols*)
-        symbol)))
 
 (defvar *standard-method-combination*)
 
@@ -363,12 +357,7 @@
    ;; Used to make DFUN-STATE & FIN-FUNCTION updates atomic.
    (%lock
     :initform (sb-thread:make-mutex :name "GF lock")
-    :reader gf-lock)
-   ;; Set to true by ADD-METHOD, REMOVE-METHOD; to false by
-   ;; MAYBE-UPDATE-INFO-FOR-GF.
-   (info-needs-update
-    :initform nil
-    :accessor gf-info-needs-update))
+    :reader gf-lock))
   (:metaclass funcallable-standard-class)
   (:default-initargs :method-class *the-class-standard-method*
                      :method-combination *standard-method-combination*))
@@ -654,19 +643,6 @@
    (finalized-p
     :initform nil
     :reader class-finalized-p)))
-
-(def!method make-load-form ((class class) &optional env)
-  ;; FIXME: should we not instead pass ENV to FIND-CLASS?  Probably
-  ;; doesn't matter while all our environments are the same...
-  (declare (ignore env))
-  (let ((name (class-name class)))
-    (unless (and name (eq (find-class name nil) class))
-      (error "~@<Can't use anonymous or undefined class as constant: ~S~:@>"
-             class))
-    ;; Essentially we want `(FIND-CLASS ',NAME) but without using backquote.
-    ;; Because this is a delayed DEF!METHOD, its entire body is quoted structure
-    ;; and can't contain a comma object until a MAKE-LOAD-FORM exists for that.
-    (list 'find-class (list 'quote name))))
 
 ;;; The class PCL-CLASS is an implementation-specific common
 ;;; superclass of all specified subclasses of the class CLASS.

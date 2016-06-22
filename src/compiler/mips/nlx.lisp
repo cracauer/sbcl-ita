@@ -1,11 +1,5 @@
 (in-package "SB!VM")
 
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* immediate-arg-scn)
-   env))
-
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 ;;;
@@ -71,9 +65,9 @@
   (:generator 22
     (inst addu block cfp-tn (* (tn-offset tn) n-word-bytes))
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew cfp-tn block unwind-block-current-cont-slot)
-    (storew code-tn block unwind-block-current-code-slot)
+    (storew temp block unwind-block-uwp-slot)
+    (storew cfp-tn block unwind-block-cfp-slot)
+    (storew code-tn block unwind-block-code-slot)
     (inst compute-lra-from-code temp code-tn entry-label ndescr)
     (storew temp block catch-block-entry-pc-slot)))
 
@@ -92,9 +86,9 @@
   (:generator 44
     (inst addu result cfp-tn (* (tn-offset tn) n-word-bytes))
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp result catch-block-current-uwp-slot)
-    (storew cfp-tn result catch-block-current-cont-slot)
-    (storew code-tn result catch-block-current-code-slot)
+    (storew temp result catch-block-uwp-slot)
+    (storew cfp-tn result catch-block-cfp-slot)
+    (storew code-tn result catch-block-code-slot)
     (inst compute-lra-from-code temp code-tn entry-label ndescr)
     (storew temp result catch-block-entry-pc-slot)
 
@@ -132,7 +126,7 @@
   (:translate %unwind-protect-breakup)
   (:generator 17
     (load-symbol-value block *current-unwind-protect-block*)
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-symbol-value block *current-unwind-protect-block*)))
 
 

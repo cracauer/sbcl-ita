@@ -92,7 +92,6 @@ static struct thread_post_mortem * volatile pending_thread_post_mortem = 0;
 
 int dynamic_values_bytes=TLS_SIZE*sizeof(lispobj);  /* same for all threads */
 struct thread *all_threads;
-extern struct interrupt_data * global_interrupt_data;
 
 #ifdef LISP_FEATURE_SB_THREAD
 pthread_mutex_t all_threads_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -141,7 +140,7 @@ thread_state(struct thread *thread)
 {
     lispobj state;
     sigset_t old;
-    block_blockable_signals(NULL, &old);
+    block_blockable_signals(&old);
     os_sem_wait(thread->state_sem, "thread_state");
     state = thread->state;
     os_sem_post(thread->state_sem, "thread_state");
@@ -154,7 +153,7 @@ set_thread_state(struct thread *thread, lispobj state)
 {
     int i, waitcount = 0;
     sigset_t old;
-    block_blockable_signals(NULL, &old);
+    block_blockable_signals(&old);
     os_sem_wait(thread->state_sem, "set_thread_state");
     if (thread->state != state) {
         if ((STATE_STOPPED==state) ||
@@ -182,7 +181,7 @@ wait_for_thread_state_change(struct thread *thread, lispobj state)
 {
     sigset_t old;
     os_sem_t *wait_sem;
-    block_blockable_signals(NULL, &old);
+    block_blockable_signals(&old);
   start:
     os_sem_wait(thread->state_sem, "wait_for_thread_state_change");
     if (thread->state == state) {
@@ -261,7 +260,6 @@ schedule_thread_post_mortem(struct thread *corpse)
 {
     pthread_detach(pthread_self());
     gc_assert(!pthread_attr_destroy(corpse->os_attr));
-    free(corpse->os_attr);
 #if defined(LISP_FEATURE_WIN32)
     os_invalidate_free(corpse->os_address, THREAD_STRUCT_SIZE);
 #else
@@ -305,10 +303,16 @@ perform_thread_post_mortem(struct thread_post_mortem *post_mortem)
 #ifdef CREATE_POST_MORTEM_THREAD
     pthread_detach(pthread_self());
 #endif
+    int result;
     if (post_mortem) {
-        gc_assert(!pthread_join(post_mortem->os_thread, NULL));
-        gc_assert(!pthread_attr_destroy(post_mortem->os_attr));
-        free(post_mortem->os_attr);
+        if ((result = pthread_join(post_mortem->os_thread, NULL))) {
+            lose("Error calling pthread_join in perform_thread_post_mortem:\n%s",
+                 strerror(result));
+        }
+        if ((result = pthread_attr_destroy(post_mortem->os_attr))) {
+            lose("Error calling pthread_attr_destroy in perform_thread_post_mortem:\n%s",
+                 strerror(result));
+        }
         os_invalidate(post_mortem->os_address, THREAD_STRUCT_SIZE);
         free(post_mortem);
     }
@@ -409,7 +413,7 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
      * non-safepoint versions of this code.  Can we unify this more?
      */
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-    block_blockable_signals(0, 0);
+    block_blockable_signals(0);
     gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &th->alloc_region);
 #if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
     gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &th->sprof_alloc_region);
@@ -422,7 +426,7 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
     gc_assert(lock_ret == 0);
 #else
     /* Block GC */
-    block_blockable_signals(0, 0);
+    block_blockable_signals(0);
     set_thread_state(th, STATE_DEAD);
 
     /* SIG_STOP_FOR_GC is blocked and GC might be waiting for this
@@ -439,19 +443,14 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
     gc_assert(lock_ret == 0);
 #endif
 
-    if(th->tls_cookie>=0) arch_os_thread_cleanup(th);
+    arch_os_thread_cleanup(th);
+
 #ifndef LISP_FEATURE_SB_SAFEPOINT
     os_sem_destroy(th->state_sem);
     os_sem_destroy(th->state_not_running_sem);
     os_sem_destroy(th->state_not_stopped_sem);
 #endif
 
-#if defined(LISP_FEATURE_WIN32)
-    free((os_vm_address_t)th->interrupt_data);
-#else
-    os_invalidate((os_vm_address_t)th->interrupt_data,
-                  (sizeof (struct interrupt_data)));
-#endif
 
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     mach_lisp_thread_destroy(th);
@@ -475,8 +474,6 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
 #else
     pthread_setspecific(specials, NULL);
 #endif
-
-    schedule_thread_post_mortem(th);
 }
 
 /* this is the first thing that runs in the child (which is why the
@@ -502,6 +499,8 @@ new_thread_trampoline(struct thread *th)
     result = funcall0(function);
     undo_init_new_thread(th, &scribble);
 
+    schedule_thread_post_mortem(th);
+
     FSHOW((stderr,"/exiting thread %lu\n", thread_self()));
     return result;
 }
@@ -515,7 +514,7 @@ attach_os_thread(init_thread_data *scribble)
     odxprint(misc, "attach_os_thread: attaching to %p", os);
 
     struct thread *th = create_thread_struct(NIL);
-    block_deferrable_signals(0, &scribble->oldset);
+    block_deferrable_signals(&scribble->oldset);
     th->no_tls_value_marker = NO_TLS_VALUE_MARKER_WIDETAG;
     /* We don't actually want a pthread_attr here, but rather than add
      * `if's to the post-mostem, let's just keep that code happy by
@@ -625,22 +624,13 @@ callback_wrapper_trampoline(
 }
 #endif /* LISP_FEATURE_SB_THREAD */
 
-static void
+static void __attribute__((unused))
 free_thread_struct(struct thread *th)
 {
 #if defined(LISP_FEATURE_WIN32)
-    if (th->interrupt_data) {
-        os_invalidate_free((os_vm_address_t) th->interrupt_data,
-                      (sizeof (struct interrupt_data)));
-    }
-    os_invalidate_free((os_vm_address_t) th->os_address,
-                  THREAD_STRUCT_SIZE);
+    os_invalidate_free((os_vm_address_t) th->os_address, THREAD_STRUCT_SIZE);
 #else
-    if (th->interrupt_data)
-        os_invalidate((os_vm_address_t) th->interrupt_data,
-                      (sizeof (struct interrupt_data)));
-    os_invalidate((os_vm_address_t) th->os_address,
-                  THREAD_STRUCT_SIZE);
+    os_invalidate((os_vm_address_t) th->os_address, THREAD_STRUCT_SIZE);
 #endif
 }
 
@@ -717,19 +707,17 @@ create_thread_struct(lispobj initial_function) {
     th->csp_around_foreign_call = csp_page;
 #endif
 
-#ifdef LISP_FEATURE_SB_THREAD
-    /* Contrary to the "allocate all the spaces at once" comment above,
-     * the os_attr is allocated separately.  We cannot put it into the
-     * nonpointer data, because it's used for post_mortem and freed
-     * separately */
-    th->os_attr=malloc(sizeof(pthread_attr_t));
-# ifndef LISP_FEATURE_SB_SAFEPOINT
     struct nonpointer_thread_data *nonpointer_data
       = (void *) &per_thread->dynamic_values[TLS_SIZE];
 
-    th->state_sem=&nonpointer_data->state_sem;
-    th->state_not_running_sem=&nonpointer_data->state_not_running_sem;
-    th->state_not_stopped_sem=&nonpointer_data->state_not_stopped_sem;
+    th->interrupt_data = &nonpointer_data->interrupt_data;
+
+#ifdef LISP_FEATURE_SB_THREAD
+    th->os_attr = &nonpointer_data->os_attr;
+# ifndef LISP_FEATURE_SB_SAFEPOINT
+    th->state_sem = &nonpointer_data->state_sem;
+    th->state_not_running_sem = &nonpointer_data->state_not_running_sem;
+    th->state_not_stopped_sem = &nonpointer_data->state_not_stopped_sem;
     os_sem_init(th->state_sem, 1);
     os_sem_init(th->state_not_running_sem, 0);
     os_sem_init(th->state_not_stopped_sem, 0);
@@ -748,7 +736,7 @@ create_thread_struct(lispobj initial_function) {
 
 #ifdef LISP_FEATURE_SB_THREAD
     th->pseudo_atomic_bits=0;
-#else
+#elif defined LISP_FEATURE_GENCGC
     clear_pseudo_atomic_atomic(th);
     clear_pseudo_atomic_interrupted(th);
 #endif
@@ -810,17 +798,6 @@ create_thread_struct(lispobj initial_function) {
     access_control_stack_pointer(th)=th->control_stack_start;
 #endif
 
-#if defined(LISP_FEATURE_WIN32)
-    th->interrupt_data = (struct interrupt_data *)
-        calloc((sizeof (struct interrupt_data)),1);
-#else
-    th->interrupt_data = (struct interrupt_data *)
-        os_validate(0,(sizeof (struct interrupt_data)));
-#endif
-    if (!th->interrupt_data) {
-        free_thread_struct(th);
-        return 0;
-    }
     th->interrupt_data->pending_handler = 0;
     th->interrupt_data->gc_blocked_deferrables = 0;
 #ifdef GENCGC_IS_PRECISE
@@ -869,7 +846,7 @@ boolean create_os_thread(struct thread *th,os_thread_t *kid_tid)
     /* Blocking deferrable signals is enough, no need to block
      * SIG_STOP_FOR_GC because the child process is not linked onto
      * all_threads until it's ready. */
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 
 #ifdef LOCK_CREATE_THREAD
     retcode = pthread_mutex_lock(&create_thread_lock);
@@ -1103,7 +1080,7 @@ kill_safely(os_thread_t os_thread, int signal)
 
         /* pthread_kill is not async signal safe and we don't want to be
          * interrupted while holding the lock. */
-        block_deferrable_signals(0, &oldset);
+        block_deferrable_signals(&oldset);
         pthread_mutex_lock(&all_threads_lock);
         for (thread = all_threads; thread; thread = thread->next) {
             if (thread->os_thread == os_thread) {

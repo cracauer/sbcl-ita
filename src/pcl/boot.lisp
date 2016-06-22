@@ -309,10 +309,12 @@ generic function lambda list ~S~:>"
       (verify-each-atom-or-singleton '&key keys))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; Kill the existing definition of DEFMETHOD which expands to DEF!METHOD.
-  ;; It's there mainly so that DEFSTRUCT's printer options can expand
-  ;; to DEFMETHOD instead of a DEF!METHOD.
   (fmakunbound 'defmethod))
+;;; As per CLHS -
+;;; "defmethod is not required to perform any compile-time side effects."
+;;; and we don't do much other than to make the function be defined,
+;;; which means that checking of callers' arglists can only occur after called
+;;; methods are actually loaded.
 (defmacro defmethod (name &rest args)
   (multiple-value-bind (qualifiers lambda-list body)
       (parse-defmethod args)
@@ -1708,7 +1710,9 @@ generic function lambda list ~S~:>"
 (defun generic-clobbers-function (fun-name)
   (cerror "Replace the function binding"
           'simple-program-error
-          :format-control "~S already names an ordinary function or a macro."
+          :format-control "~@<~/sb-impl:print-symbol-with-prefix/ ~
+                           already names an ordinary function or a ~
+                           macro.~@:>"
           :format-arguments (list fun-name)))
 
 (defvar *sgf-wrapper*

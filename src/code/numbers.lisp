@@ -616,9 +616,12 @@
     (number-dispatch ((number real) (divisor real))
       ((fixnum fixnum) (truncate number divisor))
       (((foreach fixnum bignum) ratio)
-       (let ((q (truncate (* number (denominator divisor))
-                          (numerator divisor))))
-         (values q (- number (* q divisor)))))
+       (if (= (numerator divisor) 1)
+           (values (* number (denominator divisor)) 0)
+           (multiple-value-bind (quot rem)
+               (truncate (* number (denominator divisor))
+                         (numerator divisor))
+             (values quot (/ rem (denominator divisor))))))
       ((fixnum bignum)
        (bignum-truncate (make-small-bignum number) divisor))
       ((ratio (or float rational))
@@ -650,13 +653,8 @@
         (foreach single-float double-float #!+long-float long-float))
        (truncate-float (dispatch-type divisor))))))
 
-;; Only inline when no VOP exists
-#!-multiply-high-vops (declaim (inline %multiply-high))
 (defun %multiply-high (x y)
   (declare (type word x y))
-  #!-multiply-high-vops
-  (values (sb!bignum:%multiply x y))
-  #!+multiply-high-vops
   (%multiply-high x y))
 
 (defun floor (number &optional (divisor 1))
@@ -1034,7 +1032,7 @@ the first."
        #!+sb-doc "Complement the logical AND of INTEGER1 and INTEGER2.")
   (def lognor t lognor
        (lambda (x y) (lognot (bignum-logical-ior x y)))
-       #!+sb-doc "Complement the logical AND of INTEGER1 and INTEGER2.")
+       #!+sb-doc "Complement the logical OR of INTEGER1 and INTEGER2.")
   ;; ... but BIGNUM-LOGICAL-NOT on a bignum will always return a bignum
   (def logandc1 t logandc1
        (lambda (x y) (bignum-logical-and (bignum-logical-not x) y))
@@ -1164,8 +1162,14 @@ and the number of 0 bits if INTEGER is negative."
 
 (defun %ldb (size posn integer)
   (declare (type bit-index size posn) (explicit-check))
-  (logand (ash integer (- posn))
-          (1- (ash 1 size))))
+  ;; The naive algorithm is horrible in the general case.
+  ;; Consider (LDB (BYTE 1 2) (SOME-GIANT-BIGNUM)) which has to shift the
+  ;; input rightward 2 bits, consing a new bignum just to read 1 bit.
+  (if (and (<= 0 size sb!vm:n-positive-fixnum-bits)
+           (typep integer 'bignum))
+      (sb!bignum::ldb-bignum=>fixnum size posn integer)
+      (logand (ash integer (- posn))
+              (1- (ash 1 size)))))
 
 (defun %mask-field (size posn integer)
   (declare (type bit-index size posn) (explicit-check))
@@ -1187,13 +1191,27 @@ and the number of 0 bits if INTEGER is negative."
   #!+sb-doc
   "Extract SIZE lower bits from INTEGER, considering them as a
 2-complement SIZE-bits representation of a signed integer."
-  (cond ((zerop size)
-         0)
-        ((logbitp (1- size) integer)
-         (dpb integer (byte size 0) -1))
-        (t
-         (ldb (byte size 0) integer))))
-
+  (macrolet ((msf (size integer)
+               `(if (logbitp (1- ,size) ,integer)
+                    (dpb ,integer (byte (1- ,size) 0) -1)
+                    (ldb (byte (1- ,size) 0) ,integer))))
+    (typecase size
+      ((eql 0) 0)
+      ((integer 1 #.sb!vm:n-fixnum-bits)
+       (number-dispatch ((integer integer))
+         ((fixnum) (msf size integer))
+         ((bignum) (let ((fix (sb!c::mask-signed-field #.sb!vm:n-fixnum-bits (%bignum-ref integer 0))))
+                     (if (= size #.sb!vm:n-fixnum-bits)
+                         fix
+                         (msf size fix))))))
+      ((integer (#.sb!vm:n-fixnum-bits) #.sb!vm:n-word-bits)
+       (number-dispatch ((integer integer))
+         ((fixnum) integer)
+         ((bignum) (let ((word (sb!c::mask-signed-field #.sb!vm:n-word-bits (%bignum-ref integer 0))))
+                     (if (= size #.sb!vm:n-word-bits)
+                         word
+                         (msf size word))))))
+      ((unsigned-byte) (msf size integer)))))
 
 ;;;; BOOLE
 
@@ -1519,13 +1537,13 @@ and the number of 0 bits if INTEGER is negative."
 ;;; arithmetic, as that is only (currently) defined for constant
 ;;; shifts.  See also the comment in (LOGAND OPTIMIZER) for more
 ;;; discussion of this hack.  -- CSR, 2003-10-09
-#!-64-bit
+#!-64-bit-registers
 (defun sb!vm::ash-left-mod32 (integer amount)
   (etypecase integer
     ((unsigned-byte 32) (ldb (byte 32 0) (ash integer amount)))
     (fixnum (ldb (byte 32 0) (ash (logand integer #xffffffff) amount)))
     (bignum (ldb (byte 32 0) (ash (logand integer #xffffffff) amount)))))
-#!+64-bit
+#!+64-bit-registers
 (defun sb!vm::ash-left-mod64 (integer amount)
   (etypecase integer
     ((unsigned-byte 64) (ldb (byte 64 0) (ash integer amount)))

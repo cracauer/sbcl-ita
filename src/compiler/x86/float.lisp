@@ -2068,9 +2068,9 @@
 (defknown ((setf floating-point-modes)) (float-modes)
   float-modes)
 
-(def!constant npx-env-size (* 7 n-word-bytes))
-(def!constant npx-cw-offset 0)
-(def!constant npx-sw-offset 4)
+(defconstant npx-env-size (* 7 n-word-bytes))
+(defconstant npx-cw-offset 0)
+(defconstant npx-sw-offset 4)
 
 (define-vop (floating-point-modes)
   (:results (res :scs (unsigned-reg)))
@@ -2647,10 +2647,11 @@
 
 (define-vop (fscalen)
   (:translate %scalbn)
-  (:args (x :scs (double-reg double-stack descriptor-reg) :target fr0)
+  (:args (x :scs (double-reg double-stack descriptor-reg)
+            :to (:argument 2) :target fr0)
          (y :scs (signed-stack signed-reg) :target temp))
   (:temporary (:sc double-reg :offset fr0-offset
-                   :from (:argument 0) :to :result) fr0)
+               :from (:argument 2) :to :result) fr0)
   (:temporary (:sc double-reg :offset fr1-offset :from :eval :to :result) fr1)
   (:temporary (:sc signed-stack :from (:argument 1) :to :result) temp)
   (:results (r :scs (double-reg)))

@@ -113,7 +113,7 @@
        (lambda-whole (if whole (car whole) (make-symbol "FORM")))
        (lambda-env (if env (car env) (make-symbol "ENV")))
        (new-ll (if (or whole env) ; strip them out if present
-                   (make-lambda-list llks whole req opt rest keys aux)
+                   (make-lambda-list llks nil req opt rest keys aux)
                    lambda-list)) ; otherwise use the original list
        (args (make-symbol "ARGS")))
     `(setf (info :function :source-transform ',fun-name)
@@ -130,153 +130,6 @@
                        ,@inner-decls ,@forms)
                    (values call pass))
                  (values nil t))))))
-
-;;;; boolean attribute utilities
-;;;;
-;;;; We need to maintain various sets of boolean attributes for known
-;;;; functions and VOPs. To save space and allow for quick set
-;;;; operations, we represent the attributes as bits in a fixnum.
-
-(deftype attributes () 'fixnum)
-
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
-;;; Given a list of attribute names and an alist that translates them
-;;; to masks, return the OR of the masks.
-(defun compute-attribute-mask (names alist)
-  (collect ((res 0 logior))
-    (dolist (name names)
-      (let ((mask (cdr (assoc name alist))))
-        (unless mask
-          (error "unknown attribute name: ~S" name))
-        (res mask)))
-    (res)))
-
-) ; EVAL-WHEN
-
-;;; Define a new class of boolean attributes, with the attributes
-;;; having the specified ATTRIBUTE-NAMES. NAME is the name of the
-;;; class, which is used to generate some macros to manipulate sets of
-;;; the attributes:
-;;;
-;;;    NAME-attributep attributes attribute-name*
-;;;      Return true if one of the named attributes is present, false
-;;;      otherwise. When set with SETF, updates the place Attributes
-;;;      setting or clearing the specified attributes.
-;;;
-;;;    NAME-attributes attribute-name*
-;;;      Return a set of the named attributes.
-#-sb-xc
-(progn
-  (def!macro !def-boolean-attribute (name &rest attribute-names)
-
-    (let ((translations-name (symbolicate "*" name "-ATTRIBUTE-TRANSLATIONS*"))
-          (test-name (symbolicate name "-ATTRIBUTEP"))
-          (decoder-name (symbolicate "DECODE-" name "-ATTRIBUTES")))
-      (collect ((alist))
-        (do ((mask 1 (ash mask 1))
-             (names attribute-names (cdr names)))
-            ((null names))
-          (alist (cons (car names) mask)))
-        `(progn
-           (eval-when (:compile-toplevel :load-toplevel :execute)
-             (defparameter ,translations-name ',(alist)))
-           (defmacro ,(symbolicate name "-ATTRIBUTES") (&rest attribute-names)
-             #!+sb-doc
-             "Automagically generated boolean attribute creation function.
-  See !DEF-BOOLEAN-ATTRIBUTE."
-             (compute-attribute-mask attribute-names ,translations-name))
-           (defmacro ,test-name (attributes &rest attribute-names)
-             #!+sb-doc
-             "Automagically generated boolean attribute test function.
-  See !DEF-BOOLEAN-ATTRIBUTE."
-             `(logtest ,(compute-attribute-mask attribute-names
-                                                ,translations-name)
-                       (the attributes ,attributes)))
-           ;; This definition transforms strangely under UNCROSS, in a
-           ;; way that DEF!MACRO doesn't understand, so we delegate it
-           ;; to a submacro then define the submacro differently when
-           ;; building the xc and when building the target compiler.
-           (!def-boolean-attribute-setter ,test-name
-                                          ,translations-name
-                                          ,@attribute-names)
-           (defun ,decoder-name (attributes)
-             (loop for (name . mask) in ,translations-name
-                   when (logtest mask attributes)
-                     collect name))))))
-
-  ;; It seems to be difficult to express in DEF!MACRO machinery what
-  ;; to do with target-vs-host GET-SETF-EXPANSION in here, so we just
-  ;; hack it by hand, passing a different GET-SETF-EXPANSION-FUN-NAME
-  ;; in the host DEFMACRO and target DEFMACRO-MUNDANELY cases.
-  (defun guts-of-!def-boolean-attribute-setter (test-name
-                                                translations-name
-                                                attribute-names
-                                                get-setf-expansion-fun-name)
-    (declare (ignore attribute-names))
-    `(define-setf-expander ,test-name (place &rest attributes
-                                             &environment env)
-       #!+sb-doc
-       "Automagically generated boolean attribute setter. See
- !DEF-BOOLEAN-ATTRIBUTE."
-       #-sb-xc-host (declare (type lexenv env))
-       ;; FIXME: It would be better if &ENVIRONMENT arguments were
-       ;; automatically declared to have type LEXENV by the
-       ;; hairy-argument-handling code.
-       (multiple-value-bind (temps values stores set get)
-           (,get-setf-expansion-fun-name place env)
-         (when (cdr stores)
-           (error "multiple store variables for ~S" place))
-         (let ((newval (sb!xc:gensym))
-               (n-place (sb!xc:gensym))
-               (mask (compute-attribute-mask attributes ,translations-name)))
-           (values `(,@temps ,n-place)
-                   `(,@values ,get)
-                   `(,newval)
-                   `(let ((,(first stores)
-                           (if ,newval
-                               (logior ,n-place ,mask)
-                               (logand ,n-place ,(lognot mask)))))
-                      ,set
-                      ,newval)
-                   `(,',test-name ,n-place ,@attributes))))))
-  ;; We define the host version here, and the just-like-it-but-different
-  ;; target version later, after DEFMACRO-MUNDANELY has been defined.
-  (defmacro !def-boolean-attribute-setter (test-name
-                                           translations-name
-                                           &rest attribute-names)
-    (guts-of-!def-boolean-attribute-setter test-name
-                                           translations-name
-                                           attribute-names
-                                           'get-setf-expansion)))
-
-;;; Otherwise the source locations for DEFTRANSFORM, DEFKNOWN, &c
-;;; would be off by one toplevel form as their source locations are
-;;; determined before cross-compiling where the above PROGN is not
-;;; seen.
-#+sb-xc (progn)
-
-;;; And now for some gratuitous pseudo-abstraction...
-;;;
-;;; ATTRIBUTES-UNION
-;;;   Return the union of all the sets of boolean attributes which are its
-;;;   arguments.
-;;; ATTRIBUTES-INTERSECTION
-;;;   Return the intersection of all the sets of boolean attributes which
-;;;   are its arguments.
-;;; ATTRIBUTES
-;;;   True if the attributes present in ATTR1 are identical to
-;;;   those in ATTR2.
-(defmacro attributes-union (&rest attributes)
-  `(the attributes
-        (logior ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
-(defmacro attributes-intersection (&rest attributes)
-  `(the attributes
-        (logand ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
-(declaim (ftype (function (attributes attributes) boolean) attributes=))
-#!-sb-fluid (declaim (inline attributes=))
-(defun attributes= (attr1 attr2)
-  (eql attr1 attr2))
 
 ;;;; lambda-list parsing utilities
 ;;;;
@@ -431,37 +284,60 @@
           (parse-deftransform lambda-list n-node
                               '(give-up-ir1-transform))
         (let ((stuff
-               `((,n-node &aux ,@bindings
-                               ,@(when result
-                                   `((,result (node-lvar ,n-node)))))
-                 (declare (ignorable ,@(mapcar #'car bindings)))
-                 (declare (lambda-list (node)))
-                 ,@decls
-                 ,@(if policy
-                      `((unless (policy ,n-node ,policy)
-                          (give-up-ir1-transform))))
-                 ;; What purpose does it serve to allow the transform's body
-                 ;; to return decls as a second value? They would go in the
-                 ;; right place if simply returned as part of the expression.
-                 (multiple-value-bind (,n-lambda ,n-decls)
-                       (progn ,@body)
-                     (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
-                         ,n-lambda
-                       `(lambda ,',lambda-list
-                          (declare (ignorable ,@',vars))
-                          ,@,n-decls
-                          ,,n-lambda))))))
+                `((,n-node &aux ,@bindings
+                           ,@(when result
+                               `((,result (node-lvar ,n-node)))))
+                  (declare (ignorable ,@(mapcar #'car bindings)))
+                  (declare (lambda-list (node)))
+                  ,@decls
+                  ,@(and defun-only
+                         doc
+                         `(,doc))
+                  ,@(if policy
+                        `((unless (policy ,n-node ,policy)
+                            (give-up-ir1-transform))))
+                  ;; What purpose does it serve to allow the transform's body
+                  ;; to return decls as a second value? They would go in the
+                  ;; right place if simply returned as part of the expression.
+                  (multiple-value-bind (,n-lambda ,n-decls)
+                      (progn ,@body)
+                    (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
+                        ,n-lambda
+                        `(lambda ,',lambda-list
+                           (declare (ignorable ,@',vars))
+                           ,@,n-decls
+                           ,,n-lambda))))))
           (if defun-only
-              `(defun ,name ,@(when doc `(,doc)) ,@stuff)
+              `(defun ,name ,@stuff)
               `(%deftransform
                 ,(if eval-name name `',name)
                 ,(if eval-name
                      ``(function ,,arg-types ,,result-type)
                      `'(function ,arg-types ,result-type))
                 (named-lambda ,(if eval-name "xform" `(deftransform ,name))
-                              ,@stuff)
+                  ,@stuff)
                 ,doc
                 ,important)))))))
+
+(defmacro deftransforms (names (lambda-list &optional (arg-types '*)
+                                                      (result-type '*)
+                                &key result policy node (important :slightly))
+                         &body body-decls-doc)
+
+  (let ((transform-name (symbolicate (car names) '-transform))
+        (type (list 'function arg-types result-type))
+        (doc (nth-value 2 (parse-body body-decls-doc t))))
+    `(progn
+       (deftransform ,transform-name
+           (,lambda-list ,arg-types ,result-type
+            :defun-only t
+            :result ,result :policy ,policy :node ,node)
+         ,@body-decls-doc)
+       ,@(loop for name in names
+               collect
+               `(%deftransform ',name ',type #',transform-name
+                               ,doc
+                               ,important)))))
 
 ;;;; DEFKNOWN and DEFOPTIMIZER
 
@@ -494,18 +370,105 @@
     (error "function cannot have both good and bad attributes: ~S" attributes))
 
   (when (member 'any attributes)
-    (setq attributes (union '(call unwind) attributes)))
+    (setq attributes (union '(unwind) attributes)))
   (when (member 'flushable attributes)
     (pushnew 'unsafely-flushable attributes))
+  (multiple-value-bind (foldable-call callable arg-types)
+      (make-foldable-call-check arg-types attributes)
+    `(%defknown ',(if (and (consp name)
+                           (not (legal-fun-name-p name)))
+                      name
+                      (list name))
+                '(sfunction ,arg-types ,result-type)
+                (ir1-attributes ,@attributes)
+                (source-location)
+                :foldable-call-check ,foldable-call
+                :callable-check ,callable
+                ,@keys)))
 
-  `(%defknown ',(if (and (consp name)
-                         (not (legal-fun-name-p name)))
-                    name
-                    (list name))
-              '(sfunction ,arg-types ,result-type)
-              (ir1-attributes ,@attributes)
-              (source-location)
-              ,@keys))
+(defun make-foldable-call-check (arg-types attributes)
+  (let ((call (member 'call attributes))
+        (fold (member 'foldable attributes)))
+    (if (not call)
+        (values nil nil arg-types)
+        (multiple-value-bind (llks required optional rest keys)
+            (parse-lambda-list
+             arg-types
+             :context :function-type
+             :accept (lambda-list-keyword-mask
+                      '(&optional &rest &key &allow-other-keys))
+             :silent t)
+          (let (vars
+                call-vars
+                arg-count-specified)
+            (labels ((callable-p (x)
+                     (member x '(callable function)))
+                   (process-var (x &optional (name (gensym)))
+                     (if (callable-p (if (consp x)
+                                         (car x)
+                                         x))
+                         (push (cons name
+                                     (cond ((consp x)
+                                            (setf arg-count-specified t)
+                                            (cadr x))))
+                               call-vars)
+                         (push name vars))
+                     name)
+                   (process-type (type)
+                     (if (and (consp type)
+                              (callable-p (car type)))
+                         (car type)
+                         type))
+                   (callable-rest-p (x)
+                     (and (consp x)
+                          (callable-p (car x))
+                          (eql (cadr x) '&rest))))
+              (let* (rest-var
+                     (lambda-list
+                       (cond ((find-if #'callable-rest-p required)
+                              (setf rest-var (gensym))
+                              `(,@(loop for var in required
+                                       collect (process-var var)
+                                       until (callable-rest-p var))
+                                &rest ,rest-var))
+                             (t
+                              `(,@(mapcar #'process-var required)
+                                ,@(and optional
+                                       `(&optional ,@(mapcar #'process-var optional)))
+                                ,@(and rest
+                                       `(&rest ,@(mapcar #'process-var rest)))
+                                ,@(and (ll-kwds-keyp llks)
+                                       `(&key ,@(loop for (key type) in keys
+                                                      for var = (gensym)
+                                                      do (process-var type var)
+                                                      collect `((,key ,var))))))))))
+
+                (assert call-vars)
+                (values
+                 (and fold
+                      `(lambda ,lambda-list
+                         (declare (ignore ,@vars))
+                         (and ,@(loop for (x) in call-vars
+                                      collect `(constant-fold-arg-p ,x)))))
+                 (and arg-count-specified
+                      `(lambda ,lambda-list
+                         (declare (ignore ,@vars))
+                         ,@(loop for (x . arg-count) in call-vars
+                                 when arg-count
+                                 collect (if (eq arg-count '&rest)
+                                             `(valid-callable-argument ,x (length ,rest-var))
+                                             `(valid-callable-argument ,x ,arg-count)))))
+                 `(,@(mapcar #'process-type required)
+                   ,@(and optional
+                          `(&optional ,@(mapcar #'process-type optional)))
+                   ,@(and (ll-kwds-restp llks)
+                          `(&rest ,@rest))
+                   ,@(and (ll-kwds-keyp llks)
+                          `(&key
+                            ,@(loop for (key type) in keys
+                                    collect `(,key ,(process-type type)))))
+                   ,@(and (ll-kwds-allowp llks)
+                          '(&allow-other-keys)))))))))))
 
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
@@ -923,21 +886,9 @@
     (when (funcall test (funcall key current) element)
       (return i))))
 
-
-;;; KLUDGE: This is expanded out twice, by cut-and-paste, in a
-;;;   (DEF!MACRO FOO (..) .. CL:GET-SETF-EXPANSION ..)
-;;;   #+SB-XC-HOST
-;;;   (SB!XC:DEFMACRO FOO (..) .. SB!XC:GET-SETF-EXPANSION ..)
-;;; arrangement, in order to get it to work in cross-compilation. This
-;;; duplication should be removed, perhaps by rewriting the macro in a more
-;;; cross-compiler-friendly way, or perhaps just by using some (MACROLET ((FROB
-;;; ..)) .. FROB .. FROB) form, or perhaps by completely eliminating this macro
-;;; and its partner PUSH-IN, but I don't want to do it now, because the system
-;;; isn't running yet, so it'd be too hard to check that my changes were
-;;; correct -- WHN 19990806
-(def!macro deletef-in (next place item &environment env)
+(defmacro deletef-in (next place item &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (get-setf-expansion place env)
+      (#+sb-xc sb!xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     (let ((n-item (gensym))
@@ -957,25 +908,13 @@
                   (setf (,next ,n-prev)
                         (,next ,n-current)))))
          (values)))))
-;;; #+SB-XC-HOST SB!XC:DEFMACRO version is in late-macros.lisp. -- WHN 19990806
 
 ;;; Push ITEM onto a list linked by the accessor function NEXT that is
 ;;; stored in PLACE.
 ;;;
-;;; KLUDGE: This is expanded out twice, by cut-and-paste, in a
-;;;   (DEF!MACRO FOO (..) .. CL:GET-SETF-EXPANSION ..)
-;;;   #+SB-XC-HOST
-;;;   (SB!XC:DEFMACRO FOO (..) .. SB!XC:GET-SETF-EXPANSION ..)
-;;; arrangement, in order to get it to work in cross-compilation. This
-;;; duplication should be removed, perhaps by rewriting the macro in a more
-;;; cross-compiler-friendly way, or perhaps just by using some (MACROLET ((FROB
-;;; ..)) .. FROB .. FROB) form, or perhaps by completely eliminating this macro
-;;; and its partner DELETEF-IN, but I don't want to do it now, because the
-;;; system isn't running yet, so it'd be too hard to check that my changes were
-;;; correct -- WHN 19990806
-(def!macro push-in (next item place &environment env)
+(defmacro push-in (next item place &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (get-setf-expansion place env)
+      (#+sb-xc sb!xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     `(let (,@(mapcar #'list temps vals)
@@ -983,7 +922,6 @@
        (setf (,next ,(first stores)) ,access)
        ,store
        (values))))
-;;; #+SB-XC-HOST SB!XC:DEFMACRO version is in late-macros.lisp. -- WHN 19990806
 
 (defmacro position-or-lose (&rest args)
   `(or (position ,@args)

@@ -240,8 +240,8 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;; Make some random tns for important registers.
 (macrolet ((defregtn (name sc)
@@ -307,11 +307,18 @@
   (or (eql sc (sc-number-or-lose 'zero))
       (eql sc (sc-number-or-lose 'null))
       (eql sc (sc-number-or-lose 'immediate))))
+
+;;; A predicate to see if a character can be used as an inline
+;;; constant (the immediate field in the instruction used is eight
+;;; bits wide, which is not the same as any defined subtype of
+;;; CHARACTER, as BASE-CHAR is seven bits wide).
+(defun inlinable-character-constant-p (char)
+  (and (characterp char)
+       (< (char-code char) #x100)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
 (def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
 (def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 

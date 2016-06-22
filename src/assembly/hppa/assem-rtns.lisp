@@ -131,23 +131,23 @@
   (declare (ignore start count))
 
 
-  (let ((error (generate-error-code nil invalid-unwind-error)))
+  (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst bc := nil block zero-tn error))
 
   (load-symbol-value cur-uwp *current-unwind-protect-block*)
-  (loadw target-uwp block unwind-block-current-uwp-slot)
+  (loadw target-uwp block unwind-block-uwp-slot)
   (inst bc :<> nil cur-uwp target-uwp DO-UWP)
 
   (move block cur-uwp)
 
   DO-EXIT
-  (loadw cfp-tn cur-uwp unwind-block-current-cont-slot)
-  (loadw code-tn cur-uwp unwind-block-current-code-slot)
+  (loadw cfp-tn cur-uwp unwind-block-cfp-slot)
+  (loadw code-tn cur-uwp unwind-block-code-slot)
   (loadw lra cur-uwp unwind-block-entry-pc-slot)
   (lisp-return lra :frob-code nil)
 
   DO-UWP
-  (loadw next-uwp cur-uwp unwind-block-current-uwp-slot)
+  (loadw next-uwp cur-uwp unwind-block-uwp-slot)
   (inst b DO-EXIT)
   (store-symbol-value next-uwp *current-unwind-protect-block*))
 
@@ -165,7 +165,7 @@
   (load-symbol-value catch *current-catch-block*)
 
   LOOP
-  (let ((error (generate-error-code nil unseen-throw-tag-error target)))
+  (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
     (inst bc := nil catch zero-tn error))
   (loadw tag catch catch-block-tag-slot)
   (inst comb := tag target EXIT :nullify t)
@@ -197,18 +197,28 @@
         nl0 lip)
   (inst bv lip :nullify t))
 
+#+sb-assembling ;; No VOP for this one
 (define-assembly-routine
-  (funcallable-instance-tramp (:return-style :none))
+    (funcallable-instance-tramp-header
+     (:return-style :none)
+     (:align n-lowtag-bits)
+     (:export (funcallable-instance-tramp
+               (+ funcallable-instance-tramp-header
+                  fun-pointer-lowtag))))
   nil
-  (inst nop)
-  (inst nop)
-  (inst nop)
-  (inst nop)
-  (inst nop)
-  (inst ldw 3 lexenv-tn lexenv-tn)
-  (inst ldw (- (* closure-fun-slot n-word-bytes)
-                  fun-pointer-lowtag)
-            lexenv-tn code-tn)
+  (inst word simple-fun-header-widetag) ;;header
+  (inst word (make-fixup 'funcallable-instance-tramp :assembly-routine)) ;; self
+  (inst word nil-value) ;; next
+  (inst word nil-value) ;; name
+  (inst word nil-value) ;; arglist
+  (inst word nil-value) ;; type
+  (inst word nil-value) ;; info
+  (loadw lexenv-tn lexenv-tn
+         funcallable-instance-function-slot
+         fun-pointer-lowtag)
+  (loadw code-tn lexenv-tn
+         closure-fun-slot
+         fun-pointer-lowtag)
   (inst addi (- (* simple-fun-code-offset n-word-bytes)
                 fun-pointer-lowtag) code-tn lip-tn)
   (inst bv lip-tn :nullify t))
