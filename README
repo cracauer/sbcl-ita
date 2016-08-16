@@ -1,9 +1,14 @@
 Attention.  This is a SBCL tree with ITA software's changes applied.
-See README_ita
+See https://github.com/cracauer/sbcl-ita/blob/ita/README_ita
+
+Repository:
 https://github.com/cracauer/sbcl-ita/tree/ita
+
 Documentation of changes is in the commit messages
 https://github.com/cracauer/sbcl-ita/commits/ita
+(or use `git log`)
 
+%% original README follows %%%
 
 GENERAL INFORMATION
 
