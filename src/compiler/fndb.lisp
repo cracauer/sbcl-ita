@@ -487,19 +487,19 @@
 (defknown elt (sequence index) t (foldable unsafely-flushable))
 
 (defknown subseq (sequence index &optional sequence-end) consed-sequence
-  (flushable)
-  :derive-type (sequence-result-nth-arg 1))
+  (flushable))
 
 (defknown copy-seq (sequence) consed-sequence (flushable)
-  :derive-type (sequence-result-nth-arg 1))
+  :derive-type (sequence-result-nth-arg 1 :preserve-dimensions t))
 
 (defknown length (sequence) index (foldable flushable dx-safe))
 
 (defknown reverse (sequence) consed-sequence (flushable)
-  :derive-type (sequence-result-nth-arg 1))
+  :derive-type (sequence-result-nth-arg 1 :preserve-dimensions t))
 
 (defknown nreverse (sequence) sequence (important-result)
-  :derive-type #'result-type-first-arg
+  :derive-type (sequence-result-nth-arg 1 :preserve-dimensions t
+                                          :preserve-vector-type t)
   :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
 
 (defknown make-sequence (type-specifier index
@@ -669,30 +669,26 @@
 (defknown position (t sequence &rest t &key (:test (callable 2))
                     (:test-not (callable 2)) (:start index) (:from-end t)
                     (:end sequence-end) (:key (callable 1)))
-  (or index null)
-  (foldable flushable call)
-  :derive-type #'position-derive-type)
+  (or (mod #.(1- sb!xc:array-dimension-limit)) null)
+  (foldable flushable call))
 
 (defknown (position-if position-if-not)
   ((callable 1) sequence &rest t &key (:from-end t) (:start index)
    (:end sequence-end) (:key (callable 1)))
-  (or index null)
-  (foldable flushable call)
-  :derive-type #'position-derive-type)
+  (or (mod #.(1- sb!xc:array-dimension-limit)) null)
+  (foldable flushable call))
 
 (defknown count (t sequence &rest t &key
                    (:test (callable 2)) (:test-not (callable 2)) (:start index)
                    (:from-end t) (:end sequence-end) (:key (callable 1)))
   index
-  (foldable flushable call)
-  :derive-type #'count-derive-type)
+  (foldable flushable call))
 
 (defknown (count-if count-if-not)
   ((callable 1) sequence &rest t &key
    (:from-end t) (:start index) (:end sequence-end) (:key (callable 1)))
   index
-  (foldable flushable call)
-  :derive-type #'count-derive-type)
+  (foldable flushable call))
 
 (defknown (mismatch search)
   (sequence sequence &rest t &key (:from-end t) (:test (callable 2))
@@ -705,7 +701,7 @@
 (defknown (stable-sort sort) (sequence (callable 2) &rest t &key (:key (callable 1)))
   sequence
   (call)
-  :derive-type (sequence-result-nth-arg 1)
+  :derive-type #'result-type-first-arg
   :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
 (defknown sb!impl::stable-sort-list (list function function) list
   (call important-result)
@@ -945,11 +941,31 @@
                        (:displaced-index-offset index))
     array (flushable))
 
-(defknown sb!impl::fill-data-vector (vector list sequence) t ())
+(defknown fill-data-vector (vector list sequence) t ())
+
+;; INITIAL-CONTENTS is the first argument to FILL-ARRAY because
+;; of the possibility of source-transforming it for various recognized
+;; contents after the source-transform for MAKE-ARRAY has run.
+;; The original MAKE-ARRAY call might resemble either of:
+;;   (MAKE-ARRAY DIMS :ELEMENT-TYPE (F) :INITIAL-CONTENTS (G))
+;;   (MAKE-ARRAY DIMS :INITIAL-CONTENTS (F) :ELEMENT-TYPE (G))
+;; and in general we must bind temporaries to preserve left-to-right
+;; evaluation of F and G if they have side effects.
+;; Now ideally :ELEMENT-TYPE will be a constant, so it doesn't matter
+;; if it moves. But if INITIAL-CONTENTS were the second argument to FILL-ARRAY,
+;; then the multi-dimensional array creation form would look like
+;;  (FILL-ARRAY (allocate-array) initial-contents)
+;; which would mean that if the user expressed the MAKE- call the
+;; second way shown above, we would have to bind INITIAL-CONTENTS,
+;; to ensure its evaluation before the allocation,
+;; causing difficulty if doing any futher macro-like processing.
+(defknown fill-array (sequence simple-array) (simple-array) (flushable)
+  :result-arg 1)
 
 (defknown vector (&rest t) simple-vector (flushable))
 
-(defknown aref (array &rest index) t (foldable))
+(defknown aref (array &rest index) t (foldable)
+  :call-type-deriver #'array-call-type-deriver)
 (defknown row-major-aref (array index) t (foldable))
 
 (defknown array-element-type (array) (or list symbol)
@@ -961,9 +977,11 @@
 ;; be in the range 0 through 6, not 0 through 7.
 (defknown array-dimension (array array-rank) index (foldable flushable))
 (defknown array-dimensions (array) list (foldable flushable))
-(defknown array-in-bounds-p (array &rest integer) boolean (foldable flushable))
+(defknown array-in-bounds-p (array &rest integer) boolean (foldable flushable)
+  :call-type-deriver #'array-call-type-deriver)
 (defknown array-row-major-index (array &rest index) array-total-size
-  (foldable flushable))
+  (foldable flushable)
+  :call-type-deriver #'array-call-type-deriver)
 (defknown array-total-size (array) array-total-size (foldable flushable))
 (defknown adjustable-array-p (array) boolean (movable foldable flushable))
 
@@ -1046,7 +1064,8 @@
 (defknown (nstring-upcase nstring-downcase nstring-capitalize)
   (string &key (:start index) (:end sequence-end))
   string ()
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1)
+  :derive-type #'result-type-first-arg)
 
 (defknown string (string-designator) string (flushable))
 
@@ -1562,7 +1581,7 @@
 
 (defknown %cleanup-point () t)
 (defknown %special-bind (t t) t)
-(defknown %special-unbind (t) t)
+(defknown %special-unbind (index) t)
 (defknown %listify-rest-args (t index) list (flushable))
 (defknown %more-arg-context (t t) (values t index) (flushable))
 (defknown %more-arg (t index) t)
@@ -1713,7 +1732,7 @@
 
 (defknown (setf aref) (t array &rest index) t ()
   :destroyed-constant-args (nth-constant-args 2)
-  :derive-type #'result-type-first-arg)
+  :call-type-deriver #'array-call-type-deriver)
 (defknown %set-row-major-aref (array index t) t ()
   :destroyed-constant-args (nth-constant-args 1))
 (defknown (%rplaca %rplacd) (cons t) t ()

@@ -429,20 +429,24 @@
 #!+sb-thread
 (define-vop (unbind)
   (:temporary (:sc unsigned-reg) temp bsp tls-index)
+  (:temporary (:sc complex-double-reg) zero)
+  (:info n)
   (:generator 0
     (load-binding-stack-pointer bsp)
-    (inst sub bsp (* binding-size n-word-bytes))
-    ;; Load TLS-INDEX of the SYMBOL from stack
-    (loadw tls-index bsp binding-symbol-slot)
-    ;; Load VALUE from stack, then restore it to the TLS area.
-    (loadw temp bsp binding-value-slot)
-    (inst mov (make-ea :qword :base thread-base-tn :index tls-index)
-          temp)
-    ;; Zero out the stack.
-    (zeroize temp)
+    (inst xorpd zero zero)
+    (loop repeat n
+          do
+          (inst sub bsp (* binding-size n-word-bytes))
+          ;; Load TLS-INDEX of the SYMBOL from stack
+          (inst mov (reg-in-size tls-index :dword)
+                (make-ea :dword :base bsp :disp (* binding-symbol-slot n-word-bytes)))
 
-    (storew temp bsp binding-symbol-slot)
-    (storew temp bsp binding-value-slot)
+          ;; Load VALUE from stack, then restore it to the TLS area.
+          (loadw temp bsp binding-value-slot)
+          (inst mov (make-ea :qword :base thread-base-tn :index tls-index)
+                temp)
+          ;; Zero out the stack.
+          (inst movapd (make-ea :qword :base bsp) zero))
     (store-binding-stack-pointer bsp)))
 
 #!-sb-thread
@@ -460,17 +464,26 @@
 
 (define-vop (unbind-to-here)
   (:args (where :scs (descriptor-reg any-reg)))
-  (:temporary (:sc unsigned-reg) symbol value bsp zero)
+  (:temporary (:sc unsigned-reg) symbol value bsp)
+  (:temporary (:sc complex-double-reg) zero)
   (:generator 0
     (load-binding-stack-pointer bsp)
     (inst cmp where bsp)
     (inst jmp :e DONE)
-    (zeroize zero)
+    (inst xorpd zero zero)
     LOOP
     (inst sub bsp (* binding-size n-word-bytes))
-    ;; on sb-thread symbol is actually a tls-index
-    (loadw symbol bsp binding-symbol-slot)
-    (inst test symbol symbol)
+    ;; on sb-thread symbol is actually a tls-index, and it fits into
+    ;; 32-bits.
+    #!+sb-thread
+    (let ((tls-index (reg-in-size symbol :dword)))
+      (inst mov tls-index
+            (make-ea :dword :base bsp :disp (* binding-symbol-slot n-word-bytes)))
+      (inst test tls-index tls-index))
+    #!-sb-thread
+    (progn
+      (loadw symbol bsp binding-symbol-slot)
+      (inst test symbol symbol))
     (inst jmp :z SKIP)
     (loadw value bsp binding-value-slot)
     #!-sb-thread
@@ -478,10 +491,9 @@
     #!+sb-thread
     (inst mov (make-ea :qword :base thread-base-tn :index symbol)
           value)
-    (storew zero bsp binding-symbol-slot)
 
     SKIP
-    (storew zero bsp binding-value-slot)
+    (inst movapd (make-ea :qword :base bsp) zero)
 
     (inst cmp where bsp)
     (inst jmp :ne LOOP)

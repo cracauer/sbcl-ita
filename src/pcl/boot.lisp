@@ -80,71 +80,111 @@ bootstrapping.
 ;;; early definition. Do this in a way that makes sure that if we
 ;;; redefine one of the early definitions the redefinition will take
 ;;; effect. This makes development easier.
-(dolist (fns *!early-functions*)
-  (let ((name (car fns))
-        (early-name (cadr fns)))
-    (setf (gdefinition name)
-            (set-fun-name
-             (lambda (&rest args)
-               (apply (fdefinition early-name) args))
-             name))))
+(loop for (name early-name) in *!early-functions*
+   do (let ((early-name early-name))
+        (setf (gdefinition name)
+              (set-fun-name
+               (lambda (&rest args)
+                 (apply (fdefinition early-name) args))
+               name))))
 
 ;;; *!GENERIC-FUNCTION-FIXUPS* is used by !FIX-EARLY-GENERIC-FUNCTIONS
 ;;; to convert the few functions in the bootstrap which are supposed
 ;;; to be generic functions but can't be early on.
 ;;;
-;;; each entry is a list of name and lambda-list, class names as
-;;; specializers, and method body function name.
+;;; each entry is a list of the form
+;;;
+;;;   (GENERIC-FUNCTION-NAME METHOD-COMBINATION-NAME METHODS)
+;;;
+;;; where methods is a list of lists of the form
+;;;
+;;;   (LAMBDA-LIST SPECIALIZERS QUALIFIERS METHOD-BODY-FUNCTION-NAME)
+;;;
+;;;,where SPECIALIZERS is a list of class names.
 (defvar *!generic-function-fixups*
   '((add-method
+     standard
      ((generic-function method)
       (standard-generic-function method)
+      ()
       real-add-method))
+
     (remove-method
+     standard
      ((generic-function method)
       (standard-generic-function method)
+      ()
       real-remove-method))
+
     (get-method
+     standard
      ((generic-function qualifiers specializers &optional (errorp t))
       (standard-generic-function t t)
+      ()
       real-get-method))
+
     (ensure-generic-function-using-class
+     standard
      ((generic-function fun-name
                         &key generic-function-class environment
                         &allow-other-keys)
       (generic-function t)
+      ()
       real-ensure-gf-using-class--generic-function)
      ((generic-function fun-name
                         &key generic-function-class environment
                         &allow-other-keys)
       (null t)
+      ()
       real-ensure-gf-using-class--null))
+
     (make-method-lambda
+     standard
      ((proto-generic-function proto-method lambda-expression environment)
       (standard-generic-function standard-method t t)
+      ()
       real-make-method-lambda))
+
     (make-method-specializers-form
+     standard
      ((proto-generic-function proto-method specializer-names environment)
       (standard-generic-function standard-method t t)
+      ()
       real-make-method-specializers-form))
+
     (parse-specializer-using-class
+     standard
      ((generic-function specializer)
       (standard-generic-function t)
+      ()
       real-parse-specializer-using-class))
+
     (unparse-specializer-using-class
+     standard
      ((generic-function specializer)
       (standard-generic-function t)
+      ()
       real-unparse-specializer-using-class))
+
     (make-method-initargs-form
+     standard
      ((proto-generic-function proto-method
                               lambda-expression
                               lambda-list environment)
       (standard-generic-function standard-method t t t)
+      ()
       real-make-method-initargs-form))
+
     (compute-effective-method
+     standard
      ((generic-function combin applicable-methods)
       (generic-function standard-method-combination t)
-      standard-compute-effective-method))))
+      ()
+      standard-compute-effective-method)
+     ((generic-function combin applicable-methods)
+      (generic-function short-method-combination t)
+      ()
+      short-compute-effective-method))))
 
 (defmacro defgeneric (fun-name lambda-list &body options)
   (declare (type list lambda-list))
@@ -307,6 +347,14 @@ generic function lambda list ~S~:>"
       ;; no defaults or supplied-p vars allowed for &OPTIONAL or &KEY
       (verify-each-atom-or-singleton '&optional optional)
       (verify-each-atom-or-singleton '&key keys))))
+
+(defun check-method-lambda (method-lambda context)
+  (unless (typep method-lambda '(cons (eql lambda)))
+    (error "~@<The METHOD-LAMBDA argument to ~
+            ~/sb-impl:print-symbol-with-prefix/, ~S, is not a lambda ~
+            form.~@:>"
+           context method-lambda))
+  method-lambda)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (fmakunbound 'defmethod))
@@ -542,25 +590,17 @@ generic function lambda list ~S~:>"
     (sb-c:source-location)))
 
 (defmacro make-method-function (method-lambda &environment env)
-  (multiple-value-bind (proto-gf proto-method)
-      (prototypes-for-make-method-lambda nil)
-    (multiple-value-bind (method-function-lambda initargs)
-        (make-method-lambda proto-gf proto-method method-lambda env)
-      (make-method-initargs-form proto-gf
-                                 proto-method
-                                 method-function-lambda
-                                 initargs
-                                 ;; FIXME: coerce-to-lexenv?
-                                 env))))
+  (binding* (((proto-gf proto-method)
+              (prototypes-for-make-method-lambda nil))
+             ((method-function-lambda initargs)
+              (make-method-lambda proto-gf proto-method method-lambda env))) ; FIXME: coerce-to-lexenv?
+    (make-method-initargs-form
+     proto-gf proto-method method-function-lambda initargs env)))
 
 (defun real-make-method-initargs-form (proto-gf proto-method
                                        method-lambda initargs env)
   (declare (ignore proto-gf proto-method))
-  (unless (and (consp method-lambda)
-               (eq (car method-lambda) 'lambda))
-    (error "The METHOD-LAMBDA argument to MAKE-METHOD-FUNCTION, ~S, ~
-            is not a lambda form."
-           method-lambda))
+  (check-method-lambda method-lambda 'make-method-initargs)
   (make-method-initargs-form-internal method-lambda initargs env))
 
 (unless (fboundp 'make-method-initargs-form)
@@ -568,9 +608,9 @@ generic function lambda list ~S~:>"
         (symbol-function 'real-make-method-initargs-form)))
 
 ;;; When bootstrapping PCL MAKE-METHOD-LAMBDA starts out as a regular
-;;; functions: REAL-MAKE-METHOD-LAMBDA set to the fdefinition of
-;;; MAKE-METHOD-LAMBDA. Once generic functions are born, the
-;;; REAL-MAKE-METHOD lambda is used as the body of the default method.
+;;; function: REAL-MAKE-METHOD-LAMBDA set to the fdefinition of
+;;; MAKE-METHOD-LAMBDA. Once generic functions are born,
+;;; REAL-MAKE-METHOD-LAMBDA is used to implement the default method.
 ;;; MAKE-METHOD-LAMBDA-INTERNAL is split out into a separate function
 ;;; so that changing it in a live image is easy, and changes actually
 ;;; take effect.
@@ -589,10 +629,7 @@ generic function lambda list ~S~:>"
 
 (defun make-method-lambda-internal (proto-gf proto-method method-lambda env)
   (declare (ignore proto-gf proto-method))
-  (unless (and (consp method-lambda) (eq (car method-lambda) 'lambda))
-    (error "The METHOD-LAMBDA argument to MAKE-METHOD-LAMBDA, ~S, ~
-            is not a lambda form."
-           method-lambda))
+  (check-method-lambda method-lambda 'make-method-lambda)
   (multiple-value-bind (real-body declarations documentation)
       (parse-body (cddr method-lambda) t)
     ;; We have the %METHOD-NAME declaration in the place where we expect it only
@@ -643,10 +680,6 @@ generic function lambda list ~S~:>"
                   ;; knowledge of specialized argument types so that
                   ;; it can avoid run-time type dispatch overhead,
                   ;; which can be a huge win for Python.)
-                  ;;
-                  ;; KLUDGE: when I tried moving these to
-                  ;; ADD-METHOD-DECLARATIONS, things broke.  No idea
-                  ;; why.  -- CSR, 2004-06-16
                   ,@(let ((specials (declared-specials declarations)))
                       (mapcar (lambda (par spec)
                                 (parameter-specializer-declaration-in-defmethod
@@ -2304,48 +2337,46 @@ generic function lambda list ~S~:>"
 (defun !early-make-a-method (class qualifiers arglist specializers initargs doc
                             &key slot-name object-class method-class-function
                             definition-source)
-  (let ((parsed ())
-        (unparsed ()))
-    ;; Figure out whether we got class objects or class names as the
-    ;; specializers and set parsed and unparsed appropriately. If we
-    ;; got class objects, then we can compute unparsed, but if we got
-    ;; class names we don't try to compute parsed.
-    ;;
-    (aver (notany #'sb-pcl::eql-specializer-p specializers))
-    (if (every #'classp specializers)
-        (setq parsed specializers
-              unparsed (mapcar (lambda (s)
-                                 (if (eq s t) t (class-name s)))
-                               specializers))
-        (setq unparsed specializers
-              parsed ()))
-    (let ((result
-           (list :early-method
+  (aver (notany #'sb-pcl::eql-specializer-p specializers))
+  (binding*
+      ;; Figure out whether we got class objects or class names as the
+      ;; specializers and set parsed and unparsed appropriately. If we
+      ;; got class objects, then we can compute unparsed, but if we
+      ;; got class names we don't try to compute parsed.
+      (((parsed unparsed)
+        (if (every #'classp specializers)
+            (values specializers
+                    (mapcar (lambda (s)
+                              (if (eq s t) t (class-name s)))
+                            specializers))
+            (values () specializers)))
+       (result
+        (list :early-method
 
-                 (getf initargs :function)
-                 (let ((mf (getf initargs :function)))
-                   (aver mf)
-                   (and (typep mf '%method-function)
-                        (%method-function-fast-function mf)))
+              (getf initargs :function)
+              (let ((mf (getf initargs :function)))
+                (aver mf)
+                (and (typep mf '%method-function)
+                     (%method-function-fast-function mf)))
 
-                 ;; the parsed specializers. This is used by
-                 ;; EARLY-METHOD-SPECIALIZERS to cache the parse.
-                 ;; Note that this only comes into play when there is
-                 ;; more than one early method on an early gf.
-                 parsed
+              ;; the parsed specializers. This is used by
+              ;; EARLY-METHOD-SPECIALIZERS to cache the parse.
+              ;; Note that this only comes into play when there is
+              ;; more than one early method on an early gf.
+              parsed
 
-                 ;; A list to which REAL-MAKE-A-METHOD can be applied
-                 ;; to make a real method corresponding to this early
-                 ;; one.
-                 (append
-                  (list class qualifiers arglist unparsed
-                        initargs doc)
-                  (when slot-name
-                    (list :slot-name slot-name :object-class object-class
-                          :method-class-function method-class-function))
-                  (list :definition-source definition-source)))))
-      (initialize-method-function initargs result)
-      result)))
+              ;; A list to which REAL-MAKE-A-METHOD can be applied
+              ;; to make a real method corresponding to this early
+              ;; one.
+              (append
+               (list class qualifiers arglist unparsed
+                     initargs doc)
+               (when slot-name
+                 (list :slot-name slot-name :object-class object-class
+                       :method-class-function method-class-function))
+               (list :definition-source definition-source)))))
+    (initialize-method-function initargs result)
+    result))
 
 (defun real-make-a-method
        (class qualifiers lambda-list specializers initargs doc
@@ -2548,33 +2579,30 @@ generic function lambda list ~S~:>"
       (/show fn)
       (setf (gdefinition (car fn)) (fdefinition (caddr fn))))
 
-    (dolist (fixup *!generic-function-fixups*)
-      (/show fixup)
-      (let* ((fspec (car fixup))
-             (gf (gdefinition fspec))
-             (methods (mapcar (lambda (method)
-                                (let* ((lambda-list (first method))
-                                       (specializers (mapcar #'find-class (second method)))
-                                       (method-fn-name (third method))
-                                       (fn-name (or method-fn-name fspec))
-                                       (fn (fdefinition fn-name))
-                                       (initargs
-                                        (list :function
-                                              (set-fun-name
-                                               (early-gf-primary-slow-method-fn fn)
-                                               `(call ,fn-name)))))
-                                  (declare (type function fn))
-                                  (make-a-method 'standard-method
-                                                 ()
-                                                 lambda-list
-                                                 specializers
-                                                 initargs
-                                                 nil)))
-                              (cdr fixup))))
-        (setf (generic-function-method-class gf) *the-class-standard-method*)
-        (setf (generic-function-method-combination gf)
-              *standard-method-combination*)
-        (set-methods gf methods))))
+    (loop for (fspec method-combination . methods) in *!generic-function-fixups*
+       for gf = (gdefinition fspec) do
+       (flet ((make-method (spec)
+                (destructuring-bind
+                      (lambda-list specializers qualifiers fun-name) spec
+                  (let* ((specializers (mapcar #'find-class specializers))
+                         (fun-name (or fun-name fspec))
+                         (fun (fdefinition fun-name))
+                         (initargs (list :function
+                                         (set-fun-name
+                                          (early-gf-primary-slow-method-fn fun)
+                                          `(call ,fun-name)))))
+                    (declare (type function fun))
+                    (make-a-method
+                     'standard-method
+                     qualifiers lambda-list specializers initargs nil)))))
+         (setf (generic-function-method-class gf)
+               *the-class-standard-method*
+               (generic-function-method-combination gf)
+               (ecase method-combination
+                 (standard *standard-method-combination*)
+                 (or *or-method-combination*)))
+         (set-methods gf (mapcar #'make-method methods)))))
+
   (/show "leaving !FIX-EARLY-GENERIC-FUNCTIONS"))
 
 ;;; PARSE-DEFMETHOD is used by DEFMETHOD to parse the &REST argument

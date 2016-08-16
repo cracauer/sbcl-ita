@@ -3752,6 +3752,28 @@
       (t
        (give-up-ir1-transform)))))
 
+(defun array-type-dimensions-mismatch (x-type y-type)
+  (let ((array-type (specifier-type 'array))
+        (simple-array-type (specifier-type 'simple-array)))
+    (and (csubtypep x-type array-type)
+         (csubtypep y-type array-type)
+         (let ((x-dims (ctype-array-dimensions x-type))
+               (y-dims (ctype-array-dimensions y-type)))
+           (and (consp x-dims)
+                (consp y-dims)
+                (or (/= (length x-dims)
+                        (length y-dims))
+                    ;; Can compare dimensions only for simple
+                    ;; arrays due to fill-pointer and
+                    ;; adjust-array.
+                    (and (csubtypep x-type simple-array-type)
+                         (csubtypep y-type simple-array-type)
+                         (loop for x-dim in x-dims
+                               for y-dim in y-dims
+                               thereis (and (integerp x-dim)
+                                            (integerp y-dim)
+                                            (not (= x-dim y-dim)))))))))))
+
 ;;; similarly to the EQL transform above, we attempt to constant-fold
 ;;; or convert to a simpler predicate: mostly we have to be careful
 ;;; with strings and bit-vectors.
@@ -3764,9 +3786,36 @@
     (flet ((both-csubtypep (type)
              (let ((ctype (specifier-type type)))
                (and (csubtypep x-type ctype)
-                    (csubtypep y-type ctype)))))
+                    (csubtypep y-type ctype))))
+           (some-csubtypep (type)
+             (let ((ctype (specifier-type type)))
+               (or (csubtypep x-type ctype)
+                   (csubtypep y-type ctype))))
+           (some-csubtypep2 (type1 type2)
+             (let ((ctype1 (specifier-type type1))
+                   (ctype2 (specifier-type type2)))
+               (or (and (csubtypep x-type ctype1)
+                        (csubtypep y-type ctype2))
+                   (and (csubtypep y-type ctype1)
+                        (csubtypep x-type ctype2)))))
+           (mismatching-types-p (type)
+             (let* ((ctype (specifier-type type))
+                    (x-equal (types-equal-or-intersect x-type ctype))
+                    (y-equal (types-equal-or-intersect y-type ctype)))
+               (or (and x-equal (not y-equal))
+                   (and (not x-equal) y-equal))))
+           (non-equal-array-p (type)
+             (and (csubtypep type (specifier-type 'array))
+                  (let ((equal-types (specifier-type '(or bit character)))
+                        (element-types (ctype-array-specialized-element-types type)))
+                    (and (neq element-types *wild-type*)
+                         (notany (lambda (x)
+                                   (csubtypep x equal-types))
+                                 element-types))))))
       (cond
         ((same-leaf-ref-p x y) t)
+        ((array-type-dimensions-mismatch x-type y-type)
+         nil)
         ((and (constant-lvar-p x)
               (equal (lvar-value x) ""))
          `(and (stringp y)
@@ -3781,23 +3830,37 @@
          '(bit-vector-= x y))
         ((both-csubtypep 'pathname)
          '(pathname= x y))
-        ((or (not (types-equal-or-intersect x-type combination-type))
-             (not (types-equal-or-intersect y-type combination-type)))
-         (if (types-equal-or-intersect x-type y-type)
-             '(eql x y)
-             ;; Can't simply check for type intersection if both types are combination-type
-             ;; since array specialization would mean types don't intersect, even when EQUAL
-             ;; doesn't care for specialization.
-             ;; Previously checking for intersection in the outer COND resulted in
-             ;;
-             ;; (equal (the (cons (or simple-bit-vector
-             ;;                       simple-base-string))
-             ;;             x)
-             ;;        (the (cons (or (and bit-vector (not simple-array))
-             ;;                       (simple-array character (*))))
-             ;;             y))
-             ;; being incorrectly folded to NIL
-             nil))
+        ((or (non-equal-array-p x-type)
+             (non-equal-array-p y-type))
+         '(eq x y))
+        ((types-equal-or-intersect x-type y-type)
+         (cond ((some-csubtypep 'number)
+                '(eql x y))
+               ((some-csubtypep '(and array (not vector)))
+                '(eq x y))
+               ((both-csubtypep 'simple-array)
+                ;; Can only work on simple arrays due to fill-pointer
+                (let ((x-dim (ctype-array-dimensions x-type))
+                      (y-dim (ctype-array-dimensions x-type)))
+                  (if (and (consp x-dim)
+                           (consp y-dim)
+                           (integerp (car x-dim))
+                           (integerp (car y-dim))
+                           (not (equal x-dim y-dim)))
+                      nil
+                      (give-up-ir1-transform))))
+               ((or (types-equal-or-intersect x-type combination-type)
+                    (types-equal-or-intersect y-type combination-type))
+                (give-up-ir1-transform))
+               (t
+                '(eql x y))))
+        ((or (mismatching-types-p 'cons)
+             (mismatching-types-p 'bit-vector)
+             (mismatching-types-p 'string))
+         nil)
+        ((some-csubtypep2 '(and array (not vector))
+                          'vector)
+         nil)
         (t (give-up-ir1-transform))))))
 
 (deftransform equalp ((x y) * *)
@@ -3811,9 +3874,17 @@
     (flet ((both-csubtypep (type)
              (let ((ctype (specifier-type type)))
                (and (csubtypep x-type ctype)
-                    (csubtypep y-type ctype)))))
+                    (csubtypep y-type ctype))))
+           (mismatching-types-p (type)
+             (let* ((ctype (specifier-type type))
+                    (x-equal (types-equal-or-intersect x-type ctype))
+                    (y-equal (types-equal-or-intersect y-type ctype)))
+               (or (and x-equal (not y-equal))
+                   (and (not x-equal) y-equal)))))
       (cond
         ((same-leaf-ref-p x y) t)
+        ((array-type-dimensions-mismatch x-type y-type)
+         nil)
         ((and (constant-lvar-p x)
               (equal (lvar-value x) ""))
          `(and (stringp y)
@@ -3834,12 +3905,32 @@
          '(= x y))
         ((both-csubtypep 'hash-table)
          '(hash-table-equalp x y))
-        ((or (not (types-equal-or-intersect x-type combination-type))
-             (not (types-equal-or-intersect y-type combination-type)))
-         ;; See the comment about specialized types in the EQUAL transform above
-         (if (types-equal-or-intersect y-type x-type)
-             '(eq x y)
-             nil))
+        ((and (both-csubtypep 'array)
+              (flet ((upgraded-et (type)
+                       (multiple-value-bind (specialized supetype)
+                           (array-type-upgraded-element-type type)
+                         (or supetype specialized))))
+                (let ((number-ctype (specifier-type 'number))
+                      (x-et (upgraded-et x-type))
+                      (y-et (upgraded-et y-type)))
+                  (and (neq x-et *wild-type*)
+                       (neq y-et *wild-type*)
+                       (cond ((types-equal-or-intersect x-et y-et)
+                              nil)
+                             ((csubtypep x-et number-ctype)
+                              (not (types-equal-or-intersect y-et number-ctype)))
+                             ((types-equal-or-intersect y-et number-ctype)
+                              (not (types-equal-or-intersect x-et number-ctype))))))))
+         nil)
+        ((types-equal-or-intersect x-type y-type)
+         (if (or (types-equal-or-intersect x-type combination-type)
+                 (types-equal-or-intersect y-type combination-type))
+             (give-up-ir1-transform)
+             '(eq x y)))
+        ((or (mismatching-types-p 'cons)
+             (mismatching-types-p 'array)
+             (mismatching-types-p 'number))
+         nil)
         (t (give-up-ir1-transform))))))
 
 ;;; Convert to EQL if both args are rational and complexp is specified
@@ -4691,15 +4782,12 @@
               (type-union result-typeoid
                           (type-intersection (lvar-type value)
                                              (specifier-type 'rational))))))
+          ;; At zero safety the deftransform for COERCE can elide dimension
+          ;; checks for the things like (COERCE X '(SIMPLE-VECTOR 5)) -- so we
+          ;; need to simplify the type to drop the dimension information.
           ((and (policy node (zerop safety))
-                (csubtypep result-typeoid (specifier-type '(array * (*)))))
-           ;; At zero safety the deftransform for COERCE can elide dimension
-           ;; checks for the things like (COERCE X '(SIMPLE-VECTOR 5)) -- so we
-           ;; need to simplify the type to drop the dimension information.
-           (let ((vtype (simplify-vector-type result-typeoid)))
-             (if vtype
-                 (specifier-type vtype)
-                 result-typeoid)))
+                (csubtypep result-typeoid (specifier-type '(array * (*))))
+                (simplify-vector-type result-typeoid)))
           (t
            result-typeoid))))))
 
@@ -4916,3 +5004,14 @@
   `(ash (sap-ref-32 (int-sap (get-lisp-obj-address (the symbol ,sym)))
                     (- 4 sb!vm:other-pointer-lowtag))
         (- sb!vm:n-fixnum-tag-bits)))
+
+(deftransform make-string-output-stream ((&key element-type))
+  (let ((element-type (cond ((not element-type)
+                             'character)
+                            ((constant-lvar-p element-type)
+                             (let ((specifier (careful-specifier-type (lvar-value element-type))))
+                               (and (csubtypep specifier (specifier-type 'character))
+                                    (type-specifier specifier)))))))
+   (if element-type
+       `(sb!impl::%make-string-output-stream ',element-type)
+       (give-up-ir1-transform))))

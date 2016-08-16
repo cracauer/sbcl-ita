@@ -73,14 +73,16 @@
                                 (:result-arg (or index null))
                                 (:overwrite-fndb-silently boolean)
                                 (:foldable-call-check (or function null))
-                                (:callable-check (or function null)))
+                                (:callable-check (or function null))
+                                (:call-type-deriver (or function null)))
                           *)
                 %defknown))
 (defun %defknown (names type attributes location
                   &key derive-type optimizer destroyed-constant-args result-arg
                        overwrite-fndb-silently
                        foldable-call-check
-                       callable-check)
+                       callable-check
+                       call-type-deriver)
   (let ((ctype (specifier-type type)))
     (dolist (name names)
       (unless overwrite-fndb-silently
@@ -108,7 +110,8 @@
                            :destroyed-constant-args destroyed-constant-args
                            :result-arg result-arg
                            :foldable-call-check foldable-call-check
-                           :callable-check callable-check))
+                           :callable-check callable-check
+                           :call-type-deriver call-type-deriver))
       (if location
           (setf (getf (info :source-location :declaration name) 'defknown)
                 location)
@@ -142,21 +145,45 @@
           :key #'lvar-type
           :initial-value (specifier-type 'single-float)))
 
+(defun simplify-list-type (type &key preserve-dimensions)
+  ;; Preserve all the list types without dragging
+  ;; (cons (eql 10)) stuff in.
+  (let ((cons-type (specifier-type 'cons))
+        (list-type (specifier-type 'list))
+        (null-type (specifier-type 'null)))
+    (cond ((and preserve-dimensions
+                (csubtypep type cons-type))
+           cons-type)
+          ((and preserve-dimensions
+                (csubtypep type null-type))
+           null-type)
+          ((csubtypep type list-type)
+           list-type))))
+
 ;;; Return a closure usable as a derive-type method for accessing the
 ;;; N'th argument. If arg is a list, result is a list. If arg is a
 ;;; vector, result is a vector with the same element type.
-(defun sequence-result-nth-arg (n)
+(defun sequence-result-nth-arg (n &key preserve-dimensions
+                                       preserve-vector-type)
   (lambda (call)
     (declare (type combination call))
     (let ((lvar (nth (1- n) (combination-args call))))
       (when lvar
         (let ((type (lvar-type lvar)))
-          (if (array-type-p type)
-              (specifier-type
-               `(vector ,(type-specifier (array-type-element-type type))))
-              (let ((ltype (specifier-type 'list)))
-                (when (csubtypep type ltype)
-                  ltype))))))))
+          (cond ((simplify-list-type type
+                                     :preserve-dimensions preserve-dimensions))
+                ((not (csubtypep type (specifier-type 'vector)))
+                 nil)
+                (preserve-vector-type
+                 type)
+                (t
+                 (let ((simplified (simplify-vector-type type)))
+                   (if (and preserve-dimensions
+                            (csubtypep simplified (specifier-type 'simple-array)))
+                       (type-intersection (specifier-type
+                                           `(simple-array * ,(ctype-array-dimensions type)))
+                                          simplified)
+                       simplified)))))))))
 
 ;;; Derive the type to be the type specifier which is the Nth arg.
 (defun result-type-specifier-nth-arg (n)
@@ -277,39 +304,69 @@
           (type-union unexceptional-type null-type)
           unexceptional-type))))
 
-(defun count/position-max-value (call)
-  (declare (type combination call))
-    ;; Could possibly constrain the result more highly if
-    ;; the :start/:end were provided and of known types.
-  (labels ((max-dim (type)
-             ;; This can deal with just enough hair to handle type STRING,
-             ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
-             ;; if we really want to be more clever.
-             (typecase type
-               (union-type (reduce #'max2 (union-type-types type)
-                                   :key #'max-dim))
-               (array-type (if (and (not (array-type-complexp type))
-                                    (singleton-p (array-type-dimensions type)))
-                               (first (array-type-dimensions type))
-                               '*))
-               (t '*)))
-           (max2 (a b)
-             (if (and (integerp a) (integerp b)) (max a b) '*)))
-    ;; If type derivation were able to notice that non-simple arrays can
-    ;; be mutated (changing the type), we could safely use LVAR-TYPE on
-    ;; any vector type. But it doesn't notice.
-    ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
-    ;; However that's probably not an important use, so the above
-    ;; logic restricts itself to simple arrays.
-    (max-dim (lvar-type (second (combination-args call))))))
+;;; Return MAX MIN
+(defun sequence-lvar-dimensions (lvar)
+  (if (not (constant-lvar-p lvar))
+      (let ((max 0) (min array-total-size-limit))
+        (block nil
+          (labels ((max-dim (type)
+                     ;; This can deal with just enough hair to handle type STRING,
+                     ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
+                     ;; if we really want to be more clever.
+                     (typecase type
+                       (union-type
+                        (mapc #'max-dim (union-type-types type)))
+                       (array-type (if (array-type-complexp type)
+                                       (return '*)
+                                       (process-dim (array-type-dimensions type))))
+                       (t (return '*))))
+                   (process-dim (dim)
+                     (let ((length (car dim)))
+                       (if (and (singleton-p dim)
+                                (integerp length))
+                           (setf max (max max length)
+                                 min (min min length))
+                           (return '*)))))
+            ;; If type derivation were able to notice that non-simple arrays can
+            ;; be mutated (changing the type), we could safely use LVAR-TYPE on
+            ;; any vector type. But it doesn't notice.
+            ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
+            ;; However that's probably not an important use, so the above
+            ;; logic restricts itself to simple arrays.
+            (max-dim (lvar-type lvar))
+            (values max min))))
+      (let ((value (lvar-value lvar)))
+        (and (typep value 'sequence)
+             (let ((length (length value)))
+               (values length length))))))
 
 (defun position-derive-type (call)
-  (let ((dim (count/position-max-value call)))
+  (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
     (when (integerp dim)
       (specifier-type `(or (integer 0 (,dim)) null)))))
+
 (defun count-derive-type (call)
-  (let ((dim (count/position-max-value call)))
+  (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
     (when (integerp dim)
       (specifier-type `(integer 0 ,dim)))))
+
+;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
+;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
+;;; assertion that may not get eliminated and requires extra work.
+(defun array-call-type-deriver (call trusted)
+  (let ((type (lvar-type (combination-fun call)))
+        (policy (lexenv-policy (node-lexenv call)))
+        (args (combination-args call)))
+    (flet ((assert-type (arg type)
+             (when (assert-lvar-type arg type policy)
+               (unless trusted (reoptimize-lvar arg)))))
+      (loop for (type . next) on (fun-type-required type)
+            while next
+            do (assert-type (pop args) type))
+      (assert-type (pop args)
+                   (specifier-type `(array * ,(make-list (length args)
+                                                         :initial-element '*))))
+      (loop for subscript in args
+            do (assert-type subscript (fun-type-rest type))))))
 
 (/show0 "knownfun.lisp end of file")

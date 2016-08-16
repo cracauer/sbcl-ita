@@ -28,7 +28,9 @@
                                      &key &allow-other-keys &aux))
                                   ((and val (symbolp val)) (list val))
                                   (t val))
-              sum (ash 1 (position symbol lambda-list-parser-states))))
+              for weight = (or (position symbol lambda-list-parser-states)
+                               (error "Not a parser state: ~S" symbol))
+              sum (ash 1 weight)))
       ;; Otherwise the input is required to be a list of symbols.
       (with-unique-names (k)
         `(loop for ,k in ,list
@@ -68,7 +70,7 @@
 ;;; wrong, we use COMPILER-ERROR, aborting compilation to the last
 ;;; recovery point.
 (declaim (ftype (sfunction
-                 (list &key (:context t) (:accept integer) (:silent boolean)
+                 (list &key (:context t) (:accept integer) (:silent t)
                             (:condition-class symbol))
                  (values (unsigned-byte 13) list list list list list list list))
                 parse-lambda-list))

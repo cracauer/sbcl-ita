@@ -528,8 +528,8 @@
       (values nil *universal-type*)
       (values (append (args-type-required type)
                       (args-type-optional type))
-              (cond ((args-type-rest type))
-                    (t default-type)))))
+              (or (args-type-rest type)
+                  default-type))))
 
 ;;; types of values in (the <type> (values o_1 ... o_n))
 (defun values-type-out (type count)
@@ -544,10 +544,10 @@
                        do (res type))))
           (process-types (values-type-required type))
           (process-types (values-type-optional type))
-          (when (plusp count)
-            (loop with rest = (the ctype (values-type-rest type))
-                  repeat count
-                  do (res rest))))
+          (let ((rest (values-type-rest type)))
+            (when rest
+              (loop repeat count
+                    do (res rest)))))
         (res))))
 
 ;;; types of variable in (m-v-bind (v_1 ... v_n) (the <type> ...
@@ -1276,36 +1276,24 @@
          ;; FUNCALLABLE-INSTANCE in surprising ways.
          (invoke-complex-subtypep-arg1-method type1 type2))
         ((and (eq type2 *extended-sequence-type*) (classoid-p type1))
-         (let* ((layout (classoid-layout type1))
-                (inherits (layout-inherits layout))
-                (sequencep (find (classoid-layout (find-classoid 'sequence))
-                                 inherits)))
-           (values (if sequencep t nil) t)))
+         (values (if (classoid-inherits-from type1 'sequence) t nil) t))
         ((and (eq type2 *instance-type*) (classoid-p type1))
-         (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-             (values nil t)
-             (let* ((layout (classoid-layout type1))
-                    (inherits (layout-inherits layout))
-                    (functionp (find (classoid-layout (find-classoid 'function))
-                                     inherits)))
-               (cond
-                 (functionp
-                  (values nil t))
-                 ((eq type1 (find-classoid 'function))
-                  (values nil t))
-                 ((or (structure-classoid-p type1)
-                      #+nil
-                      (condition-classoid-p type1))
-                  (values t t))
-                 (t (values nil nil))))))
+         (cond
+           ((classoid-non-instance-p type1)
+            (values nil t))
+           ((classoid-inherits-from type1 'function)
+            (values nil t))
+           ((eq type1 (find-classoid 'function))
+            (values nil t))
+           ((or (structure-classoid-p type1)
+                (condition-classoid-p type1))
+            (values t t))
+           (t (values nil nil))))
         ((and (eq type2 *funcallable-instance-type*) (classoid-p type1))
-         (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-             (values nil t)
-             (let* ((layout (classoid-layout type1))
-                    (inherits (layout-inherits layout))
-                    (functionp (find (classoid-layout (find-classoid 'function))
-                                     inherits)))
-               (values (if functionp t nil) t))))
+         (if (and (not (classoid-non-instance-p type1))
+                  (classoid-inherits-from type1 'function))
+             (values t t)
+             (values nil t)))
         (t
          ;; FIXME: This seems to rely on there only being 4 or 5
          ;; NAMED-TYPE values, and the exclusion of various
@@ -1330,91 +1318,58 @@
   ;; FIXME: This assertion failed when I added it in sbcl-0.6.11.13.
   ;; Perhaps when bug 85 is fixed it can be reenabled.
   ;;(aver (not (eq type2 *wild-type*))) ; * isn't really a type.
-  (cond
-    ((eq type2 *extended-sequence-type*)
-     (typecase type1
-       (structure-classoid *empty-type*)
-       (classoid
-        (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-            *empty-type*
-            (if (find (classoid-layout (find-classoid 'sequence))
-                      (layout-inherits (classoid-layout type1)))
-                type1
-                nil)))
-       (t
-        (if (or (type-might-contain-other-types-p type1)
-                (member-type-p type1))
-            nil
-            *empty-type*))))
-    ((eq type2 *instance-type*)
-     (typecase type1
-       (structure-classoid type1)
-       (classoid
-        (if (and (not (member type1 *non-instance-classoid-types*
-                              :key #'find-classoid))
-                 (not (eq type1 (find-classoid 'function)))
-                 (not (find (classoid-layout (find-classoid 'function))
-                            (layout-inherits (classoid-layout type1)))))
-            nil
-            *empty-type*))
-       (t
-        (if (or (type-might-contain-other-types-p type1)
-                (member-type-p type1))
-            nil
-            *empty-type*))))
-    ((eq type2 *funcallable-instance-type*)
-     (typecase type1
-       (structure-classoid *empty-type*)
-       (classoid
-        (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-            *empty-type*
-            (if (find (classoid-layout (find-classoid 'function))
-                      (layout-inherits (classoid-layout type1)))
-                type1
-                (if (type= type1 (find-classoid 'function))
-                    type2
-                    nil))))
-       (fun-type nil)
-       (t
-        (if (or (type-might-contain-other-types-p type1)
-                (member-type-p type1))
-            nil
-            *empty-type*))))
-    (t (hierarchical-intersection2 type1 type2))))
+  (flet ((empty-unless-hairy (type)
+           (unless (or (type-might-contain-other-types-p type)
+                       (member-type-p type))
+             *empty-type*)))
+    (cond
+      ((eq type2 *extended-sequence-type*)
+       (typecase type1
+         ((or structure-classoid condition-classoid) *empty-type*)
+         (classoid (cond
+                     ((classoid-non-instance-p type1) *empty-type*)
+                     ((classoid-inherits-from type1 'sequence) type1)))
+         (t (empty-unless-hairy type1))))
+      ((eq type2 *instance-type*)
+       (typecase type1
+         ((or structure-classoid condition-classoid) type1)
+         (classoid (when (or (classoid-non-instance-p type1)
+                             (eq type1 (find-classoid 'function))
+                             (classoid-inherits-from type1 'function))
+                     *empty-type*))
+         (t (empty-unless-hairy type1))))
+      ((eq type2 *funcallable-instance-type*)
+       (typecase type1
+         ((or structure-classoid condition-classoid) *empty-type*)
+         (classoid
+          (cond
+            ((classoid-non-instance-p type1) *empty-type*)
+            ((classoid-inherits-from type1 'function) type1)
+            ((type= type1 (find-classoid 'function)) type2)))
+         (fun-type nil)
+         (t (empty-unless-hairy type1))))
+      (t (hierarchical-intersection2 type1 type2)))))
 
 (!define-type-method (named :complex-union2) (type1 type2)
   ;; Perhaps when bug 85 is fixed this can be reenabled.
   ;;(aver (not (eq type2 *wild-type*))) ; * isn't really a type.
   (cond
     ((eq type2 *extended-sequence-type*)
-     (if (classoid-p type1)
-         (if (or (member type1 *non-instance-classoid-types*
-                         :key #'find-classoid)
-                 (not (find (classoid-layout (find-classoid 'sequence))
-                            (layout-inherits (classoid-layout type1)))))
-             nil
-             type2)
-         nil))
+     (cond ((not (classoid-p type1)) nil)
+           ((and (not (classoid-non-instance-p type1))
+                 (classoid-inherits-from type1 'sequence))
+            type2)))
     ((eq type2 *instance-type*)
-     (if (classoid-p type1)
-         (if (or (member type1 *non-instance-classoid-types*
-                         :key #'find-classoid)
-                 (find (classoid-layout (find-classoid 'function))
-                       (layout-inherits (classoid-layout type1))))
-             nil
-             type2)
-         nil))
+     (cond ((not (classoid-p type1)) nil)
+           ((and (not (classoid-non-instance-p type1))
+                 (not (classoid-inherits-from type1 'function)))
+            type2)))
     ((eq type2 *funcallable-instance-type*)
-     (if (classoid-p type1)
-         (if (or (member type1 *non-instance-classoid-types*
-                         :key #'find-classoid)
-                 (not (find (classoid-layout (find-classoid 'function))
-                            (layout-inherits (classoid-layout type1)))))
-             nil
-             (if (eq type1 (specifier-type 'function))
-                 type1
-                 type2))
-         nil))
+     (cond ((not (classoid-p type1)) nil)
+           ((classoid-non-instance-p type1) nil)
+           ((not (classoid-inherits-from type1 'function)) nil)
+           ((eq type1 (specifier-type 'function)) type1)
+           (t type2)))
     (t (hierarchical-union2 type1 type2))))
 
 (!define-type-method (named :negate) (x)
@@ -3109,6 +3064,87 @@ used for a COMPLEX component.~:@>"
   (apply #'type-intersection
          (mapcar #'type-negation (union-type-types type))))
 
+;;; Unlike ARRAY-TYPE-DIMENSIONS this handles union types, which
+;;; includes the type STRING.
+(defun ctype-array-dimensions (type)
+  (labels ((process-compound-type (types)
+             (let (dimensions)
+               (dolist (type types)
+                 (unless (or (hairy-type-p type)
+                             (negation-type-p type))
+                   (let ((current-dimensions (determine type)))
+                     (cond ((eq current-dimensions '*)
+                            (return-from ctype-array-dimensions '*))
+                           ((and dimensions
+                                 (not (equal current-dimensions dimensions)))
+                            (if (= (length dimensions)
+                                   (length current-dimensions))
+                                (setf dimensions
+                                      (loop for dimension in dimensions
+                                            for current-dimension in current-dimensions
+                                            collect (if (eql dimension current-dimension)
+                                                        dimension
+                                                        '*)))
+                                (return-from ctype-array-dimensions '*)))
+                           (t
+
+                            (setf dimensions current-dimensions))))))
+               dimensions))
+           (determine (type)
+             (etypecase type
+               (array-type
+                (array-type-dimensions type))
+               (union-type
+                (process-compound-type (union-type-types type)))
+               (member-type
+                (process-compound-type
+                 (mapcar #'ctype-of (member-type-members type))))
+               (intersection-type
+                (process-compound-type (intersection-type-types type))))))
+    (determine type)))
+
+(defun ctype-array-specialized-element-types (type)
+  (let (types)
+    (labels ((process-compound-type (types)
+               (loop for type in types
+                     unless (or (hairy-type-p type)
+                                (negation-type-p type))
+                     do (determine type)))
+             (determine (type)
+               (etypecase type
+                 (array-type
+                  (when (eq (array-type-specialized-element-type type) *wild-type*)
+                    (return-from ctype-array-specialized-element-types
+                      *wild-type*))
+                  (pushnew (array-type-specialized-element-type type)
+                           types :test #'type=))
+                 (union-type
+                  (process-compound-type (union-type-types type)))
+                 (intersection-type
+                  (process-compound-type (intersection-type-types type)))
+                 (member-type
+                  (process-compound-type
+                   (mapcar #'ctype-of (member-type-members type)))))))
+      (determine type))
+    types))
+
+(defun unparse-string-type (ctype string-type)
+  (let ((string-ctype (specifier-type string-type)))
+    (and (union-type-p ctype)
+         (csubtypep ctype string-ctype)
+         (let ((types (copy-list (union-type-types string-ctype))))
+           (and (loop for type in (union-type-types ctype)
+                      for matching = (and (array-type-p type)
+                                          (find type types
+                                                :test #'csubtypep))
+                      always matching
+                      do (setf types (delete matching types)))
+                (null types)))
+         (let ((dimensions (ctype-array-dimensions ctype)))
+           (cond ((and (singleton-p dimensions)
+                       (integerp (car dimensions)))
+                  `(,string-type ,@dimensions)))))))
+
 ;;; The LIST, FLOAT and REAL types have special names.  Other union
 ;;; types just get mechanically unparsed.
 (!define-type-method (union :unparse) (type)
@@ -3121,6 +3157,8 @@ used for a COMPLEX component.~:@>"
     ((type= type (specifier-type 'bignum)) 'bignum)
     ((type= type (specifier-type 'simple-string)) 'simple-string)
     ((type= type (specifier-type 'string)) 'string)
+    ((unparse-string-type type 'simple-string))
+    ((unparse-string-type type 'string))
     ((type= type (specifier-type 'complex)) 'complex)
     (t `(or ,@(mapcar #'type-specifier (union-type-types type))))))
 

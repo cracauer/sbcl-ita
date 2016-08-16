@@ -2372,18 +2372,55 @@
 
 ;;; overconfident primitive type computation leading to bogus type
 ;;; checking.
-(let* ((form1 '(lambda (x)
-                (declare (type (and condition function) x))
-                x))
-       (fun1 (compile nil form1))
-       (form2 '(lambda (x)
-                (declare (type (and standard-object function) x))
-                x))
-       (fun2 (compile nil form2)))
-  (assert-error (funcall fun1 (make-condition 'error)))
-  (assert-error (funcall fun1 fun1))
-  (assert-error (funcall fun2 fun2))
-  (assert (eq (funcall fun2 #'print-object) #'print-object)))
+(with-test (:name (compile :primitive-type standard-object condition function))
+  (flet ((test-case/incompatible (type1 type2 object1 object2)
+           (multiple-value-bind (fun failure-p warnings)
+               (checked-compile
+                `(lambda (x)
+                   (declare (type (and ,type1 ,type2) x))
+                   x)
+                :allow-failure t :allow-warnings t)
+             (assert failure-p)
+             (assert (= (length warnings) 1))
+             ;; FIXME (declare (type <equivalent-to-empty-type> x)) is
+             ;; currently dropped instead of compiled into a type
+             ;; check.
+             ;; (assert-error (funcall fun object1) type-error)
+             ;; (assert-error (funcall fun object2) type-error)
+             ))
+         (test-case/compatible (type1 type2 object1 object2)
+           (let ((fun (checked-compile
+                       `(lambda (x)
+                          (declare (type (and ,type1 ,type2) x))
+                          x))))
+             (when (typep object1 type2)
+               (assert (typep (funcall fun object1) type1)))
+             (when (typep object2 type1)
+               (assert (typep (funcall fun object2) type2))))))
+    ;; TODO Add structure classes, SEQUENCE and EXTENDED-SEQUENCE
+    (let ((types `((condition                      . ,(make-condition 'error))
+                   (sb-kernel:funcallable-instance . ,#'print-object)
+                   (function                       . ,#'identity)
+                   (sb-kernel:instance             . ,(find-class 'class))
+                   (standard-object                . ,(find-class 'class))))
+          (compatible '((sb-kernel:instance             . condition)
+                        (sb-kernel:instance             . standard-object)
+                        (sb-kernel:funcallable-instance . function)
+                        (sb-kernel:funcallable-instance . standard-object)
+                        (function                       . standard-object))))
+      (loop :for (type1 . object1) :in types :do
+         (loop :for (type2 . object2) :in types :do
+            (funcall
+             (if (or (eq type1 type2)
+                     (find-if (lambda (cell)
+                                (or (and (eq type1 (car cell))
+                                         (eq type2 (cdr cell)))
+                                    (and (eq type2 (car cell))
+                                         (eq type1 (cdr cell)))))
+                              compatible))
+                 #'test-case/compatible
+                 #'test-case/incompatible)
+             type1 type2 object1 object2))))))
 
 ;;; LET* + VALUES declaration: while the declaration is a non-standard
 ;;; and possibly a non-conforming extension, as long as we do support
@@ -3149,7 +3186,15 @@
     (test `(lambda (x y z)
              (make-array '3 :initial-contents (vector x y z))))
     (test `(lambda (x y z)
-             (make-array '3 :initial-contents `(,x ,y ,z))))))
+             (make-array '3 :initial-contents `(,x ,y ,z))))
+    (test `(lambda (x y z)
+             ;; Single-use FLET is eliminated,
+             ;; so MAKE-ARRAY's result is obviously a vector.
+             (flet ((size () '(3)))
+               (make-array (size) :initial-contents `(,x ,y ,z)))))
+    (test `(lambda (x y z)
+             (flet ((size () (list 3))) ; here too
+               (make-array (size) :initial-contents `(,x ,y ,z)))))))
 
 ;;; optimizing array-in-bounds-p
 (with-test (:name :optimize-array-in-bounds-p)
@@ -5809,3 +5854,73 @@
                            (ctu:compiler-derived-type (sb-kernel:%array-data-vector (the array x)))))
                        #2A())))
     (assert (eq type 'array))))
+
+(with-test (:name :equalp-transofrm)
+  (assert
+   (funcall (checked-compile
+             `(lambda (x y)
+                (equalp (the (simple-array single-float (*)) x)
+                        (the (simple-array double-float (*)) y))))
+            (coerce '(1f0) '(simple-array single-float (*)))
+            (coerce '(1d0) '(simple-array double-float (*))))))
+
+(with-test (:name :array-hairy-type-derivation)
+  (assert
+   (equal (funcall (checked-compile
+                    `(lambda (x)
+                       (subseq (the (and (satisfies sb-impl::vector-with-fill-pointer-p)
+                                         (string 3)) x)
+                               1)))
+                   (make-array 3 :element-type 'character
+                                 :fill-pointer t
+                                 :initial-contents "abc"))
+          "bc")))
+
+(with-test (:name :nreverse-derive-type)
+  (assert
+   (not (funcall (checked-compile
+                  '(lambda (x)
+                    (eql (car (nreverse (the (cons (eql 10)) x))) 10)))
+                 '(10 20)))))
+
+(with-test (:name :subseq-derive-type)
+  (assert
+   (equalp (funcall (checked-compile
+                    '(lambda (x)
+                      (subseq (the (simple-vector 3) x) 1)))
+                   #(1 2 3))
+           #(2 3))))
+
+(with-test (:name :sequence-derive-type)
+  (assert
+   (equalp (funcall (checked-compile
+                     '(lambda (x)
+                       (copy-seq (the (and string (not (simple-array nil))) x))))
+                    (make-array 3 :element-type 'character
+                                  :fill-pointer 2
+                                  :initial-contents "123"))
+           "12")))
+
+(with-test (:name :sequence-derive-type.2)
+  (assert
+   (funcall (checked-compile
+             '(lambda (x y)
+               (equal (the (and string (not (simple-array nil))) x) y)))
+            (make-array 3 :element-type 'character
+                          :fill-pointer 2
+                          :initial-contents "123")
+            "12")))
+
+(with-test (:name :sequence-derive-type.3)
+  (assert
+   (equalp (funcall (checked-compile
+                     '(lambda (x)
+                       (subseq (the (or (simple-array * (*)) string) x)  0 2)))
+                    #(1 2 3))
+           #(1 2))))
+
+(with-test (:name :not-enough-values-cast)
+  (assert
+   (not (funcall (checked-compile
+                  `(lambda ()
+                     (car (describe 1 (make-broadcast-stream)))))))))
